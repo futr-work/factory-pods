@@ -1,0 +1,11 @@
+[pod]
+name = "worker-pod-template"
+role = "worker"
+version = "1.0.0"
+
+[harness]
+runtime = "cloudflare-worker"
+engine = "edge-v8"
+
+[tools]
+mcp = ["submit_task", "task_status", "approve", "cancel", "get_receipt"]

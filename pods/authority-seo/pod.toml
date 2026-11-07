@@ -1,0 +1,11 @@
+[pod]
+name = "authority-seo-pod"
+role = "seo-governance"
+version = "1.0.0"
+
+[harness]
+runtime = "cloudflare-worker"
+engine = "edge-v8"
+
+[tools]
+mcp = ["audit_site", "generate_ai_robots_txt", "generate_schema_jsonld", "optimize_metadata", "generate_sample_fixpack", "submit_indexnow", "search_google_serp"]

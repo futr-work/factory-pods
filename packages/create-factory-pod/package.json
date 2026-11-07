@@ -1,0 +1,41 @@
+{
+  "name": "@futr-work/create-factory-pod",
+  "version": "0.1.0",
+  "description": "Scaffold a new autonomous worker pod on Cloudflare Workers and MCP v2",
+  "type": "module",
+  "bin": {
+    "create-factory-pod": "./bin/create.js"
+  },
+  "files": [
+    "bin",
+    "templates"
+  ],
+  "keywords": [
+    "factory-pod",
+    "cloudflare-workers",
+    "mcp",
+    "autonomous-agent",
+    "d1-sqlite"
+  ],
+  "author": "futr.work",
+  "license": "MIT",
+  "kernelVersion": "0.1.0",
+  "homepage": "https://futr.work",
+  "bugs": {
+    "url": "https://github.com/futr-work/factory-pods/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/futr-work/factory-pods.git",
+    "directory": "packages/create-factory-pod"
+  },
+  "scripts": {
+    "prepack": "node bin/bundle-templates.js"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=22.16.0"
+  }
+}

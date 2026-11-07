@@ -1,0 +1,11 @@
+[pod]
+name = "model-governor-pod"
+role = "governor"
+version = "1.0.0"
+
+[harness]
+runtime = "cloudflare-worker"
+engine = "edge-v8"
+
+[tools]
+mcp = []

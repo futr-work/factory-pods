@@ -1,0 +1,10 @@
+node_modules/
+.wrangler/
+dist/
+.DS_Store
+*.log
+.env
+.env.local
+.factory/
+packages/create-factory-pod/templates/
+bun.lock

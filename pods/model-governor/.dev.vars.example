@@ -1,0 +1,4 @@
+# Local development variables loaded automatically by `wrangler dev`
+# Generate a secret: openssl rand -hex 32  (copy this file to .dev.vars)
+# Left empty, the pod fails closed: only /health is served.
+FACTORY_HUB_TOKEN=

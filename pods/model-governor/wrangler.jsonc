@@ -1,0 +1,31 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "model-governor-pod",
+  "main": "src/worker.ts",
+  "compatibility_date": "2024-11-01",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "model-governor-pod-db",
+      "database_id": "REPLACE_WITH_D1_DATABASE_ID"
+    }
+  ],
+  "ai": {
+    "binding": "AI"
+  },
+  "triggers": {
+    "crons": [
+      "*/5 * * * *"
+    ]
+  },
+  "vars": {
+    // Daily cap (USD) for probing PAID models; tune for your account. for probing PAID models. Free models are always probed.
+    "PROBE_BUDGET_USD_DAILY": "10"
+  },
+  "observability": {
+    "enabled": true
+  }
+}

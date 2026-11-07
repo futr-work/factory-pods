@@ -1,0 +1,27 @@
+set shell := ["zsh", "-cu"]
+
+# Run pod locally with SQLite WAL engine
+dev:
+    npx tsx src/main.ts
+
+# Run pod test suite
+test:
+    npm test
+
+# Type check TypeScript
+check:
+    npx tsc --noEmit
+
+# Scaffold a new Pod instance
+scaffold name role lob:
+    node bin/scaffold.js --name {{quote(name)}} --role {{quote(role)}} --lob {{quote(lob)}}
+
+# Apply D1 schema remotely to Cloudflare.
+# Auth: `wrangler login`, or export CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID.
+cf-schema db_name:
+    wrangler d1 execute {{db_name}} --remote --file=schema.sql -y
+
+# Deploy Pod to Cloudflare Workers Edge (same auth as cf-schema).
+# Set runtime secrets once with: wrangler secret put FACTORY_HUB_TOKEN
+cf-deploy:
+    wrangler deploy

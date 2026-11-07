@@ -1,0 +1,37 @@
+{
+  "name": "factory-pods",
+  "version": "0.1.0",
+  "description": "Factory Pods: open-source autonomous edge workers on Cloudflare Workers, by futr.work",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "pods/*"
+  ],
+  "scripts": {
+    "build": "npm run --workspaces --if-present build",
+    "check": "npm run --workspaces --if-present check",
+    "test": "npm run --workspaces --if-present test",
+    "scaffold": "node packages/create-factory-pod/bin/create.js",
+    "check:public": "node tests/public-hygiene.mjs",
+    "test:root": "node --test tests/*.test.mjs"
+  },
+  "keywords": [
+    "factory-pods",
+    "autonomous-agents",
+    "cloudflare-workers",
+    "mcp",
+    "edge-ai",
+    "futr-work"
+  ],
+  "author": "futr.work",
+  "license": "MIT",
+  "homepage": "https://futr.work",
+  "bugs": {
+    "url": "https://github.com/futr-work/factory-pods/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/futr-work/factory-pods.git"
+  }
+}
