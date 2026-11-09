@@ -163,7 +163,7 @@ test("MCP JSON-RPC tools/call submit_indexnow", async () => {
   globalThis.fetch = (async () => new Response("", { status: 202 })) as typeof fetch;
   let res: Response;
   try {
-    res = await handleMcpRequest(req, {}, config);
+    res = await handleMcpRequest(req, { INDEXNOW_KEY: "test-indexnow-key-0000000000000000" }, config);
   } finally {
     globalThis.fetch = realFetch;
   }
