@@ -22,7 +22,7 @@ export interface SeoRobotsConfig {
   domain: string;
   sitemapUrl?: string;
   allowAiSearch?: boolean;      // Allow Perplexity, OAI-SearchBot, Claude-Web
-  allowAiTraining?: boolean;    // Allow GPTBot, ClaudeBot, Google-Extended, CCBot... (default: true)
+  allowAiTraining?: boolean;    // Allow AI training crawlers, including Bytespider; false blocks them (default: true)
   disallowPaths?: string[];     // Private paths repeated in every group (e.g. lead funnels)
 }
 
