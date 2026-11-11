@@ -146,10 +146,10 @@ export async function resolveOptimalModel(
   params.push(now, now - EXHAUSTED_COOLDOWN_MS, now - RATE_LIMIT_COOLDOWN_MS);
 
   const order = category === "fast_classification"
-    ? "tokens_per_sec DESC, quality_score DESC"
+    ? "CASE WHEN tier = 'OAUTH' THEN 0 ELSE 1 END ASC, tokens_per_sec DESC, quality_score DESC, COALESCE(output_cost_per_1m, 1e9) ASC"
     : category === "coding"
-    ? "quality_score DESC, CASE WHEN tier = 'OAUTH' THEN 0 WHEN tier = 'FREE_TIER' THEN 1 ELSE 2 END ASC, COALESCE(output_cost_per_1m, 1e9) ASC, tokens_per_sec DESC"
-    : "quality_score DESC, COALESCE(output_cost_per_1m, 1e9) ASC, tokens_per_sec DESC";
+    ? "CASE WHEN tier = 'OAUTH' THEN 0 ELSE 1 END ASC, quality_score DESC, CASE WHEN tier = 'FREE_TIER' THEN 0 ELSE 1 END ASC, COALESCE(output_cost_per_1m, 1e9) ASC, tokens_per_sec DESC"
+    : "CASE WHEN tier = 'OAUTH' THEN 0 ELSE 1 END ASC, quality_score DESC, CASE WHEN tier = 'FREE_TIER' THEN 0 ELSE 1 END ASC, COALESCE(output_cost_per_1m, 1e9) ASC, tokens_per_sec DESC";
 
   const row = await db
     .prepare(`SELECT * FROM model_catalog WHERE ${where.join(" AND ")} ORDER BY ${order} LIMIT 1`)

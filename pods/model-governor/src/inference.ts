@@ -9,6 +9,12 @@ export interface InferenceEnv {
   OPENROUTER_API_KEY?: string;
   ORCAROUTER_API_KEY?: string;
   ORCAROUTER_BASE_URL?: string;
+  FIREWORKS_API_KEY?: string;
+  FIREWORKS_BASE_URL?: string;
+  CEREBRAS_API_KEY?: string;
+  CEREBRAS_BASE_URL?: string;
+  OPENSCALE_API_KEY?: string;
+  OPENSCALE_BASE_URL?: string;
 }
 
 export interface InferenceRequest {
@@ -37,11 +43,20 @@ const DEFAULT_TIMEOUT_MS = 30_000;
  * Providers with an HTTP chat endpoint the governor can call. OAuth subscription models (tier OAUTH) are
  * driven by a local CLI on the operator's machine, not by an HTTP request, so they are never routed here.
  */
-export const CALLABLE_PROVIDERS = new Set(["openrouter", "orcarouter"]);
+export const CALLABLE_PROVIDERS = new Set(["openrouter", "orcarouter", "fireworks", "cerebras", "openscale"]);
 
 function endpoint(provider: string, env: InferenceEnv): { url: string; key?: string } {
   if (provider === "orcarouter") {
     return { url: `${env.ORCAROUTER_BASE_URL || "https://api.orcarouter.ai/v1"}/chat/completions`, key: env.ORCAROUTER_API_KEY };
+  }
+  if (provider === "fireworks") {
+    return { url: `${env.FIREWORKS_BASE_URL || "https://api.fireworks.ai/inference/v1"}/chat/completions`, key: env.FIREWORKS_API_KEY };
+  }
+  if (provider === "cerebras") {
+    return { url: `${env.CEREBRAS_BASE_URL || "https://api.cerebras.ai/v1"}/chat/completions`, key: env.CEREBRAS_API_KEY };
+  }
+  if (provider === "openscale") {
+    return { url: `${env.OPENSCALE_BASE_URL || "https://api.openscale.so/v1"}/chat/completions`, key: env.OPENSCALE_API_KEY };
   }
   return { url: "https://openrouter.ai/api/v1/chat/completions", key: env.OPENROUTER_API_KEY };
 }

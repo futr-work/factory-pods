@@ -25,6 +25,12 @@ interface Env {
   OPENROUTER_API_KEY?: string;
   ORCAROUTER_API_KEY?: string;
   ORCAROUTER_BASE_URL?: string;
+  FIREWORKS_API_KEY?: string;
+  FIREWORKS_BASE_URL?: string;
+  CEREBRAS_API_KEY?: string;
+  CEREBRAS_BASE_URL?: string;
+  OPENSCALE_API_KEY?: string;
+  OPENSCALE_BASE_URL?: string;
   /** HD-set daily ceiling for probing PAID models. Default 0: paid models are never probed automatically. */
   PROBE_BUDGET_USD_DAILY?: string;
 }
@@ -92,9 +98,23 @@ export default {
       return new Response(html, { status: 200, headers: { ...corsHeaders, "Content-Type": "text/html; charset=utf-8" } });
     }
 
-    // API: List Model Catalog with Pricing and Benchmarks
-    if (method === "GET" && url.pathname === "/api/models") {
+    // API: List Model Catalog with Pricing and Benchmarks (and OpenAI-compatible /v1/models)
+    if (method === "GET" && (url.pathname === "/api/models" || url.pathname === "/v1/models" || url.pathname === "/models")) {
       const catalog = await getModelCatalog(db);
+      if (url.pathname === "/v1/models" || url.pathname === "/models") {
+        return json({
+          object: "list",
+          data: [
+            { id: "auto", object: "model", created: Math.floor(Date.now() / 1000), owned_by: "model-governor" },
+            ...catalog.map((m) => ({
+              id: m.id,
+              object: "model",
+              created: Math.floor((m.firstSeenAt || Date.now()) / 1000),
+              owned_by: m.provider,
+            })),
+          ],
+        }, 200, corsHeaders);
+      }
       return new Response(JSON.stringify({ catalog }), {
         status: 200,
         headers: { ...corsHeaders, "Content-Type": "application/json" },
@@ -293,13 +313,14 @@ export default {
       }
     }
 
-    // API: Governor-mediated inference. Pods send prompts; the governor holds the provider keys, picks a
+    // API: Governor-mediated inference and OpenAI-compatible completions. Pods send prompts; the governor holds the provider keys, picks a
     // measured model, records the usage and returns the text, so no pod needs its own provider credential.
-    if (method === "POST" && url.pathname === "/api/inference") {
+    const isOpenAiPath = url.pathname === "/v1/chat/completions" || url.pathname === "/chat/completions" || url.pathname === "/api/inference/chat/completions";
+    if (method === "POST" && (url.pathname === "/api/inference" || isOpenAiPath)) {
       const body = (await request.json().catch(() => null)) as
-        | { podId?: string; taskId?: string; category?: string; model?: string; excludeFamily?: string; temperature?: number; maxTokens?: number; messages?: unknown }
+        | { podId?: string; taskId?: string; category?: string; model?: string; excludeFamily?: string; temperature?: number; maxTokens?: number; max_tokens?: number; messages?: unknown }
         | null;
-      if (!body || !body.podId || !Array.isArray(body.messages) || body.messages.length === 0) {
+      if (!body || (!isOpenAiPath && !body.podId) || !Array.isArray(body.messages) || body.messages.length === 0) {
         return json({ error: "podId and a non-empty messages array are required" }, 400, corsHeaders);
       }
       const messages = body.messages.filter(
@@ -307,17 +328,51 @@ export default {
           Boolean(m) && typeof m === "object" && typeof (m as { role?: unknown }).role === "string" && typeof (m as { content?: unknown }).content === "string",
       );
       if (messages.length !== body.messages.length) return json({ error: "each message needs a string role and content" }, 400, corsHeaders);
+
+      const podId = String(body.podId || "openbot");
+      const modelPreference = body.model === "auto" ? undefined : body.model;
+      const maxTokens = body.maxTokens ?? body.max_tokens;
+
       const result = await runInference(db, env, {
-        podId: String(body.podId),
+        podId,
         taskId: body.taskId,
         category: body.category,
-        model: body.model,
+        model: modelPreference,
         excludeFamily: body.excludeFamily,
         temperature: body.temperature,
-        maxTokens: body.maxTokens,
+        maxTokens,
         messages,
       });
       if (!result.ok) return json({ error: result.error, model: result.model ?? null }, result.status, corsHeaders);
+
+      if (isOpenAiPath) {
+        return json(
+          {
+            id: `chatcmpl-${Date.now()}`,
+            object: "chat.completion",
+            created: Math.floor(Date.now() / 1000),
+            model: result.model,
+            choices: [
+              {
+                index: 0,
+                message: {
+                  role: "assistant",
+                  content: result.content,
+                },
+                finish_reason: "stop",
+              },
+            ],
+            usage: {
+              prompt_tokens: result.usage.promptTokens,
+              completion_tokens: result.usage.completionTokens,
+              total_tokens: result.usage.promptTokens + result.usage.completionTokens,
+            },
+          },
+          200,
+          corsHeaders,
+        );
+      }
+
       return json(result, 200, corsHeaders);
     }
 
