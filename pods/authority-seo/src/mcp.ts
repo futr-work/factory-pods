@@ -69,7 +69,7 @@ const MCP_TOOLS = [
         },
         allowAiTraining: {
           type: "boolean",
-          description: "Allow bulk dataset training scrapers (default: false)",
+          description: "Allow AI model training crawlers such as GPTBot, ClaudeBot, Google-Extended (default: true)",
         },
       },
       required: ["domain"],

@@ -22,8 +22,20 @@ export interface SeoRobotsConfig {
   domain: string;
   sitemapUrl?: string;
   allowAiSearch?: boolean;      // Allow Perplexity, OAI-SearchBot, Claude-Web
-  allowAiTraining?: boolean;    // Allow GPTBot, CCBot, Bytespider
+  allowAiTraining?: boolean;    // Allow AI training crawlers, including Bytespider; false blocks them (default: true)
+  disallowPaths?: string[];     // Private paths repeated in every group (e.g. lead funnels)
 }
+
+const SEARCH_ENGINE_AGENTS = ["Googlebot", "Bingbot", "Applebot", "Slurp", "DuckDuckBot", "YandexBot", "Baiduspider"];
+const AI_SEARCH_AGENTS = [
+  "OAI-SearchBot", "ChatGPT-User", "PerplexityBot", "Perplexity-User",
+  "Claude-SearchBot", "Claude-User", "Claude-Web", "Meta-ExternalAgent",
+];
+const AI_TRAINING_AGENTS = [
+  "GPTBot", "CCBot", "Bytespider", "ClaudeBot", "anthropic-ai", "Google-Extended", "Applebot-Extended",
+  "cohere-ai", "cohere-training-data-crawler", "Amazonbot", "Meta-ExternalFetcher", "FacebookBot",
+  "Diffbot", "MistralAI-User",
+];
 
 export interface SeoSchemaConfig {
   type: "Organization" | "WebSite" | "Article" | "LocalBusiness" | "MedicalBusiness" | "FAQPage";
@@ -152,85 +164,61 @@ export class AuthoritySeoPodHandler implements TaskHandler {
   }
 
   /**
-   * Generates a strict 2026 AI Search & Crawler Governance policy
+   * Generates a 2026 AI Search & Crawler Governance policy.
+   *
+   * Default posture is allow-all: search engines, AI citation engines AND AI
+   * training crawlers, so the property is cited today and present in future
+   * model knowledge. Training can still be opted out per property.
+   *
+   * A crawler obeys only the most specific group that names it, so
+   * `disallowPaths` is repeated in every group rather than only under `*`.
    */
   public generateRobotsTxt(config: Partial<SeoRobotsConfig>): { robotsTxt: string; summary: string } {
     const domain = config.domain || "example.com";
     const sitemapUrl = config.sitemapUrl || `https://${domain}/sitemap.xml`;
     const allowAiSearch = config.allowAiSearch !== false; // Default: true
-    const allowAiTraining = config.allowAiTraining === true; // Default: false (protect IP)
+    const allowAiTraining = config.allowAiTraining !== false; // Default: true (opt in to future models)
+    const disallowPaths = (config.disallowPaths ?? []).filter((path) => path.startsWith("/") && path !== "/");
+
+    const group = (comment: string, agents: string[], allow: boolean): string[] => [
+      comment,
+      ...agents.map((agent) => `User-agent: ${agent}`),
+      ...(allow ? ["Allow: /", ...disallowPaths.map((path) => `Disallow: ${path}`)] : ["Disallow: /"]),
+      "",
+    ];
 
     const lines: string[] = [
       "# ===========================================================================",
       `# 2026 AI Search Engine & Web Crawler Governance Policy`,
       `# Property: ${domain}`,
       `# Generated: ${new Date().toISOString()}`,
+      "# Cloudflare Managed robots.txt / Block AI bots must stay OFF: they",
+      "# prepend Disallow groups that override this policy at the edge.",
       "# ===========================================================================",
       "",
-      "# Standard Search Engines (Always Allowed)",
-      "User-agent: Googlebot",
-      "User-agent: Bingbot",
-      "User-agent: Slurp",
-      "User-agent: DuckDuckBot",
-      "User-agent: Baiduspider",
-      "User-agent: YandexBot",
-      "Allow: /",
-      "",
-    ];
-
-    if (allowAiSearch) {
-      lines.push(
-        "# AI Citation & Search Engines (Allowed for LLM Citations & Perplexity/SearchGPT Overviews)",
-        "User-agent: PerplexityBot",
-        "User-agent: OAI-SearchBot",
-        "User-agent: Claude-Web",
-        "User-agent: Applebot-Extended",
-        "Allow: /",
-        ""
-      );
-    } else {
-      lines.push(
-        "# AI Citation & Search Engines (Disallowed)",
-        "User-agent: PerplexityBot",
-        "User-agent: OAI-SearchBot",
-        "User-agent: Claude-Web",
-        "User-agent: Applebot-Extended",
-        "Disallow: /",
-        ""
-      );
-    }
-
-    if (allowAiTraining) {
-      lines.push(
-        "# Unconsented AI Training Scrapers (Allowed)",
-        "User-agent: GPTBot",
-        "User-agent: CCBot",
-        "User-agent: Bytespider",
-        "User-agent: anthropic-ai",
-        "Allow: /",
-        ""
-      );
-    } else {
-      lines.push(
-        "# Unconsented AI Training Scrapers (Explicitly Blocked to Prevent IP Ingestion)",
-        "User-agent: GPTBot",
-        "User-agent: CCBot",
-        "User-agent: Bytespider",
-        "User-agent: anthropic-ai",
-        "User-agent: Google-Extended",
-        "User-agent: FacebookBot",
-        "Disallow: /",
-        ""
-      );
-    }
-
-    lines.push(
+      ...group("# Standard Search Engines (Always Allowed)", SEARCH_ENGINE_AGENTS, true),
+      ...group(
+        allowAiSearch
+          ? "# AI Citation & Search Engines (Allowed for LLM citations and AI answers)"
+          : "# AI Citation & Search Engines (Disallowed)",
+        AI_SEARCH_AGENTS,
+        allowAiSearch,
+      ),
+      ...group(
+        allowAiTraining
+          ? "# AI Model Training Crawlers (Allowed: include this property in future models)"
+          : "# AI Model Training Crawlers (Disallowed)",
+        AI_TRAINING_AGENTS,
+        allowAiTraining,
+      ),
       "# Fallback Policy for All Other User Agents",
       "User-agent: *",
+      `Content-Signal: search=yes, ai-input=${allowAiSearch ? "yes" : "no"}, ai-train=${allowAiTraining ? "yes" : "no"}`,
       "Allow: /",
+      ...disallowPaths.map((path) => `Disallow: ${path}`),
       "",
-      `Sitemap: ${sitemapUrl}`
-    );
+      `Sitemap: ${sitemapUrl}`,
+    ];
 
     return {
       robotsTxt: lines.join("\n"),
@@ -390,7 +378,7 @@ export class AuthoritySeoPodHandler implements TaskHandler {
       domain,
       sitemapUrl: `https://${domain}/sitemap.xml`,
       allowAiSearch: true,
-      allowAiTraining: false,
+      allowAiTraining: true,
     });
 
     const schema = this.generateSchemaJsonLd({
@@ -412,7 +400,7 @@ export class AuthoritySeoPodHandler implements TaskHandler {
       robotsTxt: robots.robotsTxt,
       schemaOrgJsonLd: schema,
       onPageRecommendations: { home: homeMeta },
-      summary: `Generated production fix pack for ${domain}: AI robots.txt with search-allow/train-deny directives, Schema.org Organization JSON-LD, and metadata recommendations.`,
+      summary: `Generated production fix pack for ${domain}: AI robots.txt allowing search, AI citation and AI training crawlers, Schema.org Organization JSON-LD, and metadata recommendations.`,
     };
   }
 
@@ -429,7 +417,7 @@ export class AuthoritySeoPodHandler implements TaskHandler {
       domain: "clinic.example.com",
       sitemapUrl: "https://clinic.example.com/sitemap.xml",
       allowAiSearch: true,
-      allowAiTraining: false,
+      allowAiTraining: true,
     });
 
     const schema = this.generateSchemaJsonLd({
@@ -485,7 +473,16 @@ export class AuthoritySeoPodHandler implements TaskHandler {
     context?: HandlerContext
   ): Promise<{ status: number; success: boolean; submitted: number; host: string; message: string }> {
     const domain = options.domain || "clinic.example.com";
-    const key = options.key || context?.env?.INDEXNOW_KEY || (typeof process !== "undefined" ? process.env?.INDEXNOW_KEY : "") || "e3b0c44298fc1c149afbf4c8996fb924";
+    const key = options.key || context?.env?.INDEXNOW_KEY || (typeof process !== "undefined" ? process.env?.INDEXNOW_KEY : "") || "";
+    if (!key) {
+      return {
+        status: 400,
+        success: false,
+        submitted: 0,
+        host: domain,
+        message: "INDEXNOW_KEY is not configured; set it as a Worker secret and host it at /<key>.txt.",
+      };
+    }
     const urls = options.urls && options.urls.length > 0 ? options.urls : [`https://${domain}/`, `https://${domain}/glp-1`, `https://${domain}/guides/glp-1-care-cycle`];
 
     const payload = {

@@ -68,6 +68,30 @@ describe("Factory Pod Template Test Suite", () => {
     assert.equal(res.robotsTxt.includes("User-agent: OAI-SearchBot"), true);
     assert.equal(res.robotsTxt.includes("User-agent: GPTBot\nUser-agent: CCBot\nUser-agent: Bytespider"), true);
     assert.equal(res.robotsTxt.includes("Sitemap: https://loans.example.com/sitemap.xml"), true);
+    assert.equal(res.robotsTxt.includes("ai-train=no"), true);
+  });
+
+  test("4b. robots.txt allows AI training crawlers by default and repeats private paths per group", () => {
+    const handler = new DefaultPodHandler();
+    const res = handler.generateRobotsTxt({ domain: "quotes.example.com", disallowPaths: ["/quiz/start"] });
+    const groups = res.robotsTxt.split("\n\n").filter((block) => block.includes("User-agent:"));
+
+    assert.equal(res.robotsTxt.includes("Content-Signal: search=yes, ai-input=yes, ai-train=yes"), true);
+    assert.equal(/^Disallow: \/$/m.test(res.robotsTxt), false);
+    for (const agent of ["GPTBot", "ClaudeBot", "Google-Extended", "CCBot", "Googlebot", "OAI-SearchBot", "*"]) {
+      const block = groups.find((g) => g.split("\n").includes(`User-agent: ${agent}`));
+      assert.ok(block, agent);
+      assert.match(block, /^Allow: \/$/m, agent);
+      assert.match(block, /^Disallow: \/quiz\/start$/m, agent);
+    }
+    assert.match(res.summary, /Training Scrapers: ALLOWED/);
+  });
+
+  test("4c. IndexNow submission refuses to run without a configured key", async () => {
+    const handler = new DefaultPodHandler();
+    const res = await handler.submitIndexNow({ domain: "quotes.example.com", urls: ["https://quotes.example.com/"] }, { env: {} } as any);
+    assert.equal(res.success, false);
+    assert.equal(res.status, 400);
   });
 
   test("5. AuthoritySeoPodHandler generates schema.org JSON-LD", () => {
@@ -128,7 +152,7 @@ describe("Factory Pod Template Test Suite", () => {
         podConfig: loadPodConfig(),
         now: Date.now(),
         publishEvent: async () => {},
-        env: { INDEXNOW_KEY: "e3b0c44298fc1c149afbf4c8996fb924" },
+        env: { INDEXNOW_KEY: "test-indexnow-key-0000000000000000" },
       });
     } finally {
       globalThis.fetch = realFetch;
