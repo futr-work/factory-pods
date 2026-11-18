@@ -86,7 +86,8 @@ CREATE TABLE IF NOT EXISTS model_catalog (
   probe_passes INTEGER NOT NULL DEFAULT 0,
   approved_by TEXT,
   approved_at INTEGER,
-  model_created_at INTEGER
+  model_created_at INTEGER,
+  supports_tools INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_catalog_route ON model_catalog(category, lifecycle);
@@ -142,3 +143,15 @@ CREATE TABLE IF NOT EXISTS usage_reports (
   report_json TEXT NOT NULL,
   created_at INTEGER NOT NULL
 );
+
+-- Per-caller routing policy and daily budget. Caller = X-Governor-Caller (agent-<id>, team:<name>) or podId;
+-- usage is attributed to it in llm_usage_events.pod_id. Caller '*' is the stored default for everyone else.
+CREATE TABLE IF NOT EXISTS caller_policies (
+  caller_id TEXT PRIMARY KEY,
+  category TEXT,
+  preferred_tier INTEGER NOT NULL DEFAULT 0 CHECK (preferred_tier BETWEEN 0 AND 2),
+  max_tier INTEGER NOT NULL DEFAULT 1 CHECK (max_tier BETWEEN 0 AND 2),
+  daily_budget_usd REAL NOT NULL DEFAULT 1,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_usage_pod_created ON llm_usage_events(pod_id, created_at);
