@@ -631,6 +631,18 @@ describe("governor-mediated inference", () => {
     // Nothing qualified in the catalog yet, so the governor says so instead of guessing a model.
     const none = await post({ podId: "p", messages: [{ role: "user", content: "x" }] });
     assert.equal(none.status, 404);
+
+    // OpenAI compatibility: /v1/chat/completions route accepts standard format
+    const openAiReq = await worker.fetch(
+      new Request("https://gov.test/v1/chat/completions", {
+        method: "POST",
+        headers: { Authorization: "Bearer hub-secret", "Content-Type": "application/json" },
+        body: JSON.stringify({ model: "auto", messages: [{ role: "user", content: "hello" }] }),
+      }),
+      routeEnv,
+    );
+    // 404 because no model qualified in this freshDb, but confirms route matches and defaults podId without 400
+    assert.equal(openAiReq.status, 404);
   });
 });
 

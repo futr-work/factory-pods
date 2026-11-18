@@ -2,3 +2,5 @@
 # Generate a secret: openssl rand -hex 32  (copy this file to .dev.vars)
 # Left empty, the pod fails closed: only /health is served.
 FACTORY_HUB_TOKEN=
+# Optional: a token that opens only the OpenAI-compatible routes, for outside clients such as an agent app.
+GOVERNOR_CLIENT_TOKEN=

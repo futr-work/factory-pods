@@ -140,9 +140,12 @@ export async function recordProbe(db: PodStorage, target: ProbeTarget, r: ProbeR
     }
     if (/HTTP 429|rate[- ]limit|quota/i.test(r.error ?? "")) {
       await db.prepare("UPDATE model_catalog SET status = 'rate_limited', last_benchmarked_at = ? WHERE id = ?").bind(now, target.id).run();
-      await db.prepare(`INSERT INTO provider_quotas (provider, status, error, exhausted_at, updated_at) VALUES (?, 'rate_limited', ?, ?, ?)
-        ON CONFLICT(provider) DO UPDATE SET status = 'rate_limited', error = excluded.error, updated_at = excluded.updated_at`)
-        .bind(target.provider, r.error ?? "rate limited", now, now).run().catch(() => {});
+      // Only lockout the entire provider if this is not a free-tier/model-specific cap
+      if (target.tier !== "FREE_TIER" && !/free-models/i.test(r.error ?? "")) {
+        await db.prepare(`INSERT INTO provider_quotas (provider, status, error, exhausted_at, updated_at) VALUES (?, 'rate_limited', ?, ?, ?)
+          ON CONFLICT(provider) DO UPDATE SET status = 'rate_limited', error = excluded.error, updated_at = excluded.updated_at`)
+          .bind(target.provider, r.error ?? "rate limited", now, now).run().catch(() => {});
+      }
     }
     // 401/403/404 or quota/usage limit: park or mark exhausted
     else if (/HTTP 40[134]|usage limit|unsupported/i.test(r.error ?? "")) {
