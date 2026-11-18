@@ -250,7 +250,7 @@ whatever caller ids a client sends. Over it, every caller is limited to tier 0 f
 curl -sS -X POST -H "Authorization: Bearer $GOVERNOR_ADMIN_TOKEN" -H "Content-Type: application/json" \
   -d '{"preferredTier": 1, "maxTier": 2, "dailyBudgetUsd": 5, "category": "coding"}' \
   "https://<your-pod-subdomain>.workers.dev/api/governor/callers/agent-grandmaster"
-# Live spend against budget per caller (hub token). Also included as callersToday in /api/governor/usage-report,
+# Live spend against budget per caller (hub token or admin token). Also included as callersToday in /api/governor/usage-report,
 # whose report.pods[] is the per-caller breakdown for the reported day.
 curl -sS -H "Authorization: Bearer $FACTORY_HUB_TOKEN" "https://<your-pod-subdomain>.workers.dev/api/governor/callers"
 ```

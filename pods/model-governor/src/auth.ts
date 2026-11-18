@@ -6,6 +6,8 @@
 //     client such as OpenBot can use the governor without holding the mesh-wide hub token.
 //   - Admin routes (approve a paid model, set caller budgets, trigger discovery and probes): Bearer
 //     <GOVERNOR_ADMIN_TOKEN> only. Pods share FACTORY_HUB_TOKEN, so a pod must never be able to approve spend (ruling #1).
+//   - Spend reads (GET /api/governor/callers, /api/governor/usage-report): the hub token or the admin token, so the
+//     operator who sets budgets can see what they are spent on without holding the mesh-wide hub token.
 // Fails closed: without FACTORY_HUB_TOKEN only /health is served (plus client routes if GOVERNOR_CLIENT_TOKEN is set);
 // without GOVERNOR_ADMIN_TOKEN no admin route is.
 
@@ -32,6 +34,13 @@ export function isClientRoute(method: string, pathname: string): boolean {
   return (method === "POST" && CLIENT_POST.has(pathname)) || (method === "GET" && CLIENT_GET.has(pathname));
 }
 
+const ADMIN_READ_GET = new Set(["/api/governor/callers", "/api/governor/usage-report"]);
+
+/** Read-only spend views the admin token may open in addition to the hub token. */
+export function isAdminReadRoute(method: string, pathname: string): boolean {
+  return method === "GET" && ADMIN_READ_GET.has(pathname);
+}
+
 /** Returns a rejection Response, or null if the request may proceed. */
 export function authGate(request: Request, env: GovAuthEnv): Response | null {
   const url = new URL(request.url);
@@ -42,6 +51,10 @@ export function authGate(request: Request, env: GovAuthEnv): Response | null {
       status: 403,
       headers: { "Content-Type": "application/json" },
     });
+  }
+  if (env.GOVERNOR_ADMIN_TOKEN && isAdminReadRoute(request.method, url.pathname)) {
+    const secret = presentedSecret(request.headers.get("Authorization"));
+    if (secret !== null && timingSafeEqual(secret, env.GOVERNOR_ADMIN_TOKEN)) return null;
   }
   if (env.GOVERNOR_CLIENT_TOKEN && isClientRoute(request.method, url.pathname)) {
     const secret = presentedSecret(request.headers.get("Authorization"));

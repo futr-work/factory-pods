@@ -317,6 +317,12 @@ describe("per-caller budgets", () => {
       callers.map((c: any) => [c.callerId, c.spentTodayUsd, c.dailyBudgetUsd, c.maxTier, c.source]),
       [["agent-buyers", 0.25, 3, 2, "caller"]],
     );
+
+    const get = (path: string, auth: string) => worker.fetch(new Request(`https://gov.test${path}`, { headers: { Authorization: auth } }), { DB: db, ...ENV } as any);
+    assert.equal((await get("/api/governor/callers", "Bearer admin-secret")).status, 200, "admin reads spend");
+    assert.equal((await get("/api/governor/callers", "Bearer client-secret")).status, 401, "client token cannot read spend");
+    assert.notEqual((await get("/api/governor/usage-report", "Bearer admin-secret")).status, 401, "admin reads the usage report");
+    assert.equal((await get("/api/telemetry/stats", "Bearer admin-secret")).status, 401, "admin token opens only the spend reads");
   });
 });
 
