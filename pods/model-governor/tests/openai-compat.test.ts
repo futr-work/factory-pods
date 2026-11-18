@@ -269,7 +269,7 @@ describe("per-caller budgets", () => {
     assert.equal(over.ok && over.model.id, "openrouter:acme/free-tools", "capped: downgraded to tier 0");
     // A pinned paid model is not an escape hatch from the cap.
     const pinned = await runChatCompletion(db, ENV, { callerId: "agent-scout", model: "openrouter:deepseek/v4", body: { messages: TOOL_MESSAGES, tools: TOOLS } }, fetcher);
-    assert.equal(pinned.ok && pinned.model.id, "openrouter:acme/free-tools");
+    assert.equal(!pinned.ok && pinned.code, "budget_exceeded");
 
     await db.prepare("UPDATE model_catalog SET supports_tools = 0 WHERE id = 'openrouter:acme/free-tools'").run();
     const res = await withFetch(fetcher, () => chat(db, { model: "auto", messages: TOOL_MESSAGES, tools: TOOLS }, { "X-Governor-Caller": "agent-scout" }));
@@ -278,7 +278,7 @@ describe("per-caller budgets", () => {
     assert.equal(body.error.code, "budget_exceeded");
     assert.equal(body.error.type, "insufficient_quota");
     assert.match(body.error.message, /agent-scout spent \$0\.60\d\d of its \$0\.5 daily budget/);
-    assert.equal(calls.length, 3, "the blocked request made no upstream call");
+    assert.equal(calls.length, 2, "the blocked request made no upstream call");
     // Other callers are unaffected.
     const other = await runChatCompletion(db, ENV, { callerId: "agent-offer", body: { messages: TOOL_MESSAGES, tools: TOOLS } }, fetcher);
     assert.equal(other.ok, true);
@@ -420,7 +420,100 @@ test("OpenAI model lists advertise unique callable names for the caller, and tho
     assert.equal(response.status, 200);
     assert.deepEqual(((await response.json()) as any).data.map((m: any) => m.id), ["auto", "acme/shared"]);
   }
-  const { fetcher } = providers({ "acme/shared": ok(TOOL_ANSWER) });
+  const { fetcher } = providers({ "acme/shared": ok({ ...TOOL_ANSWER, model: "acme/shared" }) });
   const response = await withFetch(fetcher, () => chat(db, { model: "acme/shared", messages: TOOL_MESSAGES }, {}, "/v1/chat/completions", env));
   assert.equal(response.status, 200);
+});
+
+describe("exact named routing", () => {
+  const messages = [{ role: "user", content: "review" }];
+  test("a named request returns the provider restriction while auto and omitted can switch models", async () => {
+    const { db } = freshDb();
+    await addModel(db, { id: "openrouter:review-1017", quality: 99 });
+    await addModel(db, { id: "openrouter:general", quality: 50 });
+    const { calls, fetcher } = providers({
+      "review-1017": status(403, JSON.stringify({ error: { message: "provider_project_access_denied" } })),
+      "general": ok({ model: "general", choices: [] }),
+    });
+    await withFetch(fetcher, async () => {
+      const named = await chat(db, { model: "review-1017", messages });
+      assert.equal(named.status, 403);
+      const { error } = await named.json() as any;
+      assert.equal(error.requested_model, "review-1017");
+      assert.match(error.message, /provider_project_access_denied/);
+      assert.equal(error.model, "openrouter:review-1017");
+      assert.deepEqual(calls.map(c => c.body.model), ["review-1017"]);
+      for (const model of ["auto", undefined]) {
+        const auto = await chat(db, { model, messages });
+        assert.equal(auto.headers.get("X-Governor-Model"), "openrouter:general");
+      }
+      for (const model of ["", " ", null, false, "auto:"]) assert.equal((await chat(db, { model, messages })).status, 400);
+    });
+  });
+
+  test("only bare names can move to another provider of the same model", async () => {
+    const { db } = freshDb();
+    await addModel(db, { id: "openrouter:review-1017", quality: 99 });
+    await addModel(db, { id: "cerebras:review-1017", provider: "cerebras" });
+    await addModel(db, { id: "openrouter:review-latest", quality: 100 });
+    const env = { ...ENV, CEREBRAS_API_KEY: "test" };
+    const seen: string[] = [];
+    const fetcher = (async (url, init) => {
+      seen.push(JSON.parse(String(init?.body)).model);
+      return String(url).includes("openrouter") ? new Response("down", { status: 503 }) : ok({ model: "review-1017" })();
+    }) as typeof fetch;
+    await withFetch(fetcher, async () => {
+      const post = (model: string) => chat(db, { model, messages }, {}, "/v1/chat/completions", env);
+      assert.equal((await post("openrouter:review-1017")).status, 503);
+      assert.equal(seen.length, 1);
+      assert.equal((await post("review-1017")).headers.get("X-Governor-Model"), "cerebras:review-1017");
+      assert.deepEqual(seen, ["review-1017", "review-1017", "review-1017"]);
+    });
+  });
+
+  test("named JSON and streams verify the provider's model before returning content", async () => {
+    const { db } = freshDb();
+    await addModel(db, { id: "openrouter:review-1017" });
+    for (const stream of [false, true]) {
+      for (const model of ["review-latest", undefined, "review-1017"]) {
+        const chunk = { model, choices: [{ delta: { content: "receipt" } }] };
+        const wire = ": heartbeat\r\n\r\ndata: " + JSON.stringify(chunk) + "\r\n\r\ndata: [DONE]\r\n\r\n";
+        const { fetcher } = providers({ "review-1017": stream ? () => new Response(wire) : ok(chunk) });
+        const response = await withFetch(fetcher, () => chat(db, { model: "review-1017", messages, stream }));
+        if (model === "review-1017") {
+          assert.equal(response.status, 200);
+          assert.match(await response.text(), /receipt/);
+        } else {
+          assert.equal(response.status, 502);
+          assert.match((await response.json() as any).error.message, /expected "review-1017"/);
+        }
+      }
+    }
+  });
+
+  test("invalid HTTP 200 responses produce a structured failure and no substitution", async () => {
+    const { db } = freshDb();
+    await addModel(db, { id: "openrouter:exact" });
+    await addModel(db, { id: "openrouter:other" });
+    for (const invalid of ["null", "[]", "{"]) {
+      const { fetcher, calls } = providers({ exact: () => new Response(invalid) });
+      const res = await withFetch(fetcher, () => chat(db, { model: "exact", messages }));
+      assert.equal(res.status, 502);
+      const { error } = await res.json() as any;
+      assert.equal(error.code, "named_model_failed");
+      assert.match(error.message, /invalid chat response|malformed JSON/);
+      assert.deepEqual(calls.map(c => c.body.model), ["exact"]);
+    }
+  });
+
+  test("a stream changing identity after the first event terminates with an error receipt", async () => {
+    const { db } = freshDb();
+    await addModel(db, { id: "openrouter:exact" });
+    const { fetcher } = providers({ exact: () => new Response('data: {"model":"exact"}\n\ndata: {"model":"other","choices":[{"delta":{"content":"wrong"}}]}\n\n') });
+    const res = await withFetch(fetcher, () => chat(db, { model: "exact", messages, stream: true }));
+    const reader = res.body!.getReader();
+    assert.match(new TextDecoder().decode((await reader.read()).value), /"exact"/);
+    await assert.rejects(reader.read(), /provider reported "other"/);
+    assert.equal((await db.prepare("SELECT status FROM llm_usage_events").first() as any).status, "error");
+  });
 });
