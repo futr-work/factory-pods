@@ -36,7 +36,7 @@ export interface ModelEntry {
 }
 
 /** Outcome recorded for one model call. */
-export type LlmUsageStatus = "success" | "error" | "rate_limited";
+export type LlmUsageStatus = "success" | "error" | "rate_limited" | "usage_unavailable" | "cancelled";
 
 export interface LlmUsageEvent {
   id: string;
@@ -225,7 +225,7 @@ export async function recordUsage(
     promptTokens: usage.promptTokens,
     completionTokens: usage.completionTokens,
     totalTokens,
-    costUsd: parseFloat(costUsd.toFixed(6)),
+    costUsd: usage.actualCost ?? parseFloat(costUsd.toFixed(6)),
     savedUsd: parseFloat(savedUsd.toFixed(6)),
     latencyMs: usage.latencyMs,
     status: usage.status ?? "success",

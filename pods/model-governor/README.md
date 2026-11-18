@@ -194,8 +194,15 @@ For named requests, the governor checks the provider's returned `model` against 
 A missing or different identity yields a provider error. For SSE the first data event must identify the
 model before the governor opens the stream. Later events may omit the identity. A changed identity terminates
 the stream before that event reaches the client. Named streams drop leading keepalive comments during
-verification. Automatic streams pass through byte-for-byte. The governor requests streamed usage and records
-it before the stream closes.
+verification. The Worker requests final usage and records it in D1 before forwarding terminal events. Delivery of earlier
+content streams normally. A Worker lifetime task can finish the receipt when the client stops reading.
+A client cancellation during generation stops the provider reader. Once the provider finishes, the Worker
+allows up to three seconds and 128 KiB for its usage trailer. Slow readers have bounded read-ahead.
+
+A stream receipt uses the reported model, token counts and provider cost when available. With no provider
+cost, the catalog supplies the price estimate. A completed stream missing final counts has status
+`usage_unavailable`. An early client cancellation has status `cancelled`. Their numeric totals contain only
+observed usage (zero for absent counts), so the resulting spend can understate actual provider charges.
 
 **Auth.** Send `Authorization: Bearer <token>`, where the token is one of:
 

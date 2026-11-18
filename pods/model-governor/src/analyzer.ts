@@ -13,6 +13,10 @@ const ERROR_RATE_HIGH = 0.25;
 const SLOW_RATIO = 2;
 const MAX_EVENTS = 100_000;
 
+function providerFailure(row: UsageRow): boolean {
+  return row.status === "error" || row.status === "rate_limited";
+}
+
 interface UsageRow {
   pod_id: string;
   provider: string;
@@ -146,7 +150,7 @@ export async function analyzeUsage(db: PodStorage, windowStart: number, windowEn
     const cat = byKey.get(modelId) ?? null;
     const ok = rows.filter((r) => r.status === "success");
     const latencies = ok.map((r) => r.latency_ms).sort((a, b) => a - b);
-    const errors = rows.length - ok.length;
+    const errors = rows.filter(providerFailure).length;
     models.push({
       modelId,
       provider: rows[0].provider,
@@ -238,7 +242,7 @@ export async function analyzeUsage(db: PodStorage, windowStart: number, windowEn
     const p = podMap.get(u.pod_id) ?? { podId: u.pod_id, calls: 0, errors: 0, tokens: 0, costUsd: 0 };
     const t = u.prompt_tokens + u.completion_tokens;
     p.calls += 1;
-    p.errors += u.status === "success" ? 0 : 1;
+    p.errors += providerFailure(u) ? 1 : 0;
     p.tokens += t;
     p.costUsd += u.cost_usd;
     podMap.set(u.pod_id, p);
@@ -259,7 +263,7 @@ export async function analyzeUsage(db: PodStorage, windowStart: number, windowEn
     generatedAt: now,
     totals: {
       calls: usage.length,
-      errors: usage.filter((u) => u.status !== "success").length,
+      errors: usage.filter(providerFailure).length,
       tokens,
       costUsd: round(usage.reduce((s, u) => s + u.cost_usd, 0)),
       tokensByTier,
