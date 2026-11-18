@@ -364,3 +364,35 @@ describe("self-upgrading schema", () => {
     await ensureSchema(db); // second run on an upgraded database is a no-op
   });
 });
+
+describe("live regression 2026-11-18", () => {
+  test("a zero-priced paid row is premium, and a provider 404 (no capacity) falls through to the next model", async () => {
+    const { db } = freshDb();
+    // The live row: PAID, approved, prices recorded as 0. It must not be routed as free.
+    await db
+      .prepare(`INSERT INTO model_catalog (id, provider, model_name, category, tier, input_cost_per_1m, output_cost_per_1m, quality_score,
+        status, lifecycle, probe_runs, approved_by, supports_tools) VALUES ('orcarouter:anthropic/claude-3.5-sonnet', 'orcarouter', 'anthropic/claude-3.5-sonnet',
+        'general_reasoning', 'PAID', 0, 0, 99, 'active', 'qualified', 3, 'hd', 1)`)
+      .run();
+    await addModel(db, { id: "openrouter:acme/free", quality: 50 });
+    const zeroPaid = mapModel({ id: "z", provider: "orcarouter", model_name: "z", tier: "PAID", input_cost_per_1m: 0, output_cost_per_1m: 0, status: "active" });
+    assert.equal(tierOf(zeroPaid), 2);
+
+    const env = { ...ENV, ORCAROUTER_API_KEY: "sk-orca" };
+    const noCapacity = status(404, JSON.stringify({ error: { message: "No available capacity for model anthropic/claude-3.5-sonnet right now." } }));
+    const { calls, fetcher } = providers({ "anthropic/claude-3.5-sonnet": noCapacity, "acme/free": ok({ choices: [{ message: { content: "PONG" } }], usage: {} }) });
+
+    // Default policy (tier 0..1): the zero-priced premium row is out of reach entirely.
+    const auto = await runChatCompletion(db, env, { callerId: "agent-smoke", body: { messages: [{ role: "user", content: "Say PONG" }] } }, fetcher);
+    assert.equal(auto.ok && auto.model.id, "openrouter:acme/free");
+    assert.deepEqual(calls.map((c) => c.body.model), ["acme/free"]);
+
+    // A caller allowed premium tries it, gets the 404, parks it, and is still served.
+    await setCallerPolicy(db, "grandmaster", { preferredTier: 2, maxTier: 2, dailyBudgetUsd: 5 });
+    const premium = await runChatCompletion(db, env, { callerId: "grandmaster", body: { messages: [{ role: "user", content: "Say PONG" }] } }, fetcher);
+    assert.equal(premium.ok && premium.model.id, "openrouter:acme/free");
+    assert.deepEqual(calls.slice(1).map((c) => c.body.model), ["anthropic/claude-3.5-sonnet", "acme/free"]);
+    const parked = (await db.prepare("SELECT status FROM model_catalog WHERE id = 'orcarouter:anthropic/claude-3.5-sonnet'").first()) as any;
+    assert.equal(parked.status, "degraded");
+  });
+});

@@ -1,7 +1,7 @@
 // Tiered routing and per-caller budgets. A tier is derived from the catalog price, never hand-assigned:
-//   tier 0  free (FREE_TIER, or a zero price)
+//   tier 0  free (FREE_TIER only; a PAID row with a zero price is unpriced, so premium)
 //   tier 1  cheap paid: output price <= TIER1_MAX_OUTPUT_COST_PER_1M (default $4/1M)
-//   tier 2  premium: anything pricier, or a paid model whose price is unknown
+//   tier 2  premium: anything pricier, or a paid model whose price is unknown or zero
 // A caller (X-Governor-Caller, else podId) has a policy: the tier it starts at, the highest tier it may reach,
 // and a daily spend cap. Over the cap, paid tiers are off for the rest of the UTC day.
 
@@ -54,8 +54,8 @@ export function asTier(n: unknown, fallback: Tier): Tier {
 
 export function tierOf(model: ModelEntry, env: RoutingEnv = {}): Tier {
   if (model.tier === "FREE_TIER") return 0;
-  if (model.outputCostPer1M === 0 && model.inputCostPer1M === 0) return 0;
-  if (model.outputCostPer1M === null) return 2;
+  // A paid row with a zero or missing price is unpriced, not free: it must never land in the free tier.
+  if (model.outputCostPer1M === null || (model.outputCostPer1M === 0 && model.inputCostPer1M === 0)) return 2;
   return model.outputCostPer1M <= num(env.TIER1_MAX_OUTPUT_COST_PER_1M, DEFAULT_TIER1_MAX_OUTPUT_COST_PER_1M) ? 1 : 2;
 }
 

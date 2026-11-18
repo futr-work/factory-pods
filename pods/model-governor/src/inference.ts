@@ -140,7 +140,7 @@ function refusesTools(status: number, text: string): boolean {
 
 /** Whether a failed attempt moves on to the next model, or is the caller's own error to return. */
 function retryable(status: number, text: string, needsTools: boolean): boolean {
-  return status === 429 || status === 402 || status === 401 || status === 403 || status === 408 || status >= 500 || (needsTools && refusesTools(status, text));
+  return status === 429 || status === 402 || status === 404 || status === 410 || status === 401 || status === 403 || status === 408 || status >= 500 || (needsTools && refusesTools(status, text));
 }
 
 async function noteFailure(db: PodStorage, model: ModelEntry, status: number, text: string, needsTools: boolean, now: number): Promise<void> {
@@ -156,6 +156,9 @@ async function noteFailure(db: PodStorage, model: ModelEntry, status: number, te
       .catch(() => {});
   } else if (needsTools && refusesTools(status, text)) {
     await db.prepare("UPDATE model_catalog SET supports_tools = 0 WHERE id = ?").bind(model.id).run().catch(() => {});
+  } else if (status === 404 || status === 410) {
+    // The provider does not serve this model right now (unknown id, no capacity). Park it until the next probe re-checks it.
+    await db.prepare("UPDATE model_catalog SET status = 'degraded', last_benchmarked_at = ? WHERE id = ?").bind(now, model.id).run().catch(() => {});
   }
 }
 
