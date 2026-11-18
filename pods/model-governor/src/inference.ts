@@ -8,7 +8,7 @@
 // never called from here: CALLABLE_PROVIDERS is the allowlist and every entry is a pay-per-use API.
 
 import type { PodStorage } from "@futr-work/pod-kernel/storage";
-import { listRoutableModels, mapModel, recordUsage, type LlmUsageStatus, type ModelEntry } from "./governor.js";
+import { listRoutableModels, mapModel, recordUsage, type LlmUsageStatus, type ModelEntry, type RouteOptions } from "./governor.js";
 import { budgetState, rankCandidates, tierOf, tierOrder, type BudgetState, type RoutingEnv, type Tier } from "./routing.js";
 
 export interface InferenceEnv extends RoutingEnv {
@@ -59,7 +59,7 @@ export interface ChatRequest {
   taskId?: string;
   /** Category to rank within; falls back to the caller policy's, then general_reasoning. */
   category?: string;
-  /** A catalog id or model name to try first. Omitted = route by policy. */
+  /** An exact catalog id or upstream model name. Omitted = route by policy. */
   model?: string;
   /** Families that must not serve this request, e.g. the producer's own family for a cross-family audit. */
   excludeFamily?: string;
@@ -91,10 +91,11 @@ export function hasTools(body: Record<string, unknown>): boolean {
 }
 
 type Candidate = { model: ModelEntry; tier: Tier };
-type Plan = { list: Candidate[]; skipped: Attempt[] } | { error: { status: number; error: string; code: string } };
+type Plan = { list: Candidate[] } | { error: { status: number; error: string; code: string } };
 
-async function rankedRoutes(db: PodStorage, env: InferenceEnv, request: Pick<ChatRequest, "excludeFamily" | "category">, budget: BudgetState, needsTools: boolean) {
+async function rankedRoutes(db: PodStorage, env: InferenceEnv, request: Pick<ChatRequest, "excludeFamily" | "category">, budget: BudgetState, needsTools: boolean, identity?: RouteOptions["identity"]) {
   const routable = await listRoutableModels(db, {
+    identity,
     excludeFamily: request.excludeFamily,
     allowedProviders: [...CALLABLE_PROVIDERS],
     requireTools: needsTools,
@@ -117,28 +118,41 @@ export async function listInferenceModels(db: PodStorage, env: InferenceEnv, cal
   return models;
 }
 
-/** Prefer an eligible exact ID or upstream model name, then use the ordinary fallback order. */
+/** A catalog ID selects one provider. A bare upstream name permits only copies of that exact model. */
 async function candidates(db: PodStorage, env: InferenceEnv, request: ChatRequest, budget: BudgetState, needsTools: boolean): Promise<Plan> {
-  const list = await rankedRoutes(db, env, request, budget, needsTools);
-  const skipped: Attempt[] = [];
-  if (request.model) {
-    const pinned = list.find(c => c.model.id === request.model) ?? list.find(c => c.model.modelName === request.model);
-    if (pinned) {
-      list.splice(list.indexOf(pinned), 1);
-      list.unshift(pinned);
-    } else {
-      const row = await db.prepare(`SELECT * FROM model_catalog WHERE id = ? OR model_name = ?
-        ORDER BY (id = ?) DESC, (lifecycle = 'retired'), id LIMIT 1`)
-        .bind(request.model, request.model, request.model).first<Record<string, unknown>>();
-      if (!row) return { error: { status: 404, error: `unknown model ${request.model}`, code: "model_not_found" } };
-      if (row.lifecycle === "retired") return { error: { status: 409, error: `model ${request.model} is retired`, code: "model_retired" } };
-      if (!list.length && CALLABLE_PROVIDERS.has(String(row.provider)) && !endpoint(String(row.provider), env).key && !budget.capped) {
-        return { error: { status: 503, error: `model governor has no ${row.provider} key`, code: "upstream_error" } };
-      }
-      skipped.push({ model: String(row.id), tier: tierOf(mapModel(row), env), status: "skipped", reason: "model is unavailable under the current routing policy" });
-    }
+  if (request.model === undefined || request.model === "auto") {
+    const ranked = await rankedRoutes(db, env, request, budget, needsTools);
+    return { list: ranked.slice(0, MAX_ATTEMPTS) };
   }
-  return { list: list.slice(0, MAX_ATTEMPTS), skipped };
+
+  const requested = request.model;
+  const row = await db.prepare(`SELECT * FROM model_catalog WHERE id = ? OR model_name = ?
+    ORDER BY (id = ?) DESC, (lifecycle = 'retired'), (lifecycle = 'qualified') DESC, id LIMIT 1`)
+    .bind(requested, requested, requested).first<Record<string, unknown>>();
+  const fail = (status: number, code: string, reason: string) => ({ error: { status, code, error: `model ${requested}: ${reason}` } });
+  if (!row) return fail(404, "model_not_found", "unknown model");
+  const model = mapModel(row);
+  const identity = model.id === requested ? { id: requested } : { name: requested };
+  const matches = await rankedRoutes(db, env, request, budget, needsTools, identity);
+  if (matches.length) return { list: matches.slice(0, MAX_ATTEMPTS) };
+
+  // Describe the exact row (or a representative provider copy for a bare name).
+  const reason = (detail: string) => fail(409, "model_unavailable", `${model.id} ${detail}`);
+  if (model.lifecycle === "retired") return fail(409, "model_retired", "retired");
+  if (!CALLABLE_PROVIDERS.has(model.provider)) return reason("has no HTTP chat endpoint");
+  if (model.tier === "PAID" && !model.approvedBy) return reason("needs paid-model approval");
+  if (model.lifecycle !== "qualified") return reason("is awaiting qualification");
+  if (model.status !== "active") return reason(`is ${model.status}`);
+  if (needsTools && model.supportsTools !== true) return reason("has no qualified tool support");
+  if (!endpoint(model.provider, env).key) return fail(503, "provider_unconfigured", `model governor has no ${model.provider} key`);
+  if (tierOf(model, env) > budget.effectiveMaxTier) {
+    if (budget.capped) return fail(429, "budget_exceeded", `${budget.cappedBy} daily budget is spent and the requested model requires a paid tier`);
+    return reason(`exceeds the caller's maximum tier ${budget.effectiveMaxTier}`);
+  }
+  if (model.family && request.excludeFamily?.toLowerCase().split(",").some(family => family.trim() === model.family?.toLowerCase())) {
+    return reason("belongs to an excluded family");
+  }
+  return reason("is unavailable during provider quota cooldown");
 }
 
 /** Upstream said the model cannot take this request's tools, e.g. OpenRouter "No endpoints found that support tool use". */
@@ -179,6 +193,76 @@ function errorMessage(text: string, status: number): string {
   return `provider returned HTTP ${status}`;
 }
 
+function verifyProviderModel(reported: unknown, expected: string): void {
+  if (reported !== expected) {
+    const actual = typeof reported === "string" ? JSON.stringify(reported.slice(0, 200)) : "no model identity";
+    throw new Error(`provider reported ${actual}; expected ${JSON.stringify(expected)}`);
+  }
+}
+
+/** Check the first data event before returning 200, and every later identity before forwarding its content. */
+async function verifiedModelStream(upstream: ReadableStream<Uint8Array>, expected: string): Promise<ReadableStream<Uint8Array>> {
+  const reader = upstream.getReader();
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  let buffer = "";
+  let confirmed = false;
+  let eof = false;
+  async function nextEvent(): Promise<Uint8Array | null> {
+    for (;;) {
+      const end = /\r?\n\r?\n/.exec(buffer);
+      if (!end && !eof) {
+        if (buffer.length > 1024 * 1024) throw new Error("provider sent an oversized SSE event");
+        const next = await reader.read();
+        eof = next.done;
+        buffer += decoder.decode(next.value, { stream: !eof });
+        continue;
+      }
+      if (!buffer.length) {
+        if (!confirmed) throw new Error("provider ended stream without a model identity");
+        return null;
+      }
+      const length = end ? end.index + end[0].length : buffer.length;
+      if (length > 1024 * 1024) throw new Error("provider sent an oversized SSE event");
+      const event = buffer.slice(0, length);
+      buffer = buffer.slice(length);
+      const data = event.split(/\r?\n/).filter(line => line.startsWith("data:")).map(line => line.slice(5).trimStart()).join("\n");
+      if (data && data !== "[DONE]") {
+        const chunk = JSON.parse(data);
+        if (!confirmed || chunk.model !== undefined) verifyProviderModel(chunk.model, expected);
+        confirmed = true;
+      } else if (!confirmed) {
+        if (data === "[DONE]") throw new Error("provider ended stream without a model identity");
+        continue; // Ignore preamble comments until a provider actually identifies the model.
+      }
+      return encoder.encode(event);
+    }
+  }
+  let first: Uint8Array | null;
+  try {
+    first = await nextEvent();
+  } catch (err) {
+    await reader.cancel(err).catch(() => {});
+    throw err;
+  }
+  return new ReadableStream({
+    start(controller) {
+      if (first) controller.enqueue(first);
+    },
+    async pull(controller) {
+      try {
+        const chunk = await nextEvent();
+        if (chunk) controller.enqueue(chunk);
+        else controller.close();
+      } catch (err) {
+        await reader.cancel(err).catch(() => {});
+        controller.error(err);
+      }
+    },
+    cancel(reason) { return reader.cancel(reason); },
+  });
+}
+
 export async function runChatCompletion(
   db: PodStorage,
   env: InferenceEnv,
@@ -191,7 +275,8 @@ export async function runChatCompletion(
   const budget = await budgetState(db, request.callerId, env, now);
   const plan = await candidates(db, env, request, budget, needsTools);
   if ("error" in plan) return { ok: false, ...plan.error, model: request.model, attempts: [], budget };
-  const attempts: Attempt[] = [...plan.skipped];
+  const attempts: Attempt[] = [];
+  const named = request.model !== undefined && request.model !== "auto";
 
   if (plan.list.length === 0) {
     const toolsNote = needsTools ? " that supports tools" : "";
@@ -261,20 +346,35 @@ export async function runChatCompletion(
       return { ok: false, status: res.status, code: "upstream_error", error, model: model.id, attempts, budget };
     }
 
-    if (stream && res.body) {
-      const metered = meterStream(res.body, async (usage, status) => {
-        await record(status, usage.promptTokens, usage.completionTokens);
-      });
-      return { ok: true, kind: "stream", model, tier, attempts, budget, stream: metered };
+    let data: Record<string, any>;
+    let promptTokens = 0;
+    let completionTokens = 0;
+    try {
+      if (stream) {
+        if (!res.body) throw new Error("provider returned an empty stream");
+        const source = named ? await verifiedModelStream(res.body, model.modelName) : res.body;
+        const metered = meterStream(source, async (usage, status) => {
+          await record(status, usage.promptTokens, usage.completionTokens);
+        });
+        return { ok: true, kind: "stream", model, tier, attempts, budget, stream: metered };
+      }
+      const parsed = await res.json();
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("provider returned an invalid chat response");
+      data = parsed as Record<string, any>;
+      promptTokens = Number(data.usage?.prompt_tokens ?? 0);
+      completionTokens = Number(data.usage?.completion_tokens ?? 0);
+      if (named) verifyProviderModel(data.model, model.modelName);
+    } catch (err) {
+      await record("error", promptTokens, completionTokens);
+      const error = err instanceof SyntaxError ? "provider returned malformed JSON" : err instanceof Error ? err.message : String(err);
+      attempts.push({ model: model.id, tier, status: 502, reason: error });
+      last = { status: 502, error, model: model.id };
+      continue;
     }
-
-    const data = (await res.json()) as Record<string, any>;
-    const promptTokens = Number(data.usage?.prompt_tokens ?? 0);
-    const completionTokens = Number(data.usage?.completion_tokens ?? 0);
     await record("success", promptTokens, completionTokens);
     return { ok: true, kind: "json", model, tier, attempts, budget, data, latencyMs: Date.now() - started, usage: { promptTokens, completionTokens } };
   }
-  return { ok: false, status: last?.status ?? 502, code: "all_models_failed", error: last?.error ?? "every candidate model failed", model: last?.model, attempts, budget };
+  return { ok: false, status: last?.status ?? 502, code: named ? "named_model_failed" : "all_models_failed", error: last?.error ?? "every candidate model failed", model: last?.model, attempts, budget };
 }
 
 /**

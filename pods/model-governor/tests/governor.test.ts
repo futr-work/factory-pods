@@ -549,16 +549,16 @@ describe("scheduler", () => {
 describe("governor-mediated inference", () => {
   const env = { OPENROUTER_API_KEY: "sk-or-test" };
   const providerAnswer = (content: string) =>
-    (async () =>
-      new Response(JSON.stringify({ choices: [{ message: { content } }], usage: { prompt_tokens: 11, completion_tokens: 4 } }), { status: 200 })) as unknown as typeof fetch;
+    (async (_url: string, init?: RequestInit) =>
+      new Response(JSON.stringify({ model: JSON.parse(String(init?.body ?? "{}")).model, choices: [{ message: { content } }], usage: { prompt_tokens: 11, completion_tokens: 4 } }), { status: 200 })) as unknown as typeof fetch;
 
   test("uses the chosen model's provider with the governor's key and records the usage", async () => {
     const { db } = freshDb();
     await insertModel(db, { id: "openrouter:acme/free", tier: "FREE_TIER", quality: 90 });
     let called = "";
-    const fetcher = (async (url: string) => {
+    const fetcher = (async (url: string, init?: RequestInit) => {
       called = url;
-      return providerAnswer("PONG")(url);
+      return providerAnswer("PONG")(url, init);
     }) as unknown as typeof fetch;
     const result = await runInference(db, env, { podId: "egm-spec-pod", model: "openrouter:acme/free", messages: [{ role: "user", content: "ping" }] }, fetcher);
     assert.equal(result.ok, true);
@@ -568,14 +568,13 @@ describe("governor-mediated inference", () => {
     assert.deepEqual({ ...usage }, { pod_id: "egm-spec-pod", model_id: "openrouter:acme/free", prompt_tokens: 11, completion_tokens: 4, status: "success" });
   });
 
-  test("a pinned model it cannot serve falls back to routing instead of failing the caller", async () => {
+  test("a named model requires approval even when another qualified model is available", async () => {
     const { db } = freshDb();
     await insertModel(db, { id: "openrouter:acme/paid", tier: "PAID", quality: 99 });
-    // Unapproved spend: the pin is a preference, so a free qualified model serves the call.
     await insertModel(db, { id: "openrouter:acme/free", tier: "FREE_TIER", quality: 60 });
     const served = await runInference(db, env, { podId: "p", model: "openrouter:acme/paid", messages: [{ role: "user", content: "x" }] }, providerAnswer("ok"));
-    assert.equal(served.ok, true);
-    assert.equal(served.ok && served.model, "openrouter:acme/free");
+    assert.equal(served.ok, false);
+    assert.match(!served.ok && served.error || "", /approval/);
     // An unknown name is a caller bug and is named as such.
     const unknown = await runInference(db, env, { podId: "p", model: "openrouter:no/such", messages: [{ role: "user", content: "x" }] }, providerAnswer("ok"));
     assert.deepEqual([unknown.ok, !unknown.ok && unknown.status], [false, 404]);
@@ -612,9 +611,9 @@ describe("governor-mediated inference", () => {
     const result = await runInference(db, env, { podId: "p", category: "general_reasoning", messages: [{ role: "user", content: "x" }] }, providerAnswer("OK"));
     assert.equal(result.ok, true);
     assert.equal(result.ok && result.model, "openrouter:acme/free");
-    // Naming it explicitly does not try to call it; the request is served by the callable model instead.
     const named = await runInference(db, env, { podId: "p", model: "oauth:antigravity", messages: [{ role: "user", content: "x" }] }, providerAnswer("OK"));
-    assert.equal(named.ok && named.model, "openrouter:acme/free");
+    assert.equal(named.ok, false);
+    assert.match(!named.ok && named.error || "", /no HTTP chat endpoint/);
   });
 
   test("the route needs the hub token and validates its body", async () => {

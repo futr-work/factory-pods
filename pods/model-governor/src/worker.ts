@@ -351,7 +351,10 @@ export default {
       if (!validMessages || !legacyText) return fail(400, "each message needs a string role" + (isOpenAiPath ? "" : " and content"), "invalid_request");
 
       // model: "auto", "auto:<category>", a catalog id, or a model name.
-      const rawModel = typeof body.model === "string" ? body.model : "auto";
+      const rawModel = body.model === undefined ? "auto" : body.model;
+      if (typeof rawModel !== "string" || !rawModel.trim() || rawModel === "auto:") {
+        return fail(400, "model must be a non-empty model name, auto, or auto:<category>", "invalid_request");
+      }
       const autoCategory = rawModel.startsWith("auto:") ? rawModel.slice(5) : undefined;
       const pinned = rawModel === "auto" || autoCategory !== undefined ? undefined : rawModel;
       const callerId = (request.headers.get("X-Governor-Caller") || String(body.podId || "") || "openbot").slice(0, 200);
@@ -372,6 +375,7 @@ export default {
       });
       if (!out.ok) {
         return fail(out.status, out.error, out.code, {
+          requested_model: rawModel,
           model: out.model ?? null,
           attempts: out.attempts,
           ...(out.budget ? { budget: { callerId, spentTodayUsd: out.budget.spentTodayUsd, dailyBudgetUsd: out.budget.policy.dailyBudgetUsd } } : {}),

@@ -98,6 +98,8 @@ export const RATE_LIMIT_COOLDOWN_MS = 15 * 60_000;
 export const EXHAUSTED_COOLDOWN_MS = 6 * 3_600_000;
 
 export interface RouteOptions {
+  /** Exact catalog row or upstream name, resolved before the general catalog limit. */
+  identity?: { id: string } | { name: string };
   /** Never return this family (e.g. the auditor's), so review stays cross-family. Comma-separated allowed. */
   excludeFamily?: string;
   /** Upper bound on output price per 1M tokens; unknown prices never pass a bound. */
@@ -141,6 +143,10 @@ function routableFilter(opts: RouteOptions, now: number): { where: string; param
   // Spend control: a paid model is routable only after HD approved it.
   const where = ["lifecycle = 'qualified'", "status = 'active'", "(tier != 'PAID' OR approved_by IS NOT NULL)"];
   const params: any[] = [];
+  if (opts.identity) {
+    where.push("id" in opts.identity ? "id = ?" : "model_name = ?");
+    params.push("id" in opts.identity ? opts.identity.id : opts.identity.name);
+  }
   const excluded = (opts.excludeFamily || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
   if (excluded.length) {
     where.push(`(family IS NULL OR family NOT IN (${excluded.map(() => "?").join(",")}))`);

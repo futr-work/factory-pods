@@ -146,10 +146,11 @@ curl -sS -X POST -H "Authorization: Bearer $FACTORY_HUB_TOKEN" -H "Content-Type:
   https://<your-pod-subdomain>.workers.dev/api/inference
 ```
 
-`model` is a preference: the named model serves the request when it is callable and allowed (a PAID model counts
-as allowed only once approved), and otherwise the request is routed, with the served model reported back. An
-unknown name is `404` and a retired one `409`. When the named model cannot serve and nothing else qualifies, the
-answer is `404 no_qualified_model`, and its `attempts` list says why each model was skipped.
+A catalog ID pins both provider and model. An upstream name allows any eligible provider of that exact model.
+Use `auto`, `auto:<category>`, or omit `model` for automatic cross-model fallback. Empty or non-string
+selectors return HTTP 400. Named requests retain the caller's budget, approval, tool and health checks.
+Errors include the requested selector, a reason, and the attempted provider routes. Unknown names return
+404, retired models return 409, and spent budgets blocking paid requests return 429.
 
 ## Provider keys
 
@@ -189,9 +190,12 @@ The request body is forwarded **unchanged except `model`**. That covers `tools`,
 included. Response headers say what served the request: `X-Governor-Model`, `X-Governor-Tier`,
 `X-Governor-Caller`, `X-Governor-Attempts`.
 
-`"stream": true` is proxied as server-sent events byte-for-byte. The governor adds
-`stream_options.include_usage` upstream and records the final usage chunk to D1 before the stream closes. If a
-model fails before its first byte, the next model is tried. Once bytes have flowed, there is no fallback.
+For named requests, the governor checks the provider's returned `model` against the selected upstream name.
+A missing or different identity yields a provider error. For SSE the first data event must identify the
+model before the governor opens the stream. Later events may omit the identity. A changed identity terminates
+the stream before that event reaches the client. Named streams drop leading keepalive comments during
+verification. Automatic streams pass through byte-for-byte. The governor requests streamed usage and records
+it before the stream closes.
 
 **Auth.** Send `Authorization: Bearer <token>`, where the token is one of:
 
@@ -225,9 +229,9 @@ A caller's policy has a preferred tier, a maximum tier and a daily budget. Witho
 `*` default applies, then the environment defaults (`DEFAULT_CALLER_TIER=0`, `DEFAULT_CALLER_MAX_TIER=1`,
 `DEFAULT_CALLER_DAILY_BUDGET_USD=1`). Candidates are visited in this order: the preferred tier, then cheaper tiers,
 then pricier tiers up to the maximum. Within a tier they rank by probe score, then price, then speed
-(`fast_classification` ranks speed first). A pinned `model` is tried first when it is allowed.
+(`fast_classification` ranks speed first). Named requests limit this order to the selected model.
 
-On `429`, `402`, `401`/`403`, `408`, `5xx`, a network error or timeout, the next candidate is tried, up to 6.
+On `429`, `402`, `401`/`403`, `404`/`410`, `408`, `5xx`, a network error or timeout, the next candidate is tried, up to 6.
 A `402` parks the provider. A `429` marks the model `rate_limited` until its next probe. Any other `4xx` is the
 caller's error and is returned as-is.
 
@@ -236,7 +240,7 @@ caller's error and is returned as-is.
 marked unsupported and skipped from then on. Unknown support never qualifies a model for a tools request.
 
 **Budgets.** Today's spend is the caller's summed `cost_usd` since 00:00 UTC. At or over the cap, paid tiers are
-off for the rest of the day. The caller is routed on tier 0, and a pinned paid model is skipped. If no tier-0
+off for the rest of the day. Automatic requests route on tier 0. A named paid request returns a budget error. If no tier-0
 model qualifies (for example, none supports tools), the answer is `429` with
 `error.code = "budget_exceeded"`, `type = "insufficient_quota"`, and a message naming the spend and the cap. The
 check happens before each call, so one call can overshoot the cap by its own cost.
