@@ -148,7 +148,8 @@ curl -sS -X POST -H "Authorization: Bearer $FACTORY_HUB_TOKEN" -H "Content-Type:
 
 `model` is a preference: the named model serves the request when it is callable and allowed (a PAID model counts
 as allowed only once approved), and otherwise the request is routed, with the served model reported back. An
-unknown name is `404`; a name nothing else can replace is `409` with the reason.
+unknown name is `404` and a retired one `409`. When the named model cannot serve and nothing else qualifies, the
+answer is `404 no_qualified_model`, and its `attempts` list says why each model was skipped.
 
 ## Provider keys
 
@@ -175,3 +176,84 @@ curl -sS -X POST -H "Authorization: Bearer $GOVERNOR_ADMIN_TOKEN" -H "Content-Ty
 
 Each finding names the model it concerns and the numbers behind it. Latency percentiles use successful calls
 only, so a fast rejection never improves a model's record.
+
+### 5. OpenAI-Compatible Backend for Agents (tools, streaming, budgets)
+
+Any OpenAI client can use the governor as its model backend. Set the base URL to
+`https://<your-pod-subdomain>.workers.dev/api/inference` (or `.../v1`) and the model to `auto`. The client calls
+`POST {base}/chat/completions` and `GET {base}/models`.
+
+The request body is forwarded **unchanged except `model`**. That covers `tools`, `tool_choice`,
+`parallel_tool_calls`, `response_format`, array content, assistant `tool_calls`, and `tool` messages with
+`tool_call_id`. The provider's JSON comes back verbatim, `choices[].message.tool_calls` and `finish_reason`
+included. Response headers say what served the request: `X-Governor-Model`, `X-Governor-Tier`,
+`X-Governor-Caller`, `X-Governor-Attempts`.
+
+`"stream": true` is proxied as server-sent events byte-for-byte. The governor adds
+`stream_options.include_usage` upstream and records the final usage chunk to D1 before the stream closes. If a
+model fails before its first byte, the next model is tried. Once bytes have flowed, there is no fallback.
+
+**Auth.** Send `Authorization: Bearer <token>`, where the token is one of:
+
+| Token | Opens |
+|-------|-------|
+| `GOVERNOR_CLIENT_TOKEN` (optional secret) | Only `POST /v1/chat/completions`, `/chat/completions`, `/api/inference/chat/completions` and `GET /v1/models`, `/models`, `/api/inference/models`. Give this one to outside clients. |
+| `FACTORY_HUB_TOKEN` | Everything except admin routes (pods, cockpit, the legacy `/api/inference`). |
+| `GOVERNOR_ADMIN_TOKEN` | Admin `POST` routes: model approval, caller policies, discovery, probes. |
+
+A wrong or missing token is `401 {"error":"unauthorized"}`. That is also the answer when the worker has no
+`FACTORY_HUB_TOKEN` at all, because it fails closed.
+
+**Caller headers.**
+
+| Header | Meaning |
+|--------|---------|
+| `X-Governor-Caller` | Who pays: `agent-<id>`, `team:<name>`, anything up to 200 chars. Usage is recorded under it (`llm_usage_events.pod_id`), and its policy and budget apply. Falls back to `podId`, then `openbot`. |
+| `X-Governor-Category` | Ranking category (`general_reasoning`, `coding`, `deep_audit`, `fast_classification`). Also accepted as the body field `category` or as `model: "auto:<category>"`. |
+
+**Routing policy.** Only qualified models are candidates: measured by probes, approved by an admin if paid, and
+on a pay-per-use API provider (OpenRouter, OrcaRouter, Fireworks, Cerebras, OpenScale). OAuth and
+consumer-subscription logins are never called. Each model's tier comes from its catalog price:
+
+| Tier | Models |
+|------|--------|
+| 0 | free (`FREE_TIER`, zero price), e.g. OpenRouter `:free` |
+| 1 | paid with output price ≤ `TIER1_MAX_OUTPUT_COST_PER_1M` (default `4`), e.g. DeepSeek, GPT-OSS, Gemini Flash |
+| 2 | pricier paid, or paid with an unknown price, e.g. Claude, GPT |
+
+A caller's policy has a preferred tier, a maximum tier and a daily budget. Without a stored policy, the stored
+`*` default applies, then the environment defaults (`DEFAULT_CALLER_TIER=0`, `DEFAULT_CALLER_MAX_TIER=1`,
+`DEFAULT_CALLER_DAILY_BUDGET_USD=1`). Candidates are visited in this order: the preferred tier, then cheaper tiers,
+then pricier tiers up to the maximum. Within a tier they rank by probe score, then price, then speed
+(`fast_classification` ranks speed first). A pinned `model` is tried first when it is allowed.
+
+On `429`, `402`, `401`/`403`, `408`, `5xx`, a network error or timeout, the next candidate is tried, up to 6.
+A `402` parks the provider. A `429` marks the model `rate_limited` until its next probe. Any other `4xx` is the
+caller's error and is returned as-is.
+
+**A request with `tools` only goes to models known to support tools.** Support comes from OpenRouter's
+`supported_parameters` at discovery. When a provider answers "no endpoints support tool use", the model is
+marked unsupported and skipped from then on. Unknown support never qualifies a model for a tools request.
+
+**Budgets.** Today's spend is the caller's summed `cost_usd` since 00:00 UTC. At or over the cap, paid tiers are
+off for the rest of the day. The caller is routed on tier 0, and a pinned paid model is skipped. If no tier-0
+model qualifies (for example, none supports tools), the answer is `429` with
+`error.code = "budget_exceeded"`, `type = "insufficient_quota"`, and a message naming the spend and the cap. The
+check happens before each call, so one call can overshoot the cap by its own cost.
+
+The caller header is trusted. A client holding a token can name any caller, so per-caller caps are cost control
+for cooperating callers, not a security boundary. Set `GOVERNOR_DAILY_BUDGET_USD` for a fleet-wide cap that holds
+whatever caller ids a client sends. Over it, every caller is limited to tier 0 for the rest of the day.
+
+```bash
+# Set a policy (admin token). Caller "*" sets the default for callers without their own row.
+curl -sS -X POST -H "Authorization: Bearer $GOVERNOR_ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"preferredTier": 1, "maxTier": 2, "dailyBudgetUsd": 5, "category": "coding"}' \
+  "https://<your-pod-subdomain>.workers.dev/api/governor/callers/agent-grandmaster"
+# Live spend against budget per caller (hub token). Also included as callersToday in /api/governor/usage-report,
+# whose report.pods[] is the per-caller breakdown for the reported day.
+curl -sS -H "Authorization: Bearer $FACTORY_HUB_TOKEN" "https://<your-pod-subdomain>.workers.dev/api/governor/callers"
+```
+
+Apply `migrations/0007_tools_and_caller_budgets.sql` before deploying this version. It adds
+`model_catalog.supports_tools` and `caller_policies`.

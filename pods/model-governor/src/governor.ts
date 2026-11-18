@@ -31,6 +31,8 @@ export interface ModelEntry {
   lastSeenAt: number | null;
   probeRuns: number;
   approvedBy: string | null;
+  /** Upstream accepts `tools` (from the provider catalog, or learned from a refusal); null = unknown. */
+  supportsTools: boolean | null;
 }
 
 /** Outcome recorded for one model call. */
@@ -76,6 +78,7 @@ export function mapModel(r: any): ModelEntry {
     lastSeenAt: r.last_seen_at ?? null,
     probeRuns: r.probe_runs ?? 0,
     approvedBy: r.approved_by ?? null,
+    supportsTools: r.supports_tools === null || r.supports_tools === undefined ? null : Boolean(r.supports_tools),
   };
 }
 
@@ -101,6 +104,8 @@ export interface RouteOptions {
   maxOutputCostPer1M?: number;
   /** Restrict routing to these providers, e.g. the ones that answer an HTTP request. */
   allowedProviders?: string[];
+  /** Only models known to accept `tools`. Unknown support never passes. */
+  requireTools?: boolean;
 }
 
 /**
@@ -113,9 +118,27 @@ export async function resolveOptimalModel(
   category: string = "general_reasoning",
   opts: RouteOptions = {}
 ): Promise<ModelEntry | null> {
-  const now = Date.now();
-  // Spend control: a paid model is routable only after HD approved it (docs promised this; the filter was missing,
-  // so quality ordering could pick an unapproved paid model).
+  const { where, params } = routableFilter(opts, Date.now());
+  const order = category === "fast_classification"
+    ? "CASE WHEN tier = 'OAUTH' THEN 0 ELSE 1 END ASC, tokens_per_sec DESC, quality_score DESC, COALESCE(output_cost_per_1m, 1e9) ASC"
+    : "CASE WHEN tier = 'OAUTH' THEN 0 ELSE 1 END ASC, quality_score DESC, CASE WHEN tier = 'FREE_TIER' THEN 0 ELSE 1 END ASC, COALESCE(output_cost_per_1m, 1e9) ASC, tokens_per_sec DESC";
+
+  const row = await db
+    .prepare(`SELECT * FROM model_catalog WHERE ${where} ORDER BY ${order} LIMIT 1`)
+    .bind(...params)
+    .first<any>();
+  return row ? mapModel(row) : null;
+}
+
+/** Every routable model under the same filters as resolveOptimalModel, unordered; callers rank them. */
+export async function listRoutableModels(db: PodStorage, opts: RouteOptions = {}): Promise<ModelEntry[]> {
+  const { where, params } = routableFilter(opts, Date.now());
+  const { results } = await db.prepare(`SELECT * FROM model_catalog WHERE ${where} LIMIT 500`).bind(...params).all<any>();
+  return (results || []).map(mapModel);
+}
+
+function routableFilter(opts: RouteOptions, now: number): { where: string; params: any[] } {
+  // Spend control: a paid model is routable only after HD approved it.
   const where = ["lifecycle = 'qualified'", "status = 'active'", "(tier != 'PAID' OR approved_by IS NOT NULL)"];
   const params: any[] = [];
   const excluded = (opts.excludeFamily || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
@@ -131,6 +154,7 @@ export async function resolveOptimalModel(
     where.push("output_cost_per_1m IS NOT NULL AND output_cost_per_1m <= ?");
     params.push(opts.maxOutputCostPer1M);
   }
+  if (opts.requireTools) where.push("supports_tools = 1");
   // Quota awareness: exclude providers that are exhausted or rate limited. A limit recorded
   // without a reset time is a cooldown, never a permanent ban: probes and callers report 429 without Retry-After,
   // so treating "no reset" as forever removes the provider from routing permanently after one throttled request.
@@ -144,18 +168,7 @@ export async function resolveOptimalModel(
       )
   )`);
   params.push(now, now - EXHAUSTED_COOLDOWN_MS, now - RATE_LIMIT_COOLDOWN_MS);
-
-  const order = category === "fast_classification"
-    ? "CASE WHEN tier = 'OAUTH' THEN 0 ELSE 1 END ASC, tokens_per_sec DESC, quality_score DESC, COALESCE(output_cost_per_1m, 1e9) ASC"
-    : category === "coding"
-    ? "CASE WHEN tier = 'OAUTH' THEN 0 ELSE 1 END ASC, quality_score DESC, CASE WHEN tier = 'FREE_TIER' THEN 0 ELSE 1 END ASC, COALESCE(output_cost_per_1m, 1e9) ASC, tokens_per_sec DESC"
-    : "CASE WHEN tier = 'OAUTH' THEN 0 ELSE 1 END ASC, quality_score DESC, CASE WHEN tier = 'FREE_TIER' THEN 0 ELSE 1 END ASC, COALESCE(output_cost_per_1m, 1e9) ASC, tokens_per_sec DESC";
-
-  const row = await db
-    .prepare(`SELECT * FROM model_catalog WHERE ${where.join(" AND ")} ORDER BY ${order} LIMIT 1`)
-    .bind(...params)
-    .first<any>();
-  return row ? mapModel(row) : null;
+  return { where: where.join(" AND "), params };
 }
 
 export async function recordUsage(

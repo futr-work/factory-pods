@@ -18,6 +18,8 @@ export interface DiscoveredModel {
   outputCostPer1M: number | null;
   contextWindow: number | null;
   createdAt: number | null;
+  /** From the source catalog (OpenRouter `supported_parameters`); null when the source does not say. */
+  supportsTools: boolean | null;
 }
 
 /** Not a chat model we can probe: routers, batch-API variants, non-text in/out (music, image, embeddings). */
@@ -62,6 +64,7 @@ export function fromOpenRouter(m: any): DiscoveredModel | null {
     outputCostPer1M: +(c * 1e6).toFixed(6),
     contextWindow: Number.isFinite(Number(m.context_length)) ? Number(m.context_length) : null,
     createdAt: Number.isFinite(Number(m.created)) ? Number(m.created) * 1000 : null,
+    supportsTools: Array.isArray(m.supported_parameters) ? m.supported_parameters.includes("tools") : null,
   };
 }
 
@@ -89,6 +92,7 @@ export async function fetchOrcaRouter(fetcher: Fetcher, key: string, baseUrl = "
       outputCostPer1M: null,
       contextWindow: null,
       createdAt: Number.isFinite(Number(m.created)) ? Number(m.created) * 1000 : null,
+      supportsTools: null,
     }));
 }
 
@@ -106,16 +110,17 @@ export async function upsertDiscovered(db: PodStorage, source: string, models: D
   const known = new Set((existing.results ?? []).map((r) => r.id));
   const stmt = db.prepare(`
     INSERT INTO model_catalog (id, provider, model_name, family, category, tier, input_cost_per_1m, output_cost_per_1m,
-      context_window, status, lifecycle, source, first_seen_at, last_seen_at, model_created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 'candidate', 'discovered', ?, ?, ?)
+      context_window, status, lifecycle, source, first_seen_at, last_seen_at, model_created_at, supports_tools)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 'candidate', 'discovered', ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
       tier = excluded.tier, family = excluded.family, input_cost_per_1m = excluded.input_cost_per_1m, output_cost_per_1m = excluded.output_cost_per_1m,
       source = 'discovered',
       context_window = excluded.context_window, last_seen_at = excluded.last_seen_at, model_created_at = excluded.model_created_at,
+      supports_tools = COALESCE(excluded.supports_tools, model_catalog.supports_tools),
       lifecycle = CASE WHEN model_catalog.lifecycle = 'retired' THEN 'candidate' ELSE model_catalog.lifecycle END`);
   const batch = models.map((m) =>
     stmt.bind(m.id, m.provider, m.modelName, m.family, m.category, m.tier, m.inputCostPer1M, m.outputCostPer1M,
-      m.contextWindow, now, now, m.createdAt),
+      m.contextWindow, now, now, m.createdAt, m.supportsTools === null ? null : m.supportsTools ? 1 : 0),
   );
   for (let i = 0; i < batch.length; i += 50) await db.batch(batch.slice(i, i + 50));
   const retired = await db

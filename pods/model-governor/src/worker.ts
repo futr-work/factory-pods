@@ -10,7 +10,8 @@ import { authGate } from "./auth.js";
 import { runDiscovery, runScheduledDiscovery } from "./discovery.js";
 import { runProbeCycle, recordProbe } from "./probe.js";
 import { getUsageReport, runDailyUsageAnalysis } from "./analyzer.js";
-import { runInference } from "./inference.js";
+import { runChatCompletion } from "./inference.js";
+import { callersToday, setCallerPolicy, type PolicyPatch } from "./routing.js";
 
 interface Env {
   DB: D1Database | PodStorage;
@@ -31,6 +32,12 @@ interface Env {
   CEREBRAS_BASE_URL?: string;
   OPENSCALE_API_KEY?: string;
   OPENSCALE_BASE_URL?: string;
+  GOVERNOR_CLIENT_TOKEN?: string;
+  TIER1_MAX_OUTPUT_COST_PER_1M?: string;
+  DEFAULT_CALLER_TIER?: string;
+  DEFAULT_CALLER_MAX_TIER?: string;
+  DEFAULT_CALLER_DAILY_BUDGET_USD?: string;
+  GOVERNOR_DAILY_BUDGET_USD?: string;
   /** HD-set daily ceiling for probing PAID models. Default 0: paid models are never probed automatically. */
   PROBE_BUDGET_USD_DAILY?: string;
 }
@@ -50,7 +57,8 @@ export default {
     const corsHeaders = {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Governor-Caller, X-Governor-Category",
+      "Access-Control-Expose-Headers": "X-Governor-Model, X-Governor-Tier, X-Governor-Caller, X-Governor-Attempts",
     };
 
     if (method === "OPTIONS") {
@@ -99,9 +107,9 @@ export default {
     }
 
     // API: List Model Catalog with Pricing and Benchmarks (and OpenAI-compatible /v1/models)
-    if (method === "GET" && (url.pathname === "/api/models" || url.pathname === "/v1/models" || url.pathname === "/models")) {
+    if (method === "GET" && (url.pathname === "/api/models" || url.pathname === "/v1/models" || url.pathname === "/models" || url.pathname === "/api/inference/models")) {
       const catalog = await getModelCatalog(db);
-      if (url.pathname === "/v1/models" || url.pathname === "/models") {
+      if (url.pathname !== "/api/models") {
         return json({
           object: "list",
           data: [
@@ -164,7 +172,8 @@ export default {
       const date = url.searchParams.get("date") ?? undefined;
       const report = await getUsageReport(db, date);
       if (!report) return json({ error: date ? `no report for ${date}` : "no usage report yet" }, 404, corsHeaders);
-      return json({ report }, 200, corsHeaders);
+      // report.pods[] is per caller (pod_id = X-Governor-Caller) for the reported day; callersToday is live spend vs budget.
+      return json({ report, callersToday: await callersToday(db, env) }, 200, corsHeaders);
     }
     if (method === "POST" && url.pathname === "/api/governor/analyze") {
       const body = (await request.json().catch(() => ({}))) as { date?: string; force?: boolean };
@@ -313,67 +322,91 @@ export default {
       }
     }
 
-    // API: Governor-mediated inference and OpenAI-compatible completions. Pods send prompts; the governor holds the provider keys, picks a
-    // measured model, records the usage and returns the text, so no pod needs its own provider credential.
+    // ADMIN: per-caller policy (tier range, category, daily budget). Caller '*' is the stored default.
+    const callerPath = url.pathname.match(/^\/api\/governor\/callers\/(.+)$/);
+    if (method === "POST" && callerPath) {
+      const body = (await request.json().catch(() => ({}))) as PolicyPatch;
+      try {
+        return json({ policy: await setCallerPolicy(db, decodeURIComponent(callerPath[1]), body, env) }, 200, corsHeaders);
+      } catch (err: any) {
+        return json({ error: err.message }, 400, corsHeaders);
+      }
+    }
+    if (method === "GET" && url.pathname === "/api/governor/callers") {
+      return json({ callers: await callersToday(db, env) }, 200, corsHeaders);
+    }
+
+    // API: OpenAI-compatible chat completions (OpenBot agents, any OpenAI client) and the legacy pod contract.
+    // The body passes upstream unchanged except `model`: tools, tool_choice, parallel_tool_calls, structured
+    // content and tool-role messages included. The provider's response (tool_calls, finish_reason) comes back as-is.
     const isOpenAiPath = url.pathname === "/v1/chat/completions" || url.pathname === "/chat/completions" || url.pathname === "/api/inference/chat/completions";
     if (method === "POST" && (url.pathname === "/api/inference" || isOpenAiPath)) {
-      const body = (await request.json().catch(() => null)) as
-        | { podId?: string; taskId?: string; category?: string; model?: string; excludeFamily?: string; temperature?: number; maxTokens?: number; max_tokens?: number; messages?: unknown }
-        | null;
+      const fail = (status: number, message: string, code: string, extra: Record<string, unknown> = {}) =>
+        isOpenAiPath
+          ? json({ error: { message, type: code === "budget_exceeded" ? "insufficient_quota" : "governor_error", code, ...extra } }, status, corsHeaders)
+          : json({ error: message, code, ...extra }, status, corsHeaders);
+      const body = (await request.json().catch(() => null)) as Record<string, unknown> | null;
       if (!body || (!isOpenAiPath && !body.podId) || !Array.isArray(body.messages) || body.messages.length === 0) {
-        return json({ error: "podId and a non-empty messages array are required" }, 400, corsHeaders);
+        return fail(400, "podId and a non-empty messages array are required", "invalid_request");
       }
-      const messages = body.messages.filter(
-        (m): m is { role: string; content: string } =>
-          Boolean(m) && typeof m === "object" && typeof (m as { role?: unknown }).role === "string" && typeof (m as { content?: unknown }).content === "string",
-      );
-      if (messages.length !== body.messages.length) return json({ error: "each message needs a string role and content" }, 400, corsHeaders);
+      const validMessages = body.messages.every((m) => Boolean(m) && typeof m === "object" && typeof (m as { role?: unknown }).role === "string");
+      // The legacy contract is text-only; the OpenAI contract allows array/null content (tool calls, images).
+      const legacyText = isOpenAiPath || body.messages.every((m) => typeof (m as { content?: unknown }).content === "string");
+      if (!validMessages || !legacyText) return fail(400, "each message needs a string role" + (isOpenAiPath ? "" : " and content"), "invalid_request");
 
-      const podId = String(body.podId || "openbot");
-      const modelPreference = body.model === "auto" ? undefined : body.model;
-      const maxTokens = body.maxTokens ?? body.max_tokens;
+      // model: "auto", "auto:<category>", a catalog id, or a model name.
+      const rawModel = typeof body.model === "string" ? body.model : "auto";
+      const autoCategory = rawModel.startsWith("auto:") ? rawModel.slice(5) : undefined;
+      const pinned = rawModel === "auto" || autoCategory !== undefined ? undefined : rawModel;
+      const callerId = (request.headers.get("X-Governor-Caller") || String(body.podId || "") || "openbot").slice(0, 200);
+      const category = (typeof body.category === "string" ? body.category : undefined) ?? request.headers.get("X-Governor-Category") ?? autoCategory;
 
-      const result = await runInference(db, env, {
-        podId,
-        taskId: body.taskId,
-        category: body.category,
-        model: modelPreference,
-        excludeFamily: body.excludeFamily,
-        temperature: body.temperature,
-        maxTokens,
-        messages,
+      const forward: Record<string, unknown> = { ...body };
+      for (const k of ["podId", "taskId", "category", "excludeFamily", "maxTokens", "model"]) delete forward[k];
+      if (body.maxTokens !== undefined && forward.max_tokens === undefined) forward.max_tokens = body.maxTokens;
+      if (!isOpenAiPath) delete forward.stream;
+
+      const out = await runChatCompletion(db, env, {
+        callerId,
+        taskId: typeof body.taskId === "string" ? body.taskId : undefined,
+        category: category || undefined,
+        model: pinned,
+        excludeFamily: typeof body.excludeFamily === "string" ? body.excludeFamily : undefined,
+        body: forward,
       });
-      if (!result.ok) return json({ error: result.error, model: result.model ?? null }, result.status, corsHeaders);
-
-      if (isOpenAiPath) {
-        return json(
-          {
-            id: `chatcmpl-${Date.now()}`,
-            object: "chat.completion",
-            created: Math.floor(Date.now() / 1000),
-            model: result.model,
-            choices: [
-              {
-                index: 0,
-                message: {
-                  role: "assistant",
-                  content: result.content,
-                },
-                finish_reason: "stop",
-              },
-            ],
-            usage: {
-              prompt_tokens: result.usage.promptTokens,
-              completion_tokens: result.usage.completionTokens,
-              total_tokens: result.usage.promptTokens + result.usage.completionTokens,
-            },
-          },
-          200,
-          corsHeaders,
-        );
+      if (!out.ok) {
+        return fail(out.status, out.error, out.code, {
+          model: out.model ?? null,
+          attempts: out.attempts,
+          ...(out.budget ? { budget: { callerId, spentTodayUsd: out.budget.spentTodayUsd, dailyBudgetUsd: out.budget.policy.dailyBudgetUsd } } : {}),
+        });
       }
-
-      return json(result, 200, corsHeaders);
+      const routedHeaders = {
+        ...corsHeaders,
+        "X-Governor-Model": out.model.id,
+        "X-Governor-Tier": String(out.tier),
+        "X-Governor-Caller": callerId,
+        "X-Governor-Attempts": String(out.attempts.length + 1),
+      };
+      if (out.kind === "stream") {
+        return new Response(out.stream, {
+          status: 200,
+          headers: { ...routedHeaders, "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache" },
+        });
+      }
+      if (isOpenAiPath) return json(out.data, 200, routedHeaders);
+      return json(
+        {
+          ok: true,
+          model: out.model.id,
+          provider: out.model.provider,
+          content: String(out.data.choices?.[0]?.message?.content ?? ""),
+          usage: out.usage,
+          latencyMs: out.latencyMs,
+        },
+        200,
+        routedHeaders,
+      );
     }
 
     // API: Get Telemetry & TokenMaxxing Analytics
