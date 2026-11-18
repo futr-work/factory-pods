@@ -47,7 +47,7 @@ const json = (body: any, status: number, headers: Record<string, string>) =>
   new Response(JSON.stringify(body), { status, headers: { ...headers, "Content-Type": "application/json" } });
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx?: Pick<ExecutionContext, "waitUntil">): Promise<Response> {
     const url = new URL(request.url);
     const method = request.method;
     const config = loadPodConfig(env as any);
@@ -304,7 +304,7 @@ export default {
           latencyMs: parseInt(body.latencyMs || "0", 10),
           tier: body.tier,
           actualCost: body.actualCost,
-          status: body.status === "error" || body.status === "rate_limited" ? body.status : undefined,
+          status: ["error", "rate_limited", "usage_unavailable", "cancelled"].includes(body.status) ? body.status : undefined,
         });
         return new Response(JSON.stringify({ status: "recorded", event }), {
           status: 201,
@@ -372,7 +372,7 @@ export default {
         model: pinned,
         excludeFamily: typeof body.excludeFamily === "string" ? body.excludeFamily : undefined,
         body: forward,
-      });
+      }, undefined, undefined, { signal: request.signal, waitUntil: ctx && (task => ctx.waitUntil(task)) });
       if (!out.ok) {
         return fail(out.status, out.error, out.code, {
           requested_model: rawModel,

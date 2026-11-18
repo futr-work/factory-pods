@@ -517,3 +517,146 @@ describe("exact named routing", () => {
     assert.equal((await db.prepare("SELECT status FROM llm_usage_events").first() as any).status, "error");
   });
 });
+
+describe("SSE receipt lifetime", () => {
+  const encode = (data: unknown) => new TextEncoder().encode("data: " + JSON.stringify(data) + "\n\n");
+  const content = encode({ model: "acme/pilot", choices: [{ delta: { content: "HERE" } }] });
+  const finish = encode({ model: "acme/pilot", choices: [{ index: 0, finish_reason: "stop" }] });
+  const totals = encode({ model: "acme/pilot", choices: [], usage: { prompt_tokens: 230, completion_tokens: 31, cost: 0.00000014 } });
+  const done = new TextEncoder().encode("data: [DONE]\n\n");
+
+  async function setup() {
+    const { db } = freshDb();
+    await addModel(db, { id: "openrouter:acme/pilot" });
+    let origin!: ReadableStreamDefaultController<Uint8Array>;
+    let stopped = false;
+    const source = new ReadableStream<Uint8Array>({ start(c) { origin = c; }, cancel() { stopped = true; } });
+    const { fetcher } = providers({ "acme/pilot": () => new Response(source) });
+    const client = new AbortController();
+    const req = new Request("https://gov.test/v1/chat/completions", {
+      method: "POST", signal: client.signal, headers: { Authorization: "Bearer client-secret", "X-Governor-Caller": "pilot" },
+      body: JSON.stringify({ model: "auto", stream: true, messages: [{ role: "user", content: "hello" }] }),
+    });
+    const tasks: Promise<unknown>[] = [];
+    const res = await withFetch(fetcher, () => worker.fetch(req, { DB: db, ...ENV }, { waitUntil(task) { tasks.push(task); } }));
+    assert.equal(res.status, 200);
+    assert.equal(tasks.length, 1);
+    const rows = async () => (await db.prepare("SELECT pod_id, model_id, prompt_tokens, completion_tokens, cost_usd, status FROM llm_usage_events").all()).results;
+    return { body: res.body!, origin, client, tasks, rows, stopped: () => stopped };
+  }
+
+  test("an abandoned response needs no downstream pulls to persist exactly one provider receipt", async () => {
+    const s = await setup();
+    for (const frame of [content, finish, totals, done]) s.origin.enqueue(frame);
+    await Promise.all(s.tasks);
+    const rows = await s.rows();
+    assert.deepEqual(rows.map(row => ({ ...row })), [{
+      pod_id: "pilot", model_id: "openrouter:acme/pilot", prompt_tokens: 230, completion_tokens: 31, cost_usd: 0.00000014, status: "success",
+    }]);
+    await s.body.cancel();
+    assert.equal((await s.rows()).length, 1);
+  });
+
+  test("terminal events reach the client only after the authoritative D1 write", async () => {
+    const s = await setup();
+    const reader = s.body.getReader();
+    s.origin.enqueue(content);
+    assert.match(new TextDecoder().decode((await reader.read()).value), /HERE/);
+    s.origin.enqueue(finish);
+    const pending = reader.read();
+    let delivered = false;
+    void pending.then(() => { delivered = true; });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(delivered, false);
+    assert.equal((await s.rows()).length, 0);
+    s.origin.enqueue(totals);
+    assert.match(new TextDecoder().decode((await pending).value), /finish_reason/);
+    assert.equal((await s.rows())[0].status, "success");
+    await reader.cancel();
+    s.origin.enqueue(done);
+    await Promise.all(s.tasks);
+    assert.equal((await s.rows()).length, 1);
+  });
+
+  test("disconnect after provider finish drains the trailer, early cancellation stops generation", async () => {
+    for (const terminal of [false, true]) {
+      const s = await setup();
+      const reader = s.body.getReader();
+      s.origin.enqueue(content);
+      await reader.read();
+      if (terminal) {
+        s.origin.enqueue(finish);
+        await new Promise(resolve => setImmediate(resolve));
+      }
+      s.client.abort();
+      if (terminal) {
+        s.origin.enqueue(totals);
+        s.origin.enqueue(done);
+      }
+      await Promise.all(s.tasks);
+      assert.equal(s.stopped(), true);
+      const rows = await s.rows();
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0].status, terminal ? "success" : "cancelled");
+      assert.equal(rows[0].completion_tokens, terminal ? 31 : 0);
+    }
+  });
+
+  test("cancel before response headers aborts one provider and prevents fallback", async () => {
+    const { db } = freshDb();
+    await addModel(db, { id: "openrouter:a" });
+    await addModel(db, { id: "openrouter:b" });
+    const client = new AbortController();
+    const attempts: string[] = [];
+    const tasks: Promise<void>[] = [];
+    const neverAnswers = async (_url: string, init?: RequestInit) => {
+      attempts.push(JSON.parse(String(init?.body)).model);
+      const aborted = new Promise<Response>((_, reject) => init?.signal?.addEventListener("abort", () => reject(new Error("disconnected")), { once: true }));
+      client.abort();
+      return aborted;
+    };
+    const out = await runChatCompletion(db, ENV, { callerId: "pilot", body: { stream: true, messages: TOOL_MESSAGES } }, neverAnswers,
+      Date.now(), { signal: client.signal, waitUntil: task => tasks.push(task) });
+    assert.equal(!out.ok && out.code, "client_disconnected");
+    assert.equal(attempts.length, 1);
+    await Promise.all(tasks);
+    assert.equal((await db.prepare("SELECT status FROM llm_usage_events").first() as any).status, "cancelled");
+  });
+
+  test("a stalled usage trailer has a time limit after an explicit cancellation", async t => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const s = await setup();
+    s.origin.enqueue(content);
+    s.origin.enqueue(finish);
+    await new Promise(resolve => setImmediate(resolve));
+    await s.body.cancel();
+    t.mock.timers.tick(3100);
+    await Promise.all(s.tasks);
+    assert.equal(s.stopped(), true);
+    assert.equal((await s.rows())[0].status, "usage_unavailable");
+  });
+
+  test("provisional counts survive without being mistaken for final usage", async () => {
+    for (const terminal of [false, true]) {
+      const s = await setup();
+      s.origin.enqueue(encode({ choices: [{ delta: { content: "partial" } }], usage: { prompt_tokens: 15, completion_tokens: 1 } }));
+      if (terminal) {
+        s.origin.enqueue(finish);
+        s.origin.enqueue(encode({ choices: [], usage: {} }));
+      }
+      s.origin.close();
+      await Promise.all(s.tasks);
+      const [row] = await s.rows();
+      assert.equal(row.status, terminal ? "usage_unavailable" : "error");
+      assert.equal(row.prompt_tokens, 15);
+      assert.equal(row.completion_tokens, 1);
+    }
+  });
+
+  test("completion without a usage frame is reported as unavailable", async () => {
+    const s = await setup();
+    for (const frame of [content, finish, done]) s.origin.enqueue(frame);
+    await Promise.all(s.tasks);
+    assert.equal((await s.rows())[0].status, "usage_unavailable");
+  });
+});

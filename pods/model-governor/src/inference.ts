@@ -7,6 +7,7 @@
 // API keys only. OAuth/consumer-subscription backends (Claude Pro/Max, ChatGPT, Gemini/Antigravity logins) are
 // never called from here: CALLABLE_PROVIDERS is the allowlist and every entry is a pay-per-use API.
 
+import { openMeteredStream, type StreamLifetime } from "./inference-stream.js";
 import type { PodStorage } from "@futr-work/pod-kernel/storage";
 import { listRoutableModels, mapModel, recordUsage, type LlmUsageStatus, type ModelEntry, type RouteOptions } from "./governor.js";
 import { budgetState, rankCandidates, tierOf, tierOrder, type BudgetState, type RoutingEnv, type Tier } from "./routing.js";
@@ -200,75 +201,13 @@ function verifyProviderModel(reported: unknown, expected: string): void {
   }
 }
 
-/** Check the first data event before returning 200, and every later identity before forwarding its content. */
-async function verifiedModelStream(upstream: ReadableStream<Uint8Array>, expected: string): Promise<ReadableStream<Uint8Array>> {
-  const reader = upstream.getReader();
-  const decoder = new TextDecoder();
-  const encoder = new TextEncoder();
-  let buffer = "";
-  let confirmed = false;
-  let eof = false;
-  async function nextEvent(): Promise<Uint8Array | null> {
-    for (;;) {
-      const end = /\r?\n\r?\n/.exec(buffer);
-      if (!end && !eof) {
-        if (buffer.length > 1024 * 1024) throw new Error("provider sent an oversized SSE event");
-        const next = await reader.read();
-        eof = next.done;
-        buffer += decoder.decode(next.value, { stream: !eof });
-        continue;
-      }
-      if (!buffer.length) {
-        if (!confirmed) throw new Error("provider ended stream without a model identity");
-        return null;
-      }
-      const length = end ? end.index + end[0].length : buffer.length;
-      if (length > 1024 * 1024) throw new Error("provider sent an oversized SSE event");
-      const event = buffer.slice(0, length);
-      buffer = buffer.slice(length);
-      const data = event.split(/\r?\n/).filter(line => line.startsWith("data:")).map(line => line.slice(5).trimStart()).join("\n");
-      if (data && data !== "[DONE]") {
-        const chunk = JSON.parse(data);
-        if (!confirmed || chunk.model !== undefined) verifyProviderModel(chunk.model, expected);
-        confirmed = true;
-      } else if (!confirmed) {
-        if (data === "[DONE]") throw new Error("provider ended stream without a model identity");
-        continue; // Ignore preamble comments until a provider actually identifies the model.
-      }
-      return encoder.encode(event);
-    }
-  }
-  let first: Uint8Array | null;
-  try {
-    first = await nextEvent();
-  } catch (err) {
-    await reader.cancel(err).catch(() => {});
-    throw err;
-  }
-  return new ReadableStream({
-    start(controller) {
-      if (first) controller.enqueue(first);
-    },
-    async pull(controller) {
-      try {
-        const chunk = await nextEvent();
-        if (chunk) controller.enqueue(chunk);
-        else controller.close();
-      } catch (err) {
-        await reader.cancel(err).catch(() => {});
-        controller.error(err);
-      }
-    },
-    cancel(reason) { return reader.cancel(reason); },
-  });
-}
-
 export async function runChatCompletion(
   db: PodStorage,
   env: InferenceEnv,
   request: ChatRequest,
   fetcher: Fetcher = (i, init) => fetch(i, init),
   now = Date.now(),
+  lifetime?: StreamLifetime,
 ): Promise<ChatOutcome> {
   const needsTools = hasTools(request.body);
   const stream = request.body.stream === true;
@@ -295,8 +234,10 @@ export async function runChatCompletion(
     return { ok: false, status: 404, code: "no_qualified_model", error: `no qualified model${toolsNote} for this request`, model: request.model, attempts, budget };
   }
 
+  const disconnected = () => ({ ok: false as const, status: 499, code: "client_disconnected", error: "client disconnected", model: request.model, attempts, budget });
   let last: { status: number; error: string; model: string } | null = null;
   for (const { model, tier } of plan.list) {
+    if (lifetime?.signal.aborted) return disconnected();
     const { url, key } = endpoint(model.provider, env);
     if (!key) {
       attempts.push({ model: model.id, tier, status: "skipped", reason: `model governor has no ${model.provider} key` });
@@ -307,12 +248,13 @@ export async function runChatCompletion(
     if (stream) upstreamBody.stream_options = { ...(request.body.stream_options as object | undefined), include_usage: true };
 
     const started = Date.now();
-    const record = (status: LlmUsageStatus, promptTokens = 0, completionTokens = 0) =>
+    const record = (status: LlmUsageStatus, promptTokens = 0, completionTokens = 0, actualCost?: number, modelId = model.id) =>
       recordUsage(db, {
         podId: request.callerId,
         taskId: request.taskId,
         provider: model.provider,
-        modelId: model.id,
+        modelId,
+        actualCost,
         promptTokens,
         completionTokens,
         latencyMs: Date.now() - started,
@@ -320,19 +262,30 @@ export async function runChatCompletion(
       });
 
     let res: Response;
+    const headersAbort = new AbortController();
+    const abortHeaders = () => headersAbort.abort();
+    lifetime?.signal.addEventListener("abort", abortHeaders, { once: true });
     try {
       res = await fetcher(url, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}`, ...(stream ? { Accept: "text/event-stream" } : {}) },
         body: JSON.stringify(upstreamBody),
-        signal: AbortSignal.timeout(stream ? STREAM_TIMEOUT_MS : DEFAULT_TIMEOUT_MS),
+        signal: AbortSignal.any([headersAbort.signal, AbortSignal.timeout(stream ? STREAM_TIMEOUT_MS : DEFAULT_TIMEOUT_MS)]),
       });
     } catch (err) {
+      if (lifetime?.signal.aborted) {
+        const cancelled = record("cancelled").then(() => {});
+        lifetime.waitUntil?.(cancelled);
+        await cancelled;
+        return disconnected();
+      }
       await record("error");
       const error = err instanceof Error ? err.message : String(err);
       attempts.push({ model: model.id, tier, status: 502, reason: error });
       last = { status: 502, error, model: model.id };
       continue;
+    } finally {
+      lifetime?.signal.removeEventListener("abort", abortHeaders);
     }
 
     if (!res.ok) {
@@ -352,9 +305,15 @@ export async function runChatCompletion(
     try {
       if (stream) {
         if (!res.body) throw new Error("provider returned an empty stream");
-        const source = named ? await verifiedModelStream(res.body, model.modelName) : res.body;
-        const metered = meterStream(source, async (usage, status) => {
-          await record(status, usage.promptTokens, usage.completionTokens);
+        const metered = await openMeteredStream(res.body, {
+          validateModel: named ? reported => verifyProviderModel(reported, model.modelName) : undefined,
+          choices: typeof request.body.n === "number" ? request.body.n : 1,
+          lifetime,
+          async record(usage, status) {
+            const modelId = usage.model && usage.model !== model.modelName && usage.model !== model.id
+              ? `${model.provider}:${usage.model}` : model.id;
+            await record(status, usage.promptTokens, usage.completionTokens, usage.cost, modelId);
+          },
         });
         return { ok: true, kind: "stream", model, tier, attempts, budget, stream: metered };
       }
@@ -365,6 +324,12 @@ export async function runChatCompletion(
       completionTokens = Number(data.usage?.completion_tokens ?? 0);
       if (named) verifyProviderModel(data.model, model.modelName);
     } catch (err) {
+      if (lifetime?.signal.aborted) {
+        const cancelled = record("cancelled", promptTokens, completionTokens).then(() => {});
+        lifetime.waitUntil?.(cancelled);
+        await cancelled;
+        return disconnected();
+      }
       await record("error", promptTokens, completionTokens);
       const error = err instanceof SyntaxError ? "provider returned malformed JSON" : err instanceof Error ? err.message : String(err);
       attempts.push({ model: model.id, tier, status: 502, reason: error });
@@ -375,63 +340,6 @@ export async function runChatCompletion(
     return { ok: true, kind: "json", model, tier, attempts, budget, data, latencyMs: Date.now() - started, usage: { promptTokens, completionTokens } };
   }
   return { ok: false, status: last?.status ?? 502, code: named ? "named_model_failed" : "all_models_failed", error: last?.error ?? "every candidate model failed", model: last?.model, attempts, budget };
-}
-
-/**
- * Passes an upstream SSE body through byte-for-byte while reading `usage` from the chunks (sent last when
- * stream_options.include_usage is set). Usage is recorded before the stream closes, so the Worker is still alive.
- */
-export function meterStream(
-  upstream: ReadableStream<Uint8Array>,
-  onDone: (usage: { promptTokens: number; completionTokens: number }, status: LlmUsageStatus) => Promise<void>,
-): ReadableStream<Uint8Array> {
-  const reader = upstream.getReader();
-  const decoder = new TextDecoder();
-  const usage = { promptTokens: 0, completionTokens: 0 };
-  let buffer = "";
-  let finished = false;
-  const scan = (line: string) => {
-    if (!line.startsWith("data:")) return;
-    const payload = line.slice(5).trim();
-    if (!payload || payload === "[DONE]" || !payload.includes('"usage"')) return;
-    try {
-      const u = JSON.parse(payload)?.usage;
-      if (u) {
-        usage.promptTokens = Number(u.prompt_tokens ?? usage.promptTokens);
-        usage.completionTokens = Number(u.completion_tokens ?? usage.completionTokens);
-      }
-    } catch {}
-  };
-  const finish = async (status: LlmUsageStatus) => {
-    if (finished) return;
-    finished = true;
-    if (buffer) scan(buffer);
-    await onDone(usage, status).catch(() => {});
-  };
-  return new ReadableStream<Uint8Array>({
-    async pull(controller) {
-      try {
-        const { done, value } = await reader.read();
-        if (done) {
-          await finish("success");
-          controller.close();
-          return;
-        }
-        controller.enqueue(value);
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split(/\r?\n/);
-        buffer = lines.pop() ?? "";
-        for (const line of lines) scan(line);
-      } catch (err) {
-        await finish("error");
-        controller.error(err);
-      }
-    },
-    async cancel(reason) {
-      await finish("error");
-      await reader.cancel(reason).catch(() => {});
-    },
-  });
 }
 
 // ---------------------------------------------------------------------------------------------------------------
