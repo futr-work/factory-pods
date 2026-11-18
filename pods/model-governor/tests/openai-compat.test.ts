@@ -11,6 +11,7 @@ import { authGate } from "../src/auth.js";
 import { fromOpenRouter } from "../src/discovery.js";
 import { setCallerPolicy, tierOf, tierOrder, budgetState } from "../src/routing.js";
 import { mapModel } from "../src/governor.js";
+import { ensureSchema, resetSchemaCache } from "../src/schema.js";
 
 function freshDb() {
   const sqlite = new DatabaseSync(":memory:");
@@ -340,5 +341,26 @@ describe("discovery records tool support", () => {
     assert.equal(fromOpenRouter({ ...base, supported_parameters: ["tools", "tool_choice"] })!.supportsTools, true);
     assert.equal(fromOpenRouter({ ...base, supported_parameters: ["temperature"] })!.supportsTools, false);
     assert.equal(fromOpenRouter(base)!.supportsTools, null);
+  });
+});
+
+describe("self-upgrading schema", () => {
+  test("a pre-0007 database is upgraded by the Worker itself, idempotently", async () => {
+    const { db, sqlite } = freshDb();
+    // Recreate the deployed shape: no supports_tools column, no caller_policies table.
+    sqlite.exec("DROP INDEX idx_usage_pod_created; DROP TABLE caller_policies; ALTER TABLE model_catalog DROP COLUMN supports_tools;");
+    sqlite.exec(`INSERT INTO model_catalog (id, provider, model_name, category, tier, input_cost_per_1m, output_cost_per_1m, quality_score, status, lifecycle, probe_runs)
+      VALUES ('openrouter:acme/old', 'openrouter', 'acme/old', 'general_reasoning', 'FREE_TIER', 0, 0, 90, 'active', 'qualified', 3)`);
+    resetSchemaCache();
+    const { fetcher } = providers({ "acme/old": ok({ choices: [{ message: { content: "PONG" } }], usage: {} }) });
+    const res = await withFetch(fetcher, () => chat(db, { model: "auto", messages: [{ role: "user", content: "ping" }] }));
+    assert.equal(res.status, 200, "the first request after deploy is served");
+    const cols = (sqlite.prepare("PRAGMA table_info(model_catalog)").all() as { name: string }[]).map((c) => c.name);
+    assert.ok(cols.includes("supports_tools"));
+    assert.ok(sqlite.prepare("SELECT name FROM sqlite_master WHERE name = 'caller_policies'").get());
+    // Existing rows keep unknown tool support, so tools requests still refuse them until discovery says otherwise.
+    assert.equal((sqlite.prepare("SELECT supports_tools FROM model_catalog").get() as any).supports_tools, null);
+    resetSchemaCache();
+    await ensureSchema(db); // second run on an upgraded database is a no-op
   });
 });

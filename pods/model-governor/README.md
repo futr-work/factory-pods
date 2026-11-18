@@ -255,5 +255,6 @@ curl -sS -X POST -H "Authorization: Bearer $GOVERNOR_ADMIN_TOKEN" -H "Content-Ty
 curl -sS -H "Authorization: Bearer $FACTORY_HUB_TOKEN" "https://<your-pod-subdomain>.workers.dev/api/governor/callers"
 ```
 
-Apply `migrations/0007_tools_and_caller_budgets.sql` before deploying this version. It adds
-`model_catalog.supports_tools` and `caller_policies`.
+Schema: this version adds `model_catalog.supports_tools` and `caller_policies` (`migrations/0007_tools_and_caller_budgets.sql`).
+The Worker also applies these additive steps to its own D1 binding on the first authenticated request
+(`src/schema.ts`), so a deploy works even when the deploying credential has no D1 API permission.

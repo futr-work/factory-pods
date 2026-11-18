@@ -11,6 +11,7 @@ import { runDiscovery, runScheduledDiscovery } from "./discovery.js";
 import { runProbeCycle, recordProbe } from "./probe.js";
 import { getUsageReport, runDailyUsageAnalysis } from "./analyzer.js";
 import { runChatCompletion } from "./inference.js";
+import { ensureSchema } from "./schema.js";
 import { callersToday, setCallerPolicy, type PolicyPatch } from "./routing.js";
 
 interface Env {
@@ -71,6 +72,11 @@ export default {
       const h = new Headers(denied.headers);
       for (const [k, v] of Object.entries(corsHeaders)) h.set(k, v);
       return new Response(denied.body, { status: denied.status, headers: h });
+    }
+
+    // Additive schema upgrades on the Worker's own D1 binding (see schema.ts). Only after auth, never for /health.
+    if (url.pathname !== "/health") {
+      await ensureSchema(db).catch((err) => console.error("[governor] schema upgrade failed:", err?.message || err));
     }
 
     // Health Check
@@ -562,6 +568,7 @@ export default {
     setHubAuthToken(config.hubToken);
     const tincan = new TincanClient(config, env.FACTORY_HUB);
     const db: PodStorage = toPodStorage(env.DB);
+    await ensureSchema(db).catch((err) => console.error("[governor] schema upgrade failed:", err?.message || err));
 
     // 1. Send heartbeat & persist locally
     const hbOk = await tincan.sendHeartbeat();
