@@ -3,6 +3,7 @@ import importlib.util
 import io
 import json
 import tempfile
+import urllib.error
 import unittest
 from pathlib import Path
 
@@ -36,6 +37,9 @@ class Governor:
         self.d1_override = {}
         self.policy_override = {}
         self.posts = []
+        self.headers = []
+        self.http_error = None
+        self.network_error = None
         self.lookup = []
 
     def request(self, path, token_file, body=None, headers=None):
@@ -49,6 +53,15 @@ class Governor:
                          "cost_usd": 0, "prompt_tokens": 22, "completion_tokens": 2, "total_tokens": 24,
                          **self.d1_override}]}).encode())
         self.posts.append(body)
+        self.headers.append(headers)
+        if self.network_error is not None:
+            raise self.network_error
+        if self.http_error is not None:
+            raise urllib.error.HTTPError("https://test.invalid", 504, "Gateway Timeout",
+                                         {"X-Governor-Caller": "test", "X-Governor-Model": MODEL,
+                                          "X-Governor-Tier": "0", "X-Governor-Attempts": "1",
+                                          "Content-Type": "application/json"},
+                                         io.BytesIO(json.dumps(self.http_error).encode()))
         assert headers["X-Governor-Caller"] == "test" and headers["X-Governor-Require-Output"] == "text"
         frames = [x if isinstance(x, str) else json.dumps(x) for x in self.frames]
         res = Response(b"".join(b"data: " + f.encode() + b"\n\n" for f in frames))
@@ -73,7 +86,7 @@ class RecoveryTests(unittest.TestCase):
         self.native_calls += 1
         first = json.loads(prior.read_bytes())
         self.assertEqual(first["d1UsageId"], "use_1")
-        self.assertEqual(first["trigger"], "empty_output")
+        self.assertIn(first["trigger"], ("empty_output", "upstream_timeout"))
         self.assertFalse(first["accepted"])
         folder.mkdir(exist_ok=False)
         raw = CSV.encode()
@@ -81,6 +94,8 @@ class RecoveryTests(unittest.TestCase):
         worker.save(folder / "native.json", {
             "status": "returned-ungraded", "requestedModel": worker.NATIVE, "providerReportedModel": worker.NATIVE,
             "responseId": "msg-test", "generationInvocations": 1, "turns": 1, "stopReason": None, "nativeTurnCompleted": True,
+            "trigger": first["trigger"], "priorTimeoutMs": first.get("timeoutMs"),
+            "priorTimeoutFingerprintSha256": first.get("timeoutFingerprintSha256"),
             "priorReceiptSha256": worker.sha(prior.read_bytes()), "priorTaskId": first["taskId"],
             "priorD1UsageId": first["d1UsageId"], "priorD1ReceiptSha256": first["d1ReceiptSha256"],
             "taskRef": first["taskRef"], "promptSha256": worker.sha(prompt.read_bytes()),
@@ -88,6 +103,100 @@ class RecoveryTests(unittest.TestCase):
             "artifactSha256": worker.sha(raw), "transport": {"artifactBytes": len(raw), "resultTextByteIdentical": True},
             "usage": {"input_tokens": 12, "output_tokens": 3, "cache_creation_input_tokens": 2,
                       "cache_read_input_tokens": 1, "total_counted_tokens": 18}, "elapsedSeconds": 1.2})
+
+    def timeout_governor(self, usage=None, ms=120000, served=None, gen=None, pre_headers=False):
+        usage = {} if usage is None else usage
+        metadata = {"requested_model": MODEL, "model": MODEL, "served_model": served, "completion_id": gen,
+                    "timeout_ms": ms, "usage_state": "partial" if usage else "unknown", "usage": usage}
+        err = dict(metadata, type="governor_error", code="upstream_timeout", status=504,
+                   finish_reason=None, usage_event_id="use_1")
+        gov = Governor([{"error": err}, "[DONE]"])
+        if pre_headers:
+            gov.http_error = {"error": err}
+        gov.d1_override = {"status": "upstream_timeout", "recovery_metadata_json": json.dumps(metadata),
+                           "prompt_tokens": usage.get("prompt_tokens", 0), "completion_tokens": usage.get("completion_tokens", 0),
+                           "total_tokens": usage.get("total_tokens", usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0))}
+        return gov
+
+    def test_verified_preheader_timeout_with_unknown_usage_retains_one_oauth_attempt(self):
+        self.args.oauth_on_timeout = True
+        self.args.upstream_timeout_ms = 1800
+        gov = self.timeout_governor(pre_headers=True, ms=1800)
+        r = worker.run(self.args, gov, self.native)
+        self.assertEqual((len(gov.posts), self.native_calls, r["firstPass"], r["accepted"]), (1, 1, False, True))
+        self.assertEqual((gov.posts[0]["max_tokens"], gov.headers[0]["X-Governor-Timeout-Ms"]), (12000, "1800"))
+        self.assertEqual(gov.headers[0]["X-Governor-Recover-On"], "upstream_timeout")
+        a, b = r["steps"]
+        self.assertEqual((a["http"], a["usageState"], a["usage"], a["reportedModel"], a["generationId"]),
+                         (504, "unknown", {}, None, None))
+        self.assertEqual((a["quality"]["status"], b["trigger"], b["quality"]["uniqueReturnedDomains"]),
+                         ("ungraded_no_deliverable", "upstream_timeout", 2))
+        self.assertEqual((r["totalTokens"], r["apiCostUsd"], r["observedPrimaryCostUsd"], r["verifiedGenerations"]),
+                         (None, None, None, 1))
+        self.assertEqual(r["observedTokenSubtotals"], {"prompt": 15, "output": 3, "combined": 18})
+        self.assertEqual(len(json.loads((self.args.out / "batch.json").read_bytes())), 1)
+        packet = json.loads((self.args.out / "attempt-1/upstream-timeout.json").read_bytes())
+        self.assertEqual(worker.sha(worker.canonical(packet)), a["timeoutFingerprintSha256"])
+        self.assertEqual(b["priorTaskId"], a["taskId"])
+
+    def test_bounded_sse_timeout_keeps_observed_counts_separate_from_d1_placeholders(self):
+        self.args.oauth_on_timeout = True
+        self.args.oauth_on_empty = False
+        for i, usage in enumerate([{"total_tokens": 24}, {"completion_tokens": 2, "completion_tokens_details": {"reasoning_tokens": 1}}]):
+            with self.subTest(usage=usage):
+                self.args.out = Path(self.temp.name) / f"part-{i}"
+                gov = self.timeout_governor(usage, served=NAME, gen="gen-1")
+                gov.frames.insert(0, chunk(" "))
+                r = worker.run(self.args, gov, self.native)
+                self.assertTrue(r["accepted"])
+                self.assertEqual(gov.headers[0].get("X-Governor-Timeout-Ms"), None)
+                self.assertEqual(r["steps"][0]["usage"], usage)
+                self.assertIsNone(r["totalTokens"])
+                self.assertEqual(r["observedTokenSubtotals"]["combined"], [42, 20][i])
+                self.assertEqual((r["verifiedGenerations"], r["observedGenerationIds"]), (1, 2))
+                self.assertEqual((self.args.out / "attempt-1/inventory.csv").read_bytes(), b" ")
+
+    def test_unknown_primary_and_failed_recovery_never_imply_zero_measured_tokens(self):
+        self.args.oauth_on_timeout = True
+        def failed(*_):
+            raise ValueError("native auth unavailable")
+        r = worker.run(self.args, self.timeout_governor(), failed)
+        self.assertEqual(r["observedTokenSubtotals"], {"prompt": None, "output": None, "combined": None})
+        self.assertIsNone(r["totalTokens"])
+        self.assertFalse(r["accepted"])
+
+    def test_unauthorized_incomplete_or_uncorrelated_timeout_never_recovers(self):
+        def malformed(g): g.http_error = {"error": {"message": "upstream timed out"}}
+        def local(g): g.network_error = TimeoutError("local timeout")
+        def partial(g): g.frames.insert(0, chunk("exam"))
+        def interrupted(g): g.frames.pop()
+        def cancelled(g): g.d1_override["status"] = "cancelled"
+        def unconfirmed(g): g.d1_override["recovery_metadata_json"] = "{}"
+        def fake_identity(g): g.frames[0]["error"]["served_model"] = "other"
+        def swapped_generation(g): g.frames.insert(0, chunk())
+        def wrong_timeout(g): g.frames[0]["error"]["timeout_ms"] = 1300
+        def refusal(g): g.frames.insert(0, chunk(refusal="No"))
+        def already_finished(g): g.frames.insert(0, chunk(finish="stop"))
+        def illogical(g): g.frames[0]["error"]["usage"] = {"prompt_tokens": 10, "total_tokens": 1}
+        for i, mutate in enumerate((None, malformed, local, partial, interrupted, cancelled, unconfirmed,
+                                    fake_identity, swapped_generation, wrong_timeout, refusal, already_finished, illogical)):
+            with self.subTest(case=mutate):
+                self.args.out = Path(self.temp.name) / f"bad-{i}"
+                self.args.oauth_on_timeout = mutate is not None
+                gov = self.timeout_governor()
+                if mutate:
+                    mutate(gov)
+                r = worker.run(self.args, gov, self.native)
+                self.assertFalse(r["accepted"])
+                self.assertNotIn("trigger", r["steps"][0])
+                self.assertEqual(self.native_calls, 0)
+
+    def test_override_is_only_valid_within_authorized_bounds(self):
+        for flag, ms in ((False, 1000), (True, 999), (True, 120001)):
+            self.args.oauth_on_timeout, self.args.upstream_timeout_ms = flag, ms
+            with self.assertRaises(ValueError):
+                worker.run(self.args, Governor([]), self.native)
+            self.assertFalse(self.args.out.exists())
 
     def test_first_pass_valid_csv_stops_after_one_with_frozen_inputs(self):
         gov = Governor([chunk(CSV), chunk(finish="stop"), {"choices": [], "usage": USAGE}, "[DONE]"])

@@ -32,6 +32,11 @@ function usageDetails(raw: any) {
   return u;
 }
 
+// Unknown delta extensions may contain a visible alternative or refusal. Leave the
+// response alone, but do not attest a recoverable timeout in that case.
+const timeoutDeltaFields = new Set(["role", "content", "refusal", "tool_calls", "function_call", "audio", "images",
+  "reasoning", "reasoning_content", "reasoning_details", "thinking"]);
+
 const metadata = (s: unknown) => typeof s === "string" && s.length <= 512 && !/[\x00-\x1f\x7f]/.test(s) ? s : null;
 
 export class RequiredText {
@@ -40,6 +45,16 @@ export class RequiredText {
   servedModel: string | null = null;
   finishReason: string | null = null;
   usage = usageDetails(null);
+  private partialUsage = usageDetails(null);
+  private uncertainTimeout = false;
+  get unresolved() { return !this.hasOutput && !this.ambiguous && !this.uncertainTimeout && this.finished.size === 0; }
+
+  timeoutMetadata(milliseconds: number) {
+    return { requested_model: this.requestedModel, model: this.model, served_model: this.servedModel,
+      completion_id: this.completionId, timeout_ms: milliseconds,
+      usage_state: Object.keys(this.partialUsage).length ? "partial" as const : "unknown" as const,
+      usage: { ...this.partialUsage } };
+  }
 
   private readonly assistant = new Set<number>();
   private readonly finished = new Set<number>();
@@ -58,6 +73,28 @@ export class RequiredText {
         (reportedModel && this.servedModel && reportedModel !== this.servedModel)) this.ambiguous = true;
     this.completionId ??= id;
     this.servedModel ??= reportedModel;
+    if (data.usage != null) {
+      const raw = data.usage, observed = usageDetails(raw);
+      // Missing telemetry is explicitly unknown; malformed provider telemetry must
+      // never become positive evidence of an unmetered, free attempt.
+      if (typeof raw !== "object" || Array.isArray(raw) ||
+          ["prompt_tokens", "completion_tokens", "total_tokens", "cost"].some(k =>
+            Object.hasOwn(raw, k) && !(k in observed)) ||
+          (raw.completion_tokens_details != null && (typeof raw.completion_tokens_details !== "object" ||
+            Array.isArray(raw.completion_tokens_details) || (Object.hasOwn(raw.completion_tokens_details, "reasoning_tokens") &&
+              !observed.completion_tokens_details))) || (observed.cost ?? 0) > 0) this.uncertainTimeout = true;
+      const merged = { ...this.partialUsage, ...observed };
+      const { prompt_tokens: prompt, completion_tokens: completion, total_tokens: total } = merged;
+      if (total !== undefined && ((prompt !== undefined && total < prompt) ||
+          (completion !== undefined && total < completion) ||
+          (prompt !== undefined && completion !== undefined && total !== prompt + completion))) {
+        if (observed.total_tokens !== undefined) this.uncertainTimeout = true;
+        delete merged.total_tokens; // An older cumulative total cannot describe newer component counts.
+      }
+      if (merged.completion_tokens_details && completion !== undefined &&
+          merged.completion_tokens_details.reasoning_tokens > completion) this.uncertainTimeout = true;
+      this.partialUsage = merged;
+    }
     if (finalUsage && data.usage) this.usage = usageDetails(data.usage);
     if (!Array.isArray(data.choices)) { this.ambiguous = true; return; }
     for (const choice of data.choices) {
@@ -67,6 +104,8 @@ export class RequiredText {
       if (!Number.isInteger(index) || index < 0 || index >= this.choices || !m || typeof m !== "object" || Array.isArray(m)) {
         this.ambiguous = true; continue;
       }
+      if (stream && (choice.error != null || choice.content_filter_results != null ||
+          Object.keys(m).some(k => !timeoutDeltaFields.has(k)))) this.uncertainTimeout = true;
       if (m.role === "assistant") this.assistant.add(index);
       else if (m.role != null) this.ambiguous = true;
       if (!stream && m.content === undefined) this.ambiguous = true;
@@ -84,7 +123,7 @@ export class RequiredText {
   // Only forward public Chat Completions fields in opted-in streams. Provider reasoning
   // extensions can occur on ordinary deltas as well as on the final event.
   publicChunk(data: any) {
-    if (data.error?.code === "empty_output" || data.error?.type === "governor_error") {
+    if (data.error?.code === "empty_output" || data.error?.code === "upstream_timeout" || data.error?.type === "governor_error") {
       return { error: { code: "upstream_error", type: "provider_error", message: "Provider reported a stream error." } };
     }
     if (data.error || this.hasOutput || this.ambiguous) {
@@ -127,4 +166,12 @@ export function requireTextFor(body: Record<string, unknown>): boolean {
   return Array.isArray(body.messages) && body.messages.every(m => m && m.role !== "tool" && m.role !== "function" &&
     !m.function_call && noTools(m.tool_calls) && (typeof m.content === "string" ||
       (Array.isArray(m.content) && m.content.every((p: any) => p?.type === "text" && typeof p.text === "string"))));
+}
+
+
+export type TimeoutMetadata = ReturnType<RequiredText["timeoutMetadata"]>;
+
+export function timeoutError(metadata: TimeoutMetadata, usageEventId: string) {
+  return { ...metadata, status: 504, code: "upstream_timeout", type: "governor_error", usage_event_id: usageEventId,
+    finish_reason: null, message: "The governor upstream deadline expired before visible output." };
 }

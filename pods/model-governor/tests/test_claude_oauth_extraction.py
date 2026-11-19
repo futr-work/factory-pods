@@ -126,6 +126,94 @@ class Recovery(unittest.TestCase):
                 self.run_helper()
             run.assert_not_called()
 
+    def timeout_snapshot(self, *, ms=120000, http=504, usage=None, served=None, completion=None):
+        usage = {} if usage is None else usage
+        step = {**self.step, "trigger": "upstream_timeout", "http": http, "timeoutMs": ms, "finishReason": None,
+                "usageState": "partial" if usage else "unknown", "usage": usage, "governorAttempts": 1,
+                "reportedModel": served, "generationId": completion}
+        meta = {"requested_model": step["requestedRoute"], "model": step["governorModel"], "served_model": served,
+                "completion_id": completion, "timeout_ms": ms, "usage_state": step["usageState"], "usage": usage}
+        row = {**self.d1, "status": "upstream_timeout", "recovery_metadata_json": json.dumps(meta),
+               "prompt_tokens": usage.get("prompt_tokens", 0), "completion_tokens": usage.get("completion_tokens", 0)}
+        row["total_tokens"] = row["prompt_tokens"] + row["completion_tokens"]
+        self.d1path.write_text(json.dumps(row))
+        step["d1ReceiptSha256"] = digest(helper.canonical(row))
+        terminal = {**meta, "type": "governor_error", "code": "upstream_timeout", "status": 504,
+                    "finish_reason": None, "usage_event_id": row["id"]}
+        sidecar = {"http": http, "taskId": step["taskId"], "taskRef": step["taskRef"], "caller": step["caller"],
+                   "briefSha256": step["briefSha256"], "terminal": terminal, "d1ReceiptSha256": step["d1ReceiptSha256"]}
+        (self.prior.parent / "upstream-timeout.json").write_text(json.dumps(sidecar))
+        step["timeoutFingerprintSha256"] = digest(helper.canonical(sidecar))
+        self.prior.write_text(json.dumps(step))
+        return step, row, sidecar
+
+    def test_timeout_requires_explicit_authorization_and_never_fabricates_observations(self):
+        self.timeout_snapshot()
+        with patch.object(helper, "invoke", self.fake):
+            with self.assertRaisesRegex(helper.Unverified, "authorization"):
+                self.run_helper()
+            self.assertEqual(self.calls, [])
+            receipt = helper.recover(self.prompt, self.out, self.prior, 20, upstream_timeout_ms=120000)
+        self.assertEqual(receipt["trigger"], "upstream_timeout")
+        self.assertEqual(receipt["priorTimeoutMs"], 120000)
+        self.assertIsNone(receipt["priorReportedModel"])
+        self.assertIsNone(receipt["priorGenerationId"])
+        self.assertIsNone(receipt["priorReportedCostUsd"])
+        self.assertEqual(receipt["priorObservedUsage"], {})
+        self.assertEqual(receipt["priorUsageState"], "unknown")
+        self.assertEqual(receipt["priorRequestedRoute"], "test:exact")
+
+    def test_verified_partial_stream_retains_only_the_observed_fields_and_uses_same_exclusive_claim(self):
+        usage = {"completion_tokens": 13, "completion_tokens_details": {"reasoning_tokens": 12}}
+        step, _, _ = self.timeout_snapshot(ms=1000, http=200, usage=usage, served="exact", completion="native-id")
+        with patch.object(helper, "invoke", self.fake):
+            receipt = helper.recover(self.prompt, self.out, self.prior, 20, upstream_timeout_ms=1000)
+            with self.assertRaisesRegex(helper.Unverified, "already claimed"):
+                helper.recover(self.prompt, self.root/"another", self.prior, 20, upstream_timeout_ms=1000)
+        self.assertEqual(sum("-p" in cmd for cmd in self.calls), 1)
+        self.assertEqual(receipt["priorObservedUsage"], usage)
+        self.assertEqual(receipt["priorUsageState"], "partial")
+        self.assertEqual(receipt["priorReportedModel"], "exact")
+        self.assertEqual(receipt["priorGenerationId"], "native-id")
+        self.assertEqual(receipt["priorTimeoutFingerprintSha256"], step["timeoutFingerprintSha256"])
+        self.assertIsNone(receipt["priorReportedCostUsd"])
+
+    def test_timeout_rejects_unbound_deadline_client_status_served_identity_and_conflicting_counts(self):
+        for change in ({"ms":999}, {"ms":120001}, {"http":408}, {"served":"other"},
+                       {"usage":{"completion_tokens":True}}, {"usage":{"cost":0.01}},
+                       {"usage":{"completion_tokens":2,"completion_tokens_details":{"reasoning_tokens":3}}},
+                       {"usage":{"prompt_tokens":30,"completion_tokens":11,"total_tokens":37}}):
+            self.timeout_snapshot(**change)
+            with self.subTest(change=change), patch.object(helper, "invoke") as run, self.assertRaises(helper.Unverified):
+                helper.recover(self.prompt, self.out, self.prior, 20, upstream_timeout_ms=change.get("ms",120000))
+            run.assert_not_called()
+        self.timeout_snapshot(ms=2500)
+        with self.assertRaisesRegex(helper.Unverified, "deadline"):
+            helper.verify_prior(self.prior,self.prompt.read_bytes(),120000)
+
+    def test_timeout_rejects_local_timer_d1_and_sidecar_drift_before_auth(self):
+        for target, key, value in (
+            ("step","trigger","client_timeout"), ("step","governorAttempts",2), ("step","caller","other"),
+            ("step","finishReason","stop"), ("step","timeoutFingerprintSha256","0"*64),
+            ("row","status","cancelled"), ("row","model_id","test:other"), ("row","recovery_metadata_json","{}"),
+            ("sidecar","briefSha256","0"*64), ("terminal","code","error"), ("terminal","usage_event_id","other"),
+        ):
+            step,row,sidecar = self.timeout_snapshot()
+            obj = {"step":step,"row":row,"sidecar":sidecar,"terminal":sidecar["terminal"]}[target]
+            obj[key] = value
+            # Even if copied transport files are re-hashed, their fields must match one another.
+            if target == "row":
+                step["d1ReceiptSha256"] = digest(helper.canonical(row))
+                sidecar["d1ReceiptSha256"] = step["d1ReceiptSha256"]
+            if target != "step":
+                step["timeoutFingerprintSha256"] = digest(helper.canonical(sidecar))
+            self.d1path.write_text(json.dumps(row))
+            self.prior.write_text(json.dumps(step))
+            (self.prior.parent/"upstream-timeout.json").write_text(json.dumps(sidecar))
+            with self.subTest(target=target,key=key), patch.object(helper,"invoke") as run, self.assertRaises(helper.Unverified):
+                helper.recover(self.prompt, self.out, self.prior, 20, upstream_timeout_ms=120000)
+            run.assert_not_called()
+
     def test_unreported_primary_cost_stays_unknown(self):
         self.step["usage"].pop("cost")
         self.prior.write_text(json.dumps(self.step))

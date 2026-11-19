@@ -1,9 +1,12 @@
 // The provider reader belongs to the request lifetime. A client may stop reading as soon as it sees finish_reason.
-import type { RequiredText } from "./required-text.js";
+import { timeoutError, type RequiredText, type TimeoutMetadata } from "./required-text.js";
+import type { UpstreamDeadline } from "./upstream-deadline.js";
 import type { LlmUsageStatus } from "./governor.js";
 
 export interface StreamLifetime {
   signal: AbortSignal;
+  /** Internal test seam; clients cannot inject a clock. */
+  deadlineClock?: (ms: number) => AbortSignal;
   waitUntil?: (task: Promise<void>) => void;
 }
 
@@ -16,10 +19,11 @@ interface Usage {
 
 interface Options {
   requiredText?: RequiredText;
+  deadline?: UpstreamDeadline;
   validateModel?: (reported: unknown) => void;
   choices: number;
   lifetime?: StreamLifetime;
-  record: (usage: Usage, status: LlmUsageStatus) => Promise<string>;
+  record: (usage: Usage, status: LlmUsageStatus, timeout?: TimeoutMetadata) => Promise<string>;
 }
 
 const MAX_EVENT_BYTES = 1024 * 1024;
@@ -38,6 +42,7 @@ function eventReader(stream: ReadableStream<Uint8Array>) {
   let buffer = "";
   let eof = false;
   return {
+    hasPartialEvent() { return buffer.trim().length > 0; },
     cancel() { void reader.cancel().catch(() => {}); },
     async read() {
       for (;;) {
@@ -50,7 +55,7 @@ function eventReader(stream: ReadableStream<Uint8Array>) {
           const bytes = encoder.encode(event);
           if (bytes.length > MAX_EVENT_BYTES) throw new Error("provider sent an oversized SSE event");
           const data = event.split(/\r?\n/).filter(line => line.startsWith("data:")).map(line => line.slice(5).trimStart()).join("\n");
-          return { bytes, done: data === "[DONE]", chunk: data && data !== "[DONE]" ? JSON.parse(data) : null };
+          return { bytes, errorEvent: /^event:[ \t]*error[ \t]*\r?$/im.test(event), done: data === "[DONE]", chunk: data && data !== "[DONE]" ? JSON.parse(data) : null };
         }
         if (buffer.length > MAX_EVENT_BYTES) throw new Error("provider sent an oversized SSE event");
         const next = await reader.read();
@@ -64,6 +69,17 @@ function eventReader(stream: ReadableStream<Uint8Array>) {
 export async function openMeteredStream(upstream: ReadableStream<Uint8Array>, options: Options): Promise<ReadableStream<Uint8Array>> {
   const source = eventReader(upstream);
   const signal = options.lifetime?.signal;
+  const read = async () => {
+    if (!options.deadline) return source.read();
+    try {
+      const event = await options.deadline.wait(() => source.read());
+      if (event?.errorEvent) throw new Error("provider reported an SSE error event");
+      return event;
+    } catch (err) {
+      if (options.deadline.caused(err) && source.hasPartialEvent()) throw new Error("deadline during incomplete provider event");
+      throw err;
+    }
+  };
   let first: Awaited<ReturnType<typeof source.read>> = null;
   if (options.validateModel) {
     // A mismatched first event must still be able to produce an HTTP error.
@@ -72,7 +88,7 @@ export async function openMeteredStream(upstream: ReadableStream<Uint8Array>, op
     try {
       if (signal?.aborted) throw new Error("client disconnected");
       do {
-        first = await source.read();
+        first = await read();
         if (!first || first.done) throw new Error("provider ended stream without a model identity");
       } while (!first.chunk);
       options.validateModel(first.chunk.model);
@@ -97,7 +113,7 @@ export async function openMeteredStream(upstream: ReadableStream<Uint8Array>, op
 
   const usage: Usage = {};
   let receipt: Promise<string> | undefined;
-  const persist = (status: LlmUsageStatus) => receipt ??= options.record({ ...usage }, status);
+  const persist = (status: LlmUsageStatus, timeout?: TimeoutMetadata) => receipt ??= options.record({ ...usage }, status, timeout);
 
   async function pump(controller: ReadableStreamDefaultController<Uint8Array>) {
     const finished = new Set<number>();
@@ -139,7 +155,7 @@ export async function openMeteredStream(upstream: ReadableStream<Uint8Array>, op
     signal?.addEventListener("abort", disconnect, { once: true });
     if (signal?.aborted) disconnect();
     try {
-      let event = first ?? await source.read();
+      let event = first ?? await read();
       while (event && !tailExpired && !(detached && !tail)) {
         const { chunk, done } = event;
         let bytes = event.bytes;
@@ -186,7 +202,7 @@ export async function openMeteredStream(upstream: ReadableStream<Uint8Array>, op
           await send(bytes);
         }
         if (done) break;
-        event = await source.read();
+        event = await read();
       }
       // EOF before any finish marker can carry provisional counts but cannot prove a completed reply.
       if (required?.emptyCompletion && doneSeen && !detached && !providerError && !tailExpired) {
@@ -202,8 +218,22 @@ export async function openMeteredStream(upstream: ReadableStream<Uint8Array>, op
       }
       if (!bodyCancelled) controller.close();
     } catch (err) {
+      if (options.deadline?.caused(err) && required?.unresolved && !receipt && !tail && !stalled &&
+          !detached && !signal?.aborted && !providerError) {
+        const meta = required.timeoutMetadata(options.deadline.milliseconds);
+        try {
+          const eventId = await persist("upstream_timeout", meta);
+          await send(sse({ error: timeoutError(meta, eventId) }));
+          await send(wire.encode("data: [DONE]\n\n"));
+          if (!bodyCancelled) controller.close();
+        } catch (receiptError) {
+          if (!bodyCancelled) controller.error(receiptError);
+          throw receiptError;
+        }
+        return;
+      }
       try {
-        await persist(stalled ? "cancelled" : "error");
+        await persist(stalled || detached ? "cancelled" : "error");
       } finally {
         if (!bodyCancelled) controller.error(err);
       }

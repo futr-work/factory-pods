@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run one frozen Domain Scout merge. Only a verified terminal empty_output may start one authorized native retry."""
+"""Run one frozen Domain Scout merge. One authorized native retry can follow a verified empty output or upstream timeout."""
 import argparse
 import csv
 import json
@@ -24,6 +24,7 @@ canonical, sha = COLLECTOR["canonical"], COLLECTOR["sha"]
 PRIMARY = "openrouter:nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
 NATIVE = "claude-opus-5-5"
 MAX_TOKENS = 12000
+DEFAULT_UPSTREAM_TIMEOUT_MS = 120000
 MAX_INPUT = 2 * 1024 * 1024
 MAX_STREAM = 8 * 1024 * 1024
 MAX_EVENT = 1024 * 1024
@@ -119,6 +120,15 @@ def freeze(args):
     require(ident(args.task_ref) and ident(args.caller) and len(args.caller) <= 200, "invalid task reference or caller")
     require(args.model.startswith("openrouter:") and args.model.endswith(":free") and ident(args.model),
             "primary requires an exact free OpenRouter catalog ID")
+    timeout_ms = getattr(args, "upstream_timeout_ms", None)
+    recover_on = []
+    if args.oauth_on_empty:
+        recover_on.append("empty_output")
+    if getattr(args, "oauth_on_timeout", False):
+        recover_on.append("upstream_timeout")
+    if timeout_ms is not None:
+        require("upstream_timeout" in recover_on and type(timeout_ms) is int and 1000 <= timeout_ms <= DEFAULT_UPSTREAM_TIMEOUT_MS,
+                "a shorter upstream deadline requires --oauth-on-timeout and 1000..120000 milliseconds")
     park, dyn = read_file(args.park), read_file(args.dynadot)
     inventory, rows, _ = COLLECTOR["source_inventory"](park, dyn)
     inputs = {}
@@ -127,7 +137,7 @@ def freeze(args):
         fields = ("domain", "listing_url", last)
         inputs[label] = [{k: row[k] for k in fields} for row in COLLECTOR["csv_records"](raw, fields)]
     brief = (INSTRUCTIONS + "\n" + json.dumps(inputs, ensure_ascii=False, separators=(",", ":"))).encode()
-    require(len(brief) <= (128 * 1024 if args.oauth_on_empty else MAX_INPUT), "brief exceeds workflow size limit")
+    require(len(brief) <= (128 * 1024 if recover_on else MAX_INPUT), "brief exceeds workflow size limit")
     args.out.mkdir(mode=0o700, parents=True, exist_ok=False)
     sources = args.out / "sources"
     sources.mkdir(mode=0o700)
@@ -136,7 +146,8 @@ def freeze(args):
     (args.out / "brief.txt").write_bytes(brief)
     facts = {"runId": uuid.uuid4().hex, "taskRef": args.task_ref, "taskClass": "data-extraction",
              "requestedRoute": args.model, "caller": args.caller, "freeOnly": True,
-             "maxGenerationAttempts": 2 if args.oauth_on_empty else 1,
+             "maxGenerationAttempts": 2 if recover_on else 1, "authorizedRecovery": recover_on,
+             "upstreamTimeoutMs": timeout_ms or DEFAULT_UPSTREAM_TIMEOUT_MS, "explicitTimeoutOverride": timeout_ms is not None,
              "briefSha256": sha(brief), "sourceSha256": {"park.csv": sha(park), "dynadot.csv": sha(dyn)},
              "sourceRows": rows, "sourceUnionDomains": len(inventory), "rubric": RUN_RUBRIC, "baseRubric": COLLECTOR["RUBRIC"],
              "rubricSha256": sha(canonical(RUN_RUBRIC))}
@@ -183,27 +194,87 @@ def checked_usage(raw):
     return usage
 
 
-def consume(response, step, artifact):
-    route = step["requestedRoute"]
-    expected = route.split(":", 1)[1]
+def partial_usage(raw):
+    require(isinstance(raw, dict), "missing timeout usage metadata")
+    counts = {"prompt_tokens", "completion_tokens", "total_tokens"}
+    require(raw.keys() <= counts | {"cost", "completion_tokens_details"}, "unexpected timeout usage field")
+    for key in counts & raw.keys():
+        require(count(raw[key]), "invalid observed timeout token count")
+    require(raw.get("completion_tokens", 0) <= MAX_TOKENS, "timeout output exceeds requested maximum")
+    if "total_tokens" in raw:
+        require(all(raw["total_tokens"] >= raw[k] for k in ("prompt_tokens", "completion_tokens") if k in raw),
+                "contradictory partial timeout counts")
+    if counts <= raw.keys():
+        require(raw["total_tokens"] == raw["prompt_tokens"] + raw["completion_tokens"], "inconsistent timeout usage")
+    if "cost" in raw:
+        require(type(raw["cost"]) in (int, float) and raw["cost"] == 0, "nonzero or invalid observed timeout cost")
+    if "completion_tokens_details" in raw:
+        details = raw["completion_tokens_details"]
+        require(isinstance(details, dict) and details.keys() == {"reasoning_tokens"} and
+                count(details["reasoning_tokens"]) and details["reasoning_tokens"] <= raw.get("completion_tokens", MAX_TOKENS),
+                "invalid observed reasoning count")
+    return raw
+
+
+TIMEOUT_META = ("requested_model", "model", "served_model", "completion_id", "timeout_ms", "usage_state", "usage")
+
+
+def timeout_error(error, step):
+    require(isinstance(error, dict) and error.get("type") == "governor_error" and
+            error.get("code") == "upstream_timeout" and error.get("status") == 504 and
+            error.get("requested_model") == error.get("model") == step["requestedRoute"] and
+            "finish_reason" in error and error["finish_reason"] is None and step.get("finishReason") is None and
+            type(error.get("timeout_ms")) is int and error["timeout_ms"] == step["timeoutMs"],
+            "invalid Worker upstream timeout")
+    observed = partial_usage(error["usage"])
+    require(error["usage_state"] == ("partial" if observed else "unknown"), "timeout usage state disagrees with observations")
+    expected = step["requestedRoute"].split(":", 1)[1]
+    require(error["served_model"] in (None, expected) and
+            (error["completion_id"] is None or ident(error["completion_id"])), "invalid observed timeout identity")
+    for local, field in (("reportedModel", "served_model"), ("generationId", "completion_id")):
+        require(local not in step or step[local] == error[field], "conflicting timeout identity")
+        step[local] = error[field]
+    note(step, "d1UsageId", error.get("usage_event_id"))
+    step.update(trigger="upstream_timeout", finishReason=None, usageState=error["usage_state"], usage=observed)
+    return {k: error[k] for k in (*TIMEOUT_META, "type", "code", "status", "finish_reason", "usage_event_id")}
+
+
+def routed_headers(response, step):
     head = response.headers
     step.update(http=response.status, governorModel=head.get("X-Governor-Model"), tier=head.get("X-Governor-Tier"),
                 ray=head.get("cf-ray"))
-    require(response.status == 200 and head.get("Content-Type", "").split(";")[0].strip().lower() == "text/event-stream"
-            and head.get("X-Governor-Caller") == step["caller"] and step["governorModel"] == route
+    require(head.get("X-Governor-Caller") == step["caller"] and step["governorModel"] == step["requestedRoute"]
             and step["tier"] == "0" and head.get("X-Governor-Attempts") == "1", "unverified free response headers")
     step["governorAttempts"] = 1
+    return head.get("Content-Type", "").split(";")[0].strip().lower()
+
+
+def consume(response, step, artifact):
+    route = step["requestedRoute"]
+    expected = route.split(":", 1)[1]
+    ctype = routed_headers(response, step)
+    timeout_allowed = "upstream_timeout" in step["authorizedRecovery"]
+    if response.status == 504:
+        require(timeout_allowed and ctype == "application/json", "unexpected HTTP 504 response")
+        payload = json.loads(limited(response, MAX_EVENT))
+        return timeout_error(payload["error"], step)
+    require(response.status == 200 and ctype == "text/event-stream", "expected HTTP 200 SSE")
+    terminal_timeout = None
     empty = False
     visible = False
     usage = None
     for payload in sse_events(response):
         if payload == "[DONE]":
             break
-        require(not empty, "event after empty terminal")
+        require(not empty and terminal_timeout is None, "event after terminal error")
         frame = json.loads(payload)
         require(isinstance(frame, dict), "invalid SSE payload")
         if "error" in frame:
             error = frame["error"]
+            if isinstance(error, dict) and error.get("code") == "upstream_timeout":
+                require(timeout_allowed and not visible and not frame.get("choices"), "unauthorized timeout or partial output")
+                terminal_timeout = timeout_error(error, step)
+                continue
             require(isinstance(error, dict) and error.get("code") == "empty_output"
                     and error.get("type") == "governor_error" and error.get("status") == 502
                     and error.get("model") == error.get("requested_model") == route
@@ -242,6 +313,8 @@ def consume(response, step, artifact):
                 visible |= bool(text.strip())
             if choice.get("finish_reason") is not None:
                 note(step, "finishReason", choice["finish_reason"])
+    if terminal_timeout is not None:
+        return terminal_timeout
     require(step.get("finishReason") in ("stop", "length") and step.get("reportedModel") == expected
             and step.get("generationId") and usage is not None, "unverified terminal identity, usage, or finish")
     require(visible or empty, "empty stream without authenticated governor terminal error")
@@ -255,26 +328,49 @@ def primary(args, governor, folder, step, brief):
             "max_tokens": MAX_TOKENS, "messages": [{"role": "user", "content": brief.decode()}]}
     step["requestSha256"] = sha(canonical(body))
     headers = {"X-Governor-Caller": args.caller, "X-Governor-Require-Output": "text", "Accept": "text/event-stream"}
+    if "upstream_timeout" in step["authorizedRecovery"]:
+        headers["X-Governor-Recover-On"] = "upstream_timeout"
+        if step["explicitTimeoutOverride"]:
+            headers["X-Governor-Timeout-Ms"] = str(step["timeoutMs"])
     with (folder / "inventory.csv").open("xb") as artifact, deadline(145):
-        with governor.request("/api/inference/chat/completions", args.client_token_file, body, headers) as res:
-            consume(res, step, artifact)
+        try:
+            response = governor.request("/api/inference/chat/completions", args.client_token_file, body, headers)
+        except urllib.error.HTTPError as err:
+            if err.code != 504 or "upstream_timeout" not in step["authorizedRecovery"]:
+                raise
+            response = err
+        with response:
+            return consume(response, step, artifact)
 
 
-def attest_empty(governor, args, step, folder):
+def attest_failure(governor, args, step, folder, terminal):
     event_id = step["d1UsageId"]
     query = urllib.parse.urlencode({"id": event_id})
     with deadline(25), governor.request("/api/governor/usage-receipts?" + query, args.admin_token_file) as response:
         rows = json.loads(limited(response, MAX_EVENT))["rows"]
     expected = {"id": event_id, "task_id": step["taskId"], "pod_id": step["caller"],
                 "model_id": step["governorModel"], "provider": "openrouter", "tier": "FREE_TIER",
-                "status": "empty_output", "cost_usd": 0,
-                **{k: step["usage"][k] for k in ("prompt_tokens", "completion_tokens", "total_tokens")}}
-    require(isinstance(rows, list) and len(rows) == 1, "no unique empty-output D1 receipt")
+                "status": step["trigger"]}
+    require(isinstance(rows, list) and len(rows) == 1, "no unique D1 receipt")
     row = rows[0]
+    if terminal:
+        stored = json.loads(row["recovery_metadata_json"])
+        require(canonical(stored) == canonical({k: terminal[k] for k in TIMEOUT_META}), "D1 timeout fingerprint mismatch")
+    for key, db_key in (("prompt_tokens", "prompt_tokens"), ("completion_tokens", "completion_tokens"),
+                        ("total_tokens", "total_tokens"), ("cost", "cost_usd")):
+        if key in step["usage"]:
+            expected[db_key] = step["usage"][key]
+    expected["cost_usd"] = 0  # Free route ledger constraint; never used as an observation of provider cost.
     require(all(not isinstance(row.get(k), bool) and row.get(k) == v for k, v in expected.items()),
-            "D1 receipt does not match the empty stream, task, caller, model and usage")
+            "D1 receipt does not match the triggering stream, task, caller, model and usage")
     save(folder / "d1-usage.json", row)
     step["d1ReceiptSha256"] = sha(canonical(row))
+    if terminal:
+        envelope = {**{k: step[k] for k in ("http", "taskId", "taskRef", "caller", "briefSha256", "d1ReceiptSha256")},
+                    "terminal": terminal}
+        save(folder / "upstream-timeout.json", envelope)
+        step["timeoutFingerprintSha256"] = sha(canonical(envelope))
+
 
 
 def policy(governor, args):
@@ -320,6 +416,12 @@ def measure(park, dyn, brief, artifact, frozen, step, folder):
     save(folder / "measurement.json", receipt)
     step["failedChecks"] = [k for k, v in receipt["passed"].items() if not v]
     step["accepted"] = not step["failedChecks"]
+    metrics = receipt.get("measurements", {})
+    unique_rows = (metrics["artifactRows"] - metrics["blankDomainRows"] - metrics["duplicateArtifactRows"]
+                   if metrics else None)
+    step["quality"] = {"status": "graded", "passed": sum(receipt["passed"].values()),
+                       "checked": len(receipt["passed"]), "expectedDomains": frozen["sourceUnionDomains"],
+                       "uniqueReturnedDomains": unique_rows, "measurements": metrics}
     return {"kind": "artifact_review", "taskClass": frozen["taskClass"], "taskRef": step["taskRef"],
             "briefSha256": frozen["briefSha256"], "rubricSha256": frozen["rubricSha256"],
             "sourceRef": "sha256:" + sha(canonical(frozen["sourceSha256"])),
@@ -334,8 +436,11 @@ def link(event, step, workflow):
 
 def invoke_native(brief, folder, prior):
     # The helper supplies its own native subprocess deadlines and performs OAuth and one-use checks.
+    first = json.loads(prior.read_bytes())
+    trigger_args = (["--timeout-receipt", str(prior), "--upstream-timeout-ms", str(first["timeoutMs"])]
+                    if first["trigger"] == "upstream_timeout" else ["--empty-receipt", str(prior)])
     subprocess.run([sys.executable, str(BIN / "claude-oauth-extraction.py"), "--prompt", str(brief),
-                    "--out", str(folder), "--empty-receipt", str(prior)], check=True,
+                    "--out", str(folder), *trigger_args], check=True,
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=245)
 
 
@@ -348,6 +453,10 @@ def verify_native(folder, prior, first, brief):
             and ident(n.get("responseId")) and n.get("nativeTurnCompleted") is True
             and "stopReason" in n and n["stopReason"] in (None, "end_turn", "stop_sequence")
             and type(n.get("generationInvocations")) is int and n.get("generationInvocations") == n.get("turns") == 1
+            and n.get("trigger") == first["trigger"]
+            and (first["trigger"] != "upstream_timeout" or (
+                n.get("priorTimeoutFingerprintSha256") == first["timeoutFingerprintSha256"]
+                and n.get("priorTimeoutMs") == first["timeoutMs"]))
             and n.get("priorReceiptSha256") == sha(prior.read_bytes())
             and n.get("priorD1UsageId") == first["d1UsageId"]
             and n.get("priorD1ReceiptSha256") == first["d1ReceiptSha256"]
@@ -384,7 +493,8 @@ def run(args, governor, native=invoke_native):
     tid = "domain-extract:" + frozen["runId"]
     steps, batch = [], []
     first = dict(base, attempt=1, taskId=tid + ":1", caller=args.caller, requestedRoute=args.model,
-                 startedAt=stamp(), accepted=False, requestIssued=False)
+                 startedAt=stamp(), accepted=False, requestIssued=False, authorizedRecovery=frozen["authorizedRecovery"],
+                 timeoutMs=frozen["upstreamTimeoutMs"], explicitTimeoutOverride=frozen["explicitTimeoutOverride"])
     steps.append(first)
     folder = args.out / "attempt-1"
     folder.mkdir()
@@ -397,15 +507,19 @@ def run(args, governor, native=invoke_native):
         save(prior, first)  # Leave durable evidence before the single POST.
         model_clock = time.monotonic()
         try:
-            primary(args, governor, folder, first, brief)
+            terminal = primary(args, governor, folder, first, brief)
         finally:
             first["inferenceSeconds"] = round(time.monotonic() - model_clock, 3)
             first["inferenceEndedAt"] = stamp()
-        if first.get("trigger") == "empty_output":
-            attest_empty(governor, args, first, folder)
+        if first.get("trigger"):
+            attest_failure(governor, args, first, folder, terminal)
         artifact = (folder / "inventory.csv").read_bytes()
         first.update(artifactBytes=len(artifact), artifactSha256=sha(artifact))
-        event = measure(park, dyn, brief, artifact, frozen, first, folder)
+        if first.get("trigger") == "upstream_timeout":
+            require(not artifact.decode().strip(), "timeout has partial visible artifact")
+            first["quality"] = {"status": "ungraded_no_deliverable", "expectedDomains": frozen["sourceUnionDomains"]}
+        else:
+            event = measure(park, dyn, brief, artifact, frozen, first, folder)
     except FAILURES as err:
         first["error"] = error_info(err)
         if first.pop("trigger", None) and "usage" in first:
@@ -418,10 +532,10 @@ def run(args, governor, native=invoke_native):
     save(prior, first)
     if event:
         batch.append(link(event, first, args.model))
-    if first.get("trigger") == "empty_output" and args.oauth_on_empty:
+    if first.get("trigger") in frozen["authorizedRecovery"]:
         folder = args.out / "attempt-2"
         second = dict(base, attempt=2, taskId=tid + ":2", startedAt=stamp(), accepted=False,
-                      trigger="empty_output", priorTaskId=first["taskId"], priorReceiptSha256=sha(prior.read_bytes()),
+                      trigger=first["trigger"], priorTaskId=first["taskId"], priorReceiptSha256=sha(prior.read_bytes()),
                       requestedRoute="anthropic-oauth/" + NATIVE, oauthQuotaDebit=None)
         steps.append(second)
         event = None
@@ -449,18 +563,33 @@ def run(args, governor, native=invoke_native):
         if event:
             batch.append(link(event, second, second["requestedRoute"]))
 
-    usage1 = first.get("usage")
+    usage1 = first.get("usage") or {}
     usage2 = steps[1].get("usage") if len(steps) == 2 else None
-    known = usage1 is not None and (len(steps) == 1 or usage2 is not None)
-    inputs = (usage1["prompt_tokens"] + (usage2["total_counted_tokens"] - usage2["output_tokens"] if usage2 else 0)) if known else None
-    outputs = (usage1["completion_tokens"] + (usage2["output_tokens"] if usage2 else 0)) if known else None
-    report = dict(base, startedAt=started, endedAt=stamp(), elapsedSeconds=round(time.monotonic() - tic, 3),
-                  accepted=steps[-1]["accepted"], firstPass=first["accepted"],
-                  verifiedGenerations=sum(1 for s in steps if s.get("usage") and s.get("generationId")),
-                  generationSeconds=sum(s["inferenceSeconds"] for s in steps) if known else None,
+    known = (first.get("trigger") != "upstream_timeout" and all(k in usage1 for k in ("prompt_tokens", "completion_tokens"))
+             and (len(steps) == 1 or usage2 is not None))
+    def subtotal(*amounts):
+        observed = [x for x in amounts if x is not None]
+        return sum(observed) if observed else None
+
+    inputs = subtotal(usage1.get("prompt_tokens"), usage2["total_counted_tokens"] - usage2["output_tokens"] if usage2 else None)
+    outputs = subtotal(usage1.get("completion_tokens"), usage2["output_tokens"] if usage2 else None)
+    primary_total = usage1.get("total_tokens", subtotal(usage1.get("prompt_tokens"), usage1.get("completion_tokens")))
+    observed_total = subtotal(primary_total, usage2["total_counted_tokens"] if usage2 else None)
+    elapsed = round(time.monotonic() - tic, 3)
+    accepted = steps[-1]["accepted"]
+    report = dict(base, startedAt=started, endedAt=stamp(), elapsedSeconds=elapsed,
+                  accepted=accepted, firstPass=first["accepted"], distinctTasks=1,
+                  finalQuality=steps[-1].get("quality", {"status": "ungraded"}),
+                  verifiedGenerations=sum(1 for s in steps if s.get("generationId") and "error" not in s
+                                          and not (s["attempt"] == 1 and s.get("trigger") == "upstream_timeout")),
+                  observedGenerationIds=sum(bool(s.get("generationId")) for s in steps),
+                  generationSeconds=sum(s["inferenceSeconds"] for s in steps) if all("inferenceSeconds" in s for s in steps) else None,
+                  acceptedDomainsPerSecond=(round(frozen["sourceUnionDomains"] / elapsed, 3) if accepted and elapsed else None),
                   apiRequests=int(first["requestIssued"]), nativeGenerationInvocations=steps[1].get("generationInvocations") if len(steps) == 2 else 0,
-                  promptTokens=inputs, outputTokens=outputs, totalTokens=inputs + outputs if known else None,
-                  apiCostUsd=usage1["cost"] if usage1 else None, oauthQuotaDebit=None, steps=steps)
+                  promptTokens=inputs if known else None, outputTokens=outputs if known else None, totalTokens=observed_total if known else None,
+                  observedTokenSubtotals={"prompt": inputs, "output": outputs, "combined": observed_total},
+                  exactTokenTotalsKnown=known, apiCostUsd=usage1.get("cost") if first.get("trigger") != "upstream_timeout" else None,
+                  observedPrimaryCostUsd=usage1.get("cost"), oauthQuotaDebit=None, steps=steps)
     save(args.out / "batch.json", batch)
     save(args.out / "summary.json", report)
     return report
@@ -474,6 +603,8 @@ def main():
         parser.add_argument("--" + name, required=True)
     parser.add_argument("--model", default=PRIMARY)
     parser.add_argument("--oauth-on-empty", action="store_true", help="authorize one native Claude OAuth generation only for verified empty output")
+    parser.add_argument("--oauth-on-timeout", action="store_true", help="authorize one native Claude OAuth generation only for a Worker-attested upstream timeout")
+    parser.add_argument("--upstream-timeout-ms", type=int, help="explicit Worker deadline for timeout verification, 1000..120000 milliseconds (default: normal 120000)")
     args = parser.parse_args()
     os.umask(0o077)
     try:

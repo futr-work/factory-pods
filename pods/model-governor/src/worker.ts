@@ -60,7 +60,7 @@ export default {
     const corsHeaders = {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Governor-Caller, X-Governor-Category, X-Governor-Require-Output",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Governor-Caller, X-Governor-Category, X-Governor-Require-Output, X-Governor-Recover-On, X-Governor-Timeout-Ms",
       "Access-Control-Expose-Headers": "X-Governor-Model, X-Governor-Tier, X-Governor-Caller, X-Governor-Attempts",
     };
 
@@ -324,7 +324,7 @@ export default {
             headers: { ...corsHeaders, "Content-Type": "application/json" },
           });
         }
-        if (body.status === "empty_output") return json({ error: "empty_output is reserved for governor-generated completions" }, 400, corsHeaders);
+        if (body.status === "empty_output" || body.status === "upstream_timeout") return json({ error: "status is reserved for governor-generated completions" }, 400, corsHeaders);
         const event = await recordUsage(db, {
           podId: body.podId,
           taskId: body.taskId,
@@ -396,16 +396,30 @@ export default {
       if (body.maxTokens !== undefined && forward.max_tokens === undefined) forward.max_tokens = body.maxTokens;
       if (!isOpenAiPath) delete forward.stream;
 
+      let recoveryTimeoutMs: number | undefined;
+      const recovery = request.headers.get("X-Governor-Recover-On");
+      const override = request.headers.get("X-Governor-Timeout-Ms");
+      if (recovery !== null || override !== null) {
+        if (!isOpenAiPath || recovery !== "upstream_timeout" || request.headers.get("X-Governor-Require-Output") !== "text" ||
+            forward.stream !== true || !pinned || (override !== null && !/^\d+$/.test(override))) {
+          return fail(400, "invalid timeout recovery options", "invalid_request");
+        }
+        recoveryTimeoutMs = override === null ? 120000 : Number(override);
+        if (recoveryTimeoutMs < 1000 || recoveryTimeoutMs > 120000) return fail(400, "timeout_ms must be 1000–120000", "invalid_request");
+      }
       const out = await runChatCompletion(db, env, {
         callerId,
         taskId: typeof body.taskId === "string" ? body.taskId : undefined,
         category: category || undefined,
-        model: pinned,
+        model: pinned, recoveryTimeoutMs,
         requireTextForModel: isOpenAiPath && request.headers.get("X-Governor-Require-Output") === "text" ? rawModel : undefined,
         excludeFamily: typeof body.excludeFamily === "string" ? body.excludeFamily : undefined,
         body: forward,
       }, undefined, undefined, { signal: request.signal, waitUntil: ctx && (task => ctx.waitUntil(task)) });
       if (!out.ok) {
+        if (out.upstreamTimeout) return json({error:out.upstreamTimeout},504,{...corsHeaders,
+          "X-Governor-Caller":callerId,"X-Governor-Model":out.upstreamTimeout.model,"X-Governor-Tier":"0",
+          "X-Governor-Attempts":String(out.attempts.length)});
         return fail(out.status, out.error, out.code, {
           requested_model: rawModel,
           model: out.model ?? null,

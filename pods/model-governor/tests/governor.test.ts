@@ -361,6 +361,24 @@ describe("usage analyzer", () => {
     assert.equal(report.totals.freeOrOauthTokenPct, 0);
   });
 
+  test("reports expensive deadline failures alongside successful latency without inventing usage", async () => {
+    const { db } = freshDb();
+    await insertUsage(db, [
+      { model: "free/scout", status: "success", latency: 300 },
+      { model: "free/scout", status: "upstream_timeout", latency: 120000 },
+      { model: "free/scout", status: "upstream_timeout", latency: 119000 },
+      { model: "free/scout", status: "empty_output", latency: 500 },
+    ]);
+    await db.prepare("UPDATE llm_usage_events SET recovery_metadata_json=? WHERE latency_ms=119000")
+      .bind(JSON.stringify({usage_state: "partial"})).run();
+    const { models: [m] } = await analyzeUsage(db, DAY_START, DAY_START + DAY);
+    assert.deepEqual({...m.attemptStatusCounts}, {success: 1, upstream_timeout: 2, empty_output: 1});
+    assert.deepEqual(m.timeoutsWithoutFinalUsage, {partial: 1, unknown: 1});
+    assert.equal(m.errors, 3);
+    assert.equal(m.p95LatencyMs, 300);
+    assert.equal(m.p95AttemptLatencyMs, 120000);
+  });
+
   test("flags a model failing at least 10% of 20+ calls; ignores small samples", async () => {
     const { db } = freshDb();
     await insertUsage(db, [

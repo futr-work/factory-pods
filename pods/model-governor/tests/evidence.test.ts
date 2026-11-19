@@ -164,7 +164,7 @@ test("an existing governor database can apply the additive migration or the runt
 
 test("single usage receipt readback requires admin and binds to exactly one primary key", async () => {
   const { request, sqlite } = fixture();
-  sqlite.prepare("INSERT INTO llm_usage_events VALUES(?, 'scout', 'task:attempt-1', 'test', 'model1', 'FREE_TIER', 9, 3, 12, 0, 0, 8, 'empty_output', 123)").run("use_r1");
+  sqlite.prepare("INSERT INTO llm_usage_events VALUES(?, 'scout', 'task:attempt-1', 'test', 'model1', 'FREE_TIER', 9, 3, 12, 0, 0, 8, 'empty_output', 123, NULL)").run("use_r1");
   for (const auth of ["Bearer client", "Bearer hub", "", "Basic " + btoa("x:admin")]) {
     assert.equal((await request("GET", "usage-receipts?id=use_r1", auth)).status, 403);
   }
