@@ -859,7 +859,17 @@ describe("governor-owned extraction deadline", () => {
     const {db} = freshDb();
     await addModel(db,{id:model});
     let calls=0;
-    const fetcher = (() => { calls++;return new Promise<Response>(()=>{}); }) as typeof fetch;
+    // Model an outstanding IO handle: Node's AbortSignal.timeout does not keep the event loop alive.
+    const fetcher = (async (_url: unknown, init: RequestInit) => {
+      calls++;
+      return new Promise<Response>((_resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("test upstream did not abort")), 5000);
+        init.signal?.addEventListener("abort", () => {
+          clearTimeout(timer);
+          reject(new Error("test upstream aborted"));
+        }, { once: true });
+      });
+    }) as typeof fetch;
     const res = await withFetch(fetcher,()=>chat(db,{model,taskId:"attempt-1",stream:true,messages},
       {...headers,"X-Governor-Timeout-Ms":"1000","X-Governor-Caller":"scout"}));
     assert.equal(res.status,504);
