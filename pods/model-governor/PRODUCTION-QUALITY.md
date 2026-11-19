@@ -32,3 +32,28 @@ Use eligibility and constraints first: approved provider path, trust/risk, data 
 Before changing defaults, define the rubric, quality floor and acceptable regression in advance. Compare candidates on the same representative tasks, hold out unseen briefs, and cluster repeated runs by original task. Show counts and uncertainty alongside rates. Require enough independent tasks for the decision's risk and the effect size; one preferred artifact cannot establish a reusable winner. Escalate critical decisions, uncertain cases, reviewer disagreements, and a random sample of apparently good work for human review.
 
 Recommended rollout: evaluate in shadow from recorded outcomes, review a proposed per-class policy, then canary a bounded share of eligible live tasks and retain a rollback rule. Keep exact requested models pinned. A model/version, evaluator/rubric, account restriction, or major workload change should expire or qualify older evidence. A single cached routing policy per task class can serve normal requests without invoking a second model to choose a model. These are rollout recommendations; evidence ingestion alone does not enact a routing policy or schedule recurring evaluation.
+
+## Collect outcomes on demand
+
+Run collectors in the trusted operator or validator environment. Each prints an evidence array. Keep raw source snapshots, manifests and reviewer receipts in private storage. Give the collector inputs from the source system or a trusted reviewer; a self-authored receipt supplied by a generator cannot attest its own quality.
+
+| Collector | Source and coverage | Unknowns |
+| --- | --- | --- |
+| `bin/collect-coding-outcome.py` | Reads a GitHub PR, verifies the local immutable head object, checks named app-qualified CI runs, and collects eligible current-head review decisions. Pass one `--check APP:NAME` per expected check and `--source-receipt FILE` to retain the coverage record. | Missing or nondecisive checks remain unmeasured. GitHub attaches results to the PR head; the CI job may test a merged checkout. A review from a GitHub User account is an account decision. CI success and PR merge do not establish human authorship, publication approval, or which model wrote the patch. |
+| `bin/collect-extraction-outcome.py` | Compares a merged domain inventory against frozen Park.io and Dynadot CSV snapshots. Supply `--park`, `--dynadot`, `--artifact`, the original `--brief`, stable `--task-ref`, and local `--receipts` directory. Counts omissions, extras, duplicates, provenance, listing links and displayed close values. | Measures fidelity to these snapshots. It cannot validate the upstream scraper, domain value, fields outside the rubric, or market coverage. Other extraction schemas require their own reconciler. |
+| `bin/collect-creative-outcome.py MANIFEST.json` | Recomputes both artifact hashes and checks an explicit human A/B verdict against the sealed map. Optional hash-bound per-cut outcome receipts supply measured human edit minutes or publication decisions. `--help` describes the manifest. | A preference supplies neither measured editing time nor authorization to publish. A browser-local vote requires deliberate collection from the reviewer; it is not automatically transmitted. |
+
+For example, from the pod directory:
+
+```sh
+python3 bin/collect-coding-outcome.py --repo OWNER/REPO --pr 123 \
+  --head EXACT_HEAD_SHA --checkout /path/to/checkout \
+  --check 'github-actions:build, check, test' \
+  --source-receipt /private/path/to/ci-source.json > /private/path/to/coding.json
+
+python3 bin/import-outcomes.py /private/path/to/coding.json
+python3 bin/import-outcomes.py /private/path/to/coding.json --apply \
+  --origin https://YOUR-GOVERNOR.example --admin-token-file /private/path/to/admin-token
+```
+
+Preview is offline; apply posts the same events one at a time through the existing admin ledger. The response records each created or already-recorded sequence. If a submission stops, inspect the error and replay the same files. Matching events are idempotent, and conflicting evidence under one identifier stops the batch. New check runs and changed judgments are observations in history; the task-scoped scorecard does not treat them as new independent tasks. Use the exact class and rubric hash from the batch with `GET /api/governor/scorecard` to inspect the labeled cohort. Model-specific comparisons require a verified generation-to-artifact link; an unattributed task still supplies operational quality evidence.

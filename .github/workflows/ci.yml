@@ -47,6 +47,8 @@ jobs:
       - run: npm run check
       - run: npm test
       - run: npm run test:root
+      - name: Governor local-tool regressions
+        run: python3 -m unittest discover -s pods/model-governor/tests -p '*test*.py'
 
   quickstart:
     name: quickstart end to end (${{ matrix.template }})
