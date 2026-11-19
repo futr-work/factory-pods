@@ -55,7 +55,8 @@ CREATE TABLE IF NOT EXISTS llm_usage_events (
   saved_usd REAL NOT NULL,
   latency_ms INTEGER NOT NULL,
   status TEXT NOT NULL DEFAULT 'success',
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  recovery_metadata_json TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_usage_pod ON llm_usage_events(pod_id);

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One native Claude OAuth recovery after a verified, semantically empty Governor completion.
+"""One native Claude OAuth recovery after a verified empty completion or explicitly authorized upstream timeout.
 
 The coordinator supplies a UTF-8 prompt and a new output directory. The triggering step.json
 and its sibling inventory.csv and d1-usage.json must come from the trusted local coordinator, which authenticates
@@ -49,40 +49,102 @@ def write_json(path, data):
     tmp.replace(path)
 
 
-def verify_empty(path, prompt):
-    receipt = path.read_bytes()
-    step = json.loads(receipt)
-    require(isinstance(step, dict) and step.get("trigger") == "empty_output" and step.get("http") == 200
-            and step.get("finishReason") in ("stop", "length"), "requires a completed empty_output step")
-    require(step.get("attempt") == 1 and step.get("briefSha256") == sha(prompt), "requires the original first attempt and its exact brief")
-    require(all(isinstance(step.get(k), str) and step[k].strip() and len(step[k]) <= 512
-                for k in ("taskRef", "taskId", "caller", "d1UsageId")), "missing prior task references")
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode()
+
+
+def verify_empty_completion(step, row, route):
+    require(step.get("http") == 200 and step.get("finishReason") in ("stop", "length"), "requires a completed empty_output step")
     usage = step.get("usage")
     require(isinstance(usage, dict) and all(type(usage.get(k)) is int and usage[k] >= 0
             for k in ("prompt_tokens", "completion_tokens", "total_tokens"))
             and usage["completion_tokens"] <= 12000 and usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"]
-            and (usage.get("cost") is None or type(usage["cost"]) in (int, float) and usage["cost"] == 0)
-            and str(step.get("tier")) == "0",
+            and (usage.get("cost") is None or type(usage["cost"]) in (int, float) and usage["cost"] == 0),
             "prior free-tier usage is missing or outside its bound")
+    require(route.partition(":")[2] == step.get("reportedModel") and isinstance(step.get("generationId"), str)
+            and bool(step["generationId"].strip()), "prior model identity or generation ID unverified")
+    require(all(type(row.get(k)) is int and row[k] == usage[k]
+                for k in ("prompt_tokens", "completion_tokens", "total_tokens")), "prior D1 token counts differ")
+    return {"priorReportedCostUsd": usage.get("cost")}
+
+
+def verify_timeout(step, row, folder, route, timeout_ms):
+    require(type(timeout_ms) is int and 1000 <= timeout_ms <= 120000 and type(step.get("timeoutMs")) is int
+            and step["timeoutMs"] == timeout_ms, "unexpected upstream timeout deadline")
+    require(step.get("http") in (200, 504) and "finishReason" in step and step["finishReason"] is None
+            and step.get("governorAttempts") == 1, "expected a single upstream timeout without a finish reason")
+    served, completion = step.get("reportedModel"), step.get("generationId")
+    require(served in (None, route.partition(":")[2]) and (completion is None or
+            isinstance(completion, str) and 0 < len(completion) <= 512 and completion == completion.strip() and completion.isprintable()),
+            "unverified timeout model or generation ID")
+    usage = step.get("usage")
+    state = step.get("usageState")
+    require(isinstance(usage, dict) and state == ("partial" if usage else "unknown"),
+            "timeout usage must distinguish observed partial fields from unknowns")
+    counts = ("prompt_tokens", "completion_tokens", "total_tokens")
+    require(set(usage) <= {*counts, "cost", "completion_tokens_details"} and all(type(usage[k]) is int and 0 <= usage[k] <= 2**53 - 1 for k in counts if k in usage)
+            and usage.get("completion_tokens", 0) <= 12000 and ("cost" not in usage or type(usage["cost"]) in (int,float) and usage["cost"] == 0),
+            "invalid observed timeout usage")
+    if "completion_tokens_details" in usage:
+        details = usage["completion_tokens_details"]
+        require(isinstance(details, dict) and set(details) == {"reasoning_tokens"}
+                and type(details["reasoning_tokens"]) is int
+                and 0 <= details["reasoning_tokens"] <= usage.get("completion_tokens", 12000),
+                "invalid partial reasoning token count")
+    if "total_tokens" in usage:
+        require(all(usage["total_tokens"] >= usage[k] for k in counts[:2] if k in usage)
+                and (not all(k in usage for k in counts[:2]) or usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"]),
+                "contradictory observed timeout counts")
+    # The old ledger columns require numbers. They cannot attest to missing tokens or a provider charge.
+    # The separately persisted recovery metadata preserves the actual observations, including null identities.
+    metadata = {"requested_model": route, "model": route, "served_model": served, "completion_id": completion,
+                "timeout_ms": timeout_ms, "usage_state": state, "usage": usage}
+    require(isinstance(row.get("recovery_metadata_json"), str)
+            and canonical(json.loads(row["recovery_metadata_json"])) == canonical(metadata),
+            "D1 timeout recovery metadata differs from the verified timeout")
+    require(all(type(row.get(k)) is int and row[k] == usage[k] for k in counts[:2] if k in usage)
+            and (not all(k in usage for k in counts) or type(row.get("total_tokens")) is int and row["total_tokens"] == usage["total_tokens"]),
+            "D1 timeout usage columns differ from observed components")
+    terminal = {**metadata, "type": "governor_error", "code": "upstream_timeout", "status": 504,
+                "finish_reason": None, "usage_event_id": row["id"]}
+    expected = {"http": step["http"], "taskId": step["taskId"], "taskRef": step["taskRef"], "caller": step["caller"],
+                "briefSha256": step["briefSha256"], "terminal": terminal, "d1ReceiptSha256": step["d1ReceiptSha256"]}
+    sidecar = json.loads((folder / "upstream-timeout.json").read_bytes())
+    require(canonical(sidecar) == canonical(expected) and sha(canonical(sidecar)) == step.get("timeoutFingerprintSha256"),
+            "upstream timeout fingerprint does not match the trusted terminal data")
+    return {"priorTimeoutMs": timeout_ms, "priorTimeoutFingerprintSha256": step["timeoutFingerprintSha256"],
+            "priorRequestedRoute": route, "priorReportedModel": served, "priorGenerationId": completion,
+            "priorUsageState": state, "priorObservedUsage": usage, "priorReportedCostUsd": usage.get("cost")}
+
+
+def verify_prior(path, prompt, timeout_ms=None):
+    receipt = path.read_bytes()
+    step = json.loads(receipt)
+    trigger = "upstream_timeout" if timeout_ms is not None else "empty_output"
+    require(isinstance(step, dict) and step.get("trigger") == trigger, "prior trigger does not match recovery authorization")
+    require(step.get("attempt") == 1 and step.get("briefSha256") == sha(prompt), "requires the original first attempt and its exact brief")
+    require(all(isinstance(step.get(k), str) and step[k].strip() and len(step[k]) <= 512
+                for k in ("taskRef", "taskId", "caller", "d1UsageId")), "missing prior task references")
     route = step.get("requestedRoute")
-    require(isinstance(route, str) and ":" in route and route == step.get("governorModel") and
-            bool(route.partition(":")[2]) and route.partition(":")[2] == step.get("reportedModel")
-            and isinstance(step.get("generationId"), str) and bool(step["generationId"].strip()),
-            "prior model identity or generation ID unverified")
+    require(str(step.get("tier")) == "0" and isinstance(route, str) and re.fullmatch(r"[^:\s]+:\S+", route)
+            and route == step.get("governorModel"), "unverified prior free-tier route")
     row = json.loads((path.parent / "d1-usage.json").read_bytes())
     expected = {"id": step["d1UsageId"], "task_id": step["taskId"], "pod_id": step["caller"],
-                "model_id": route, "provider": route.partition(":")[0], "status": "empty_output", "tier": "FREE_TIER",
-                "cost_usd": 0, **{k: usage[k] for k in ("prompt_tokens", "completion_tokens", "total_tokens")}}
+                "model_id": route, "provider": route.partition(":")[0], "status": trigger, "tier": "FREE_TIER", "cost_usd": 0}
     require(isinstance(row, dict) and all(not isinstance(row.get(k), bool) and row.get(k) == v for k, v in expected.items()),
-            "prior D1 receipt differs from the triggering completion")
-    row_sha = sha(json.dumps(row, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8"))
+            "prior D1 receipt differs from the triggering request")
+    row_sha = sha(canonical(row))
     require(step.get("d1ReceiptSha256") == row_sha, "prior D1 receipt digest differs")
     inventory = (path.parent / "inventory.csv").read_bytes()
     require(type(step.get("artifactBytes")) is int and step["artifactBytes"] == len(inventory)
             and step.get("artifactSha256") == sha(inventory) and not inventory.decode("utf-8").strip(),
             "prior output is nonempty or does not match its receipt")
-    return {"priorReceiptSha256": sha(receipt), "taskRef": step["taskRef"], "priorTaskId": step["taskId"],
-            "priorReportedCostUsd": usage.get("cost"), "priorD1UsageId": row["id"], "priorD1ReceiptSha256": row_sha}
+    if timeout_ms is None:
+        details = verify_empty_completion(step, row, route)
+    else:
+        details = verify_timeout(step, row, path.parent, route, timeout_ms)
+    return {"trigger": trigger, "priorReceiptSha256": sha(receipt), "taskRef": step["taskRef"], "priorTaskId": step["taskId"],
+            "priorD1UsageId": row["id"], "priorD1ReceiptSha256": row_sha, **details}
 
 
 def child_env():
@@ -190,16 +252,16 @@ def attest(stdout, receipt):
     return data
 
 
-def recover(prompt_file, out, previous, timeout):
+def recover(prompt_file, out, previous, timeout, *, upstream_timeout_ms=None):
     require(type(timeout) is int and 1 <= timeout <= MAX_TIMEOUT, "invalid timeout")
     prompt = prompt_file.read_bytes()
     require(0 < len(prompt) <= 128 * 1024 and prompt.decode("utf-8").strip(), "prompt must be nonempty UTF-8 up to 128 KiB")
-    prior = verify_empty(previous, prompt)
+    prior = verify_prior(previous, prompt, upstream_timeout_ms)
     # mkdir is the exclusive guard for the requested destination, including concurrent invocations.
     out.mkdir(mode=0o700)
     info = {"workflow": "claude-oauth-extraction-v1", "requestedModel": MODEL, "requestedEffort": EFFORT,
             "effectiveEffort": None, **prior, "promptSha256": sha(prompt),
-            "trigger": "empty_output", "generationInvocations": 0, "startedAt": utc(), "status": "preflight"}
+            "generationInvocations": 0, "startedAt": utc(), "status": "preflight"}
     clock = time.monotonic()
     try:
         env = child_env()
@@ -250,11 +312,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prompt", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True, help="New output directory")
-    parser.add_argument("--empty-receipt", type=Path, help="Completed Governor step.json beside inventory.csv (default: sibling attempt-1)")
+    receipt = parser.add_mutually_exclusive_group()
+    receipt.add_argument("--empty-receipt", type=Path, help="Completed empty_output step.json (default: sibling attempt-1)")
+    receipt.add_argument("--timeout-receipt", type=Path, help="Authorize recovery for this attested upstream_timeout step.json")
+    parser.add_argument("--upstream-timeout-ms", type=int, help="Exact opted-in Worker deadline (1000..120000, default 120000)")
     parser.add_argument("--timeout-seconds", type=int, default=MAX_TIMEOUT)
     args = parser.parse_args()
-    prior = args.empty_receipt or args.out.parent / "attempt-1" / "step.json"
-    recover(args.prompt, args.out, prior, args.timeout_seconds)
+    if args.upstream_timeout_ms is not None and args.timeout_receipt is None:
+        parser.error("--upstream-timeout-ms requires --timeout-receipt")
+    prior = args.timeout_receipt or args.empty_receipt or args.out.parent / "attempt-1" / "step.json"
+    timeout_ms = (120000 if args.upstream_timeout_ms is None else args.upstream_timeout_ms) if args.timeout_receipt else None
+    recover(args.prompt, args.out, prior, args.timeout_seconds, upstream_timeout_ms=timeout_ms)
     print(args.out / "native.json")
 
 

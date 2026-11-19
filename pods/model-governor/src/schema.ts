@@ -34,6 +34,14 @@ async function upgrade(db: PodStorage): Promise<void> {
       updated_at INTEGER NOT NULL
     )`)
     .run();
+  const hasRecoveryMetadata = async () => {
+    const columns = await db.prepare("PRAGMA table_info(llm_usage_events)").all<{ name: string }>();
+    return columns.results.some(c => c.name === "recovery_metadata_json");
+  };
+  if (!await hasRecoveryMetadata()) {
+    try { await db.prepare("ALTER TABLE llm_usage_events ADD COLUMN recovery_metadata_json TEXT").run(); }
+    catch (error) { if (!await hasRecoveryMetadata()) throw error; } // Concurrent isolate can upgrade first.
+  }
   await db.prepare("CREATE INDEX IF NOT EXISTS idx_usage_pod_created ON llm_usage_events(pod_id, created_at)").run();
   await db.prepare(`CREATE TABLE IF NOT EXISTS task_evidence (
   seq INTEGER PRIMARY KEY,

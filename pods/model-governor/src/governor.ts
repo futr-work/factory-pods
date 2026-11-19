@@ -36,7 +36,7 @@ export interface ModelEntry {
 }
 
 /** Outcome recorded for one model call. */
-export type LlmUsageStatus = "success" | "error" | "rate_limited" | "usage_unavailable" | "cancelled" | "empty_output";
+export type LlmUsageStatus = "success" | "error" | "rate_limited" | "usage_unavailable" | "cancelled" | "empty_output" | "upstream_timeout";
 
 export interface LlmUsageEvent {
   id: string;
@@ -189,13 +189,14 @@ export async function recordUsage(
     latencyMs: number;
     tier?: "FREE_TIER" | "OAUTH" | "PAID";
     actualCost?: number;
+    recoveryMetadata?: import("./required-text.js").TimeoutMetadata;
     /** Outcome of the call. Recording failures is what lets the daily analyzer measure error and 429 rates. */
     status?: LlmUsageStatus;
   }
 ): Promise<LlmUsageEvent> {
   const now = Date.now();
   const id = `use_${now}_${Math.random().toString(36).slice(2, 7)}`;
-  const totalTokens = (usage.promptTokens || 0) + (usage.completionTokens || 0);
+  const totalTokens = usage.recoveryMetadata?.usage.total_tokens ?? ((usage.promptTokens || 0) + (usage.completionTokens || 0));
 
   // Look up model pricing
   const modelRow = await db
@@ -236,7 +237,8 @@ export async function recordUsage(
     .prepare(
       `INSERT INTO llm_usage_events (
         id, pod_id, task_id, provider, model_id, tier, prompt_tokens, completion_tokens, total_tokens, cost_usd, saved_usd, latency_ms, status, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ${usage.recoveryMetadata ? ", recovery_metadata_json" : ""}
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?${usage.recoveryMetadata ? ", ?" : ""})`
     )
     .bind(
       event.id,
@@ -252,7 +254,8 @@ export async function recordUsage(
       event.savedUsd,
       event.latencyMs,
       event.status,
-      event.createdAt
+      event.createdAt,
+      ...(usage.recoveryMetadata ? [JSON.stringify(usage.recoveryMetadata)] : [])
     )
     .run();
 

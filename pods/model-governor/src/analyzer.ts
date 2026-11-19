@@ -14,7 +14,7 @@ const SLOW_RATIO = 2;
 const MAX_EVENTS = 100_000;
 
 function providerFailure(row: UsageRow): boolean {
-  return row.status === "error" || row.status === "rate_limited" || row.status === "empty_output";
+  return row.status === "error" || row.status === "rate_limited" || row.status === "empty_output" || row.status === "upstream_timeout";
 }
 
 interface UsageRow {
@@ -27,6 +27,7 @@ interface UsageRow {
   cost_usd: number;
   latency_ms: number;
   status: string;
+  timeout_usage_state: string | null;
 }
 
 interface CatalogRow {
@@ -61,6 +62,10 @@ export interface ModelUsageStats {
   /** Latency of successful calls only: failures time out or bail early and would flatter the numbers. */
   p50LatencyMs: number | null;
   p95LatencyMs: number | null;
+  /** New reports only. Transport outcomes and all-attempt latency are separate from artifact acceptance. */
+  attemptStatusCounts?: Record<string, number>;
+  p95AttemptLatencyMs?: number | null;
+  timeoutsWithoutFinalUsage?: { partial: number; unknown: number };
   probeRuns: number | null;
   /** Smoke-suite pass rate in percent; not a general quality claim. */
   probePassRate: number | null;
@@ -124,7 +129,9 @@ export async function analyzeUsage(db: PodStorage, windowStart: number, windowEn
   const usage = (
     await db
       .prepare(
-        `SELECT pod_id, provider, model_id, tier, prompt_tokens, completion_tokens, cost_usd, latency_ms, status
+        `SELECT pod_id, provider, model_id, tier, prompt_tokens, completion_tokens, cost_usd, latency_ms, status,
+                CASE WHEN status = 'upstream_timeout' AND json_valid(recovery_metadata_json)
+                     THEN json_extract(recovery_metadata_json,'$.usage_state') END AS timeout_usage_state
          FROM llm_usage_events WHERE created_at >= ? AND created_at < ? LIMIT ${MAX_EVENTS}`,
       )
       .bind(windowStart, windowEnd)
@@ -151,6 +158,9 @@ export async function analyzeUsage(db: PodStorage, windowStart: number, windowEn
     const ok = rows.filter((r) => r.status === "success");
     const latencies = ok.map((r) => r.latency_ms).sort((a, b) => a - b);
     const errors = rows.filter(providerFailure).length;
+    const attemptStatusCounts: Record<string, number> = Object.create(null);
+    for (const row of rows) attemptStatusCounts[row.status] = (attemptStatusCounts[row.status] ?? 0) + 1;
+    const timeouts = rows.filter(row => row.status === "upstream_timeout");
     models.push({
       modelId,
       provider: rows[0].provider,
@@ -165,6 +175,12 @@ export async function analyzeUsage(db: PodStorage, windowStart: number, windowEn
       costUsd: round(rows.reduce((s, r) => s + r.cost_usd, 0)),
       p50LatencyMs: percentile(latencies, 50),
       p95LatencyMs: percentile(latencies, 95),
+      attemptStatusCounts,
+      p95AttemptLatencyMs: percentile(rows.map(row => row.latency_ms).sort((a, b) => a - b), 95),
+      timeoutsWithoutFinalUsage: {
+        partial: timeouts.filter(row => row.timeout_usage_state === "partial").length,
+        unknown: timeouts.filter(row => row.timeout_usage_state !== "partial").length,
+      },
       probeRuns: cat ? cat.probe_runs : null,
       probePassRate: cat?.quality_score ?? null,
       probeAvgLatencyMs: cat?.avg_latency_ms ?? null,
@@ -203,7 +219,7 @@ export async function analyzeUsage(db: PodStorage, windowStart: number, windowEn
         evidence: { calls: m.calls, probeRuns: m.probeRuns },
       });
     }
-    if (m.p50LatencyMs !== null && m.probeAvgLatencyMs && m.calls - m.errors >= MIN_CALLS && m.p50LatencyMs >= SLOW_RATIO * m.probeAvgLatencyMs) {
+    if (m.p50LatencyMs !== null && m.probeAvgLatencyMs && (m.attemptStatusCounts?.success ?? 0) >= MIN_CALLS && m.p50LatencyMs >= SLOW_RATIO * m.probeAvgLatencyMs) {
       recommendations.push({
         kind: "slow_vs_probe",
         severity: "warn",

@@ -844,3 +844,152 @@ test("client disconnect during opted-in terminal tail and forged telemetry canno
   const rows=await db.prepare("SELECT status FROM llm_usage_events").all();
   assert.deepEqual(rows.results.map(r=>r.status),["cancelled"]);
 });
+
+describe("governor-owned extraction deadline", () => {
+  const model = "openrouter:extract-free";
+  const messages = [{role:"user",content:"CSV only"}];
+  const headers = {"X-Governor-Require-Output":"text","X-Governor-Recover-On":"upstream_timeout"};
+  const frame = (obj:unknown) => "data: "+JSON.stringify(obj)+"\n\n";
+  const encoder = new TextEncoder();
+  const reason = {model:"extract-free",id:"gen-deadline",choices:[{index:0,delta:{role:"assistant",reasoning:"private"}}]};
+  const usage = {prompt_tokens:19,completion_tokens:4,total_tokens:23,completion_tokens_details:{reasoning_tokens:4},cost:0};
+  const row = (db: Db) => db.prepare("SELECT * FROM llm_usage_events").all<any>();
+
+  test("HTTP 504 from governor before headers has a D1 row and explicitly unknown usage", async () => {
+    const {db} = freshDb();
+    await addModel(db,{id:model});
+    let calls=0;
+    const fetcher = (() => { calls++;return new Promise<Response>(()=>{}); }) as typeof fetch;
+    const res = await withFetch(fetcher,()=>chat(db,{model,taskId:"attempt-1",stream:true,messages},
+      {...headers,"X-Governor-Timeout-Ms":"1000","X-Governor-Caller":"scout"}));
+    assert.equal(res.status,504);
+    assert.equal(res.headers.get("X-Governor-Tier"),"0");
+    assert.equal(res.headers.get("X-Governor-Attempts"),"1");
+    const {error} = await res.json() as any;
+    const {results} = await row(db);
+    assert.equal(calls,1);
+    assert.equal(results.length,1);
+    const meta = {requested_model:model,model,served_model:null,completion_id:null,timeout_ms:1000,usage_state:"unknown",usage:{}};
+    assert.deepEqual(error,{...meta,status:504,code:"upstream_timeout",type:"governor_error",usage_event_id:results[0].id,
+      finish_reason:null,message:"The governor upstream deadline expired before visible output."});
+    assert.equal(results[0].status,"upstream_timeout");
+    assert.equal(results[0].task_id,"attempt-1");
+    assert.deepEqual(JSON.parse(results[0].recovery_metadata_json),meta);
+  });
+
+  async function stalled(first:string, action:"deadline"|"disconnect"|"failure"="deadline") {
+    const {db} = freshDb();
+    await addModel(db,{id:model});await addModel(db,{id:"openrouter:alternative"});
+    let origin!:ReadableStreamDefaultController<Uint8Array>,calls=0;
+    const upstream = new ReadableStream<Uint8Array>({start(c){origin=c;if(first)c.enqueue(encoder.encode(first));}});
+    const client=new AbortController(),clock=new AbortController();
+    const tasks:Promise<void>[]=[];
+    const fetcher=(async()=>{calls++;return new Response(upstream,{headers:{"Content-Type":"text/event-stream"}})}) as typeof fetch;
+    const running=runChatCompletion(db,ENV,{callerId:"scout",taskId:"test-task",model,requireTextForModel:model,
+      recoveryTimeoutMs:120000,body:{stream:true,messages}},fetcher,undefined,
+      {signal:client.signal,deadlineClock:ms=>{assert.equal(ms,120000);return clock.signal},waitUntil:t=>tasks.push(t)});
+    await new Promise(r=>setImmediate(r));
+    if(action==="deadline") clock.abort();else if(action==="disconnect")client.abort();else origin.error(new Error("provider-originated timeout"));
+    const out=await running;
+    let wire="";
+    if(out.ok && out.kind==="stream") {
+      try{wire=await new Response(out.stream).text()}catch{wire="transport error"}
+      await Promise.all(tasks);
+    }
+    assert.equal(calls,1);
+    const {results}=await row(db);assert.equal(results.length,1);
+    return {out,wire,row:results[0]};
+  }
+
+  test("before the first named SSE event only the owned clock is recoverable", async () => {
+    const s=await stalled("");
+    assert.equal(!s.out.ok && s.out.code,"upstream_timeout");
+    assert.equal(s.row.status,"upstream_timeout");
+    for (const action of ["failure","disconnect"] as const) {
+      const result=await stalled("",action);
+      assert.notEqual(result.row.status,"upstream_timeout");
+    }
+    const partial=await stalled('data: {"model":"extract-free","choices":[{"delta":{"content":"partial');
+    assert.notEqual(partial.row.status,"upstream_timeout");
+  });
+
+  test("an identified unfinished generation keeps provisional usage and hides reasoning",async()=>{
+    const s=await stalled(frame({...reason,usage}));
+    assert.equal(s.row.status,"upstream_timeout");
+    assert.equal(s.row.prompt_tokens,19);assert.equal(s.row.completion_tokens,4);
+    assert.ok(!s.wire.includes("private"));assert.ok(s.wire.endsWith("data: [DONE]\n\n"));
+    const {error}=JSON.parse(s.wire.split("\n\n").at(-3)!.slice(6));
+    const meta={requested_model:model,model,served_model:"extract-free",completion_id:"gen-deadline",timeout_ms:120000,usage_state:"partial",usage};
+    assert.equal(error.usage_event_id,s.row.id);
+    assert.deepEqual(JSON.parse(s.row.recovery_metadata_json),meta);
+    for(const [k,v] of Object.entries(meta))assert.deepEqual(error[k],v);
+    const unknown=await stalled(frame(reason));assert.equal(JSON.parse(unknown.row.recovery_metadata_json).usage_state,"unknown");
+    const newer=await stalled(frame({...reason,usage})+frame({...reason,usage:{completion_tokens:5}}));
+    assert.deepEqual(JSON.parse(newer.row.recovery_metadata_json).usage,{prompt_tokens:19,completion_tokens:5,completion_tokens_details:{reasoning_tokens:4},cost:0});
+    const onlyTotal=await stalled(frame({...reason,usage:{total_tokens:21}}));
+    assert.equal(onlyTotal.row.total_tokens,21);
+    assert.deepEqual(JSON.parse(onlyTotal.row.recovery_metadata_json).usage,{total_tokens:21});
+  });
+
+  test("visible output, refusals, tools, fragments, disconnects and provider errors never authorize recovery",async()=>{
+    for(const delta of [{content:"a,b"},{refusal:"no"},{tool_calls:[{function:{arguments:"partial"}}]},{unrecognized_output:"refusal"}]){
+      const s=await stalled(frame({...reason,choices:[{delta}]}));assert.notEqual(s.row.status,"upstream_timeout");
+    }
+    for (const bad of [{prompt_tokens:"all"}, {cost:-1}, {cost:0.0001}, {prompt_tokens:8,total_tokens:7}, {completion_tokens_details:{reasoning_tokens:-3}}]) {
+      assert.notEqual((await stalled(frame({...reason,usage:bad}))).row.status,"upstream_timeout");
+    }
+    assert.notEqual((await stalled("event: error\n\n")).row.status, "upstream_timeout");
+    const incomplete=await stalled(frame(reason)+'data: {"choices":[{"delta":{"content":"x');
+    assert.notEqual(incomplete.row.status,"upstream_timeout");
+    for(const action of ["failure","disconnect"] as const) assert.notEqual((await stalled(frame(reason),action)).row.status,"upstream_timeout");
+    const fake=await stalled(frame(reason)+frame({model:"extract-free",error:{code:"upstream_timeout",type:"governor_error"}}));
+    assert.notEqual(fake.row.status,"upstream_timeout");
+  });
+
+  test("invalid override and non-exact, paid, tool or multi-choice requests make no upstream calls", async()=>{
+    const {db}=freshDb();await addModel(db,{id:model});await addModel(db,{id:"openrouter:paid",tier:"PAID",out:1});
+    const fetcher=(()=>{assert.fail("unexpected upstream request")}) as typeof fetch;
+    await withFetch(fetcher, async()=>{
+      for(const ms of ["0","999","120001","2000.1","1e4",""]) {
+        assert.equal((await chat(db,{model,messages,stream:true},{...headers,"X-Governor-Timeout-Ms":ms})).status,400);
+      }
+      for(const extra of [{model:"auto"},{model:"extract-free"},{model:"openrouter:paid"},{n:2},{stream:false},{tools:TOOLS}]) {
+        assert.equal((await chat(db,{model,messages,stream:true,...extra},headers)).status,400);
+      }
+    });
+    const fake=await worker.fetch(new Request("https://gov.test/api/telemetry/log",{method:"POST",headers:{Authorization:"Bearer hub-secret"},
+      body:JSON.stringify({podId:"scout",modelId:model,status:"upstream_timeout"})}),{DB:db,...ENV});
+    assert.equal(fake.status,400);assert.equal((await row(db)).results.length,0);
+  });
+});
+
+test("timeout metadata upgrades existing receipt storage without reinterpreting historical rows",async()=>{
+  const {sqlite,db}=freshDb();
+  sqlite.exec("ALTER TABLE llm_usage_events DROP COLUMN recovery_metadata_json");
+  sqlite.exec(`INSERT INTO llm_usage_events(id,pod_id,provider,model_id,tier,prompt_tokens,completion_tokens,total_tokens,
+    cost_usd,saved_usd,latency_ms,status,created_at) VALUES('old','pilot','p','m','FREE_TIER',1,2,3,0,0,4,'success',5)`);
+  resetSchemaCache();await ensureSchema(db);resetSchemaCache();await ensureSchema(db);
+  const row=sqlite.prepare("SELECT status,total_tokens,recovery_metadata_json FROM llm_usage_events WHERE id='old'").get();
+  assert.deepEqual({...row},{status:"success",total_tokens:3,recovery_metadata_json:null});
+  sqlite.exec("ALTER TABLE llm_usage_events DROP COLUMN recovery_metadata_json");
+  sqlite.exec(readFileSync(decodeURIComponent(new URL("../migrations/0009_usage_recovery_metadata.sql",import.meta.url).pathname),"utf8"));
+  resetSchemaCache();await ensureSchema(db);
+  assert.equal(sqlite.prepare("SELECT recovery_metadata_json FROM llm_usage_events WHERE id='old'").get()!.recovery_metadata_json,null);
+});
+
+test("provider timeouts, wrong identity and non-SSE error bodies cannot mint governor timeout evidence",async()=>{
+  const {db}=freshDb(), model="openrouter:extract-free";
+  await addModel(db,{id:model});
+  for (const provider of [
+    () => new Response("504",{status:504}),
+    () => new Response('{"error":{"code":"upstream_timeout"}}',{headers:{"Content-Type":"application/json"}}),
+    () => new Response('data: {"model":"other","choices":[]}\n\n',{headers:{"Content-Type":"text/event-stream"}}),
+  ]) {
+    const {fetcher,calls}=providers({"extract-free":provider});
+    const res=await withFetch(fetcher,()=>chat(db,{model,stream:true,messages:[{role:"user",content:"CSV"}]},{
+      "X-Governor-Require-Output":"text","X-Governor-Recover-On":"upstream_timeout","X-Governor-Timeout-Ms":"1000"}));
+    assert.notEqual((await res.json() as any).error.code,"upstream_timeout");
+    assert.equal(calls.length,1);
+  }
+  assert.equal((await db.prepare("SELECT COUNT(*) AS n FROM llm_usage_events WHERE status='upstream_timeout'").first<any>())?.n,0);
+});

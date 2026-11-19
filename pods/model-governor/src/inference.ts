@@ -7,7 +7,8 @@
 // API keys only. OAuth/consumer-subscription backends (Claude Pro/Max, ChatGPT, Gemini/Antigravity logins) are
 // never called from here: CALLABLE_PROVIDERS is the allowlist and every entry is a pay-per-use API.
 
-import { RequiredText, requireTextFor } from "./required-text.js";
+import { UpstreamDeadline } from "./upstream-deadline.js";
+import { RequiredText, requireTextFor, timeoutError, type TimeoutMetadata } from "./required-text.js";
 import { openMeteredStream, type StreamLifetime } from "./inference-stream.js";
 import type { PodStorage } from "@futr-work/pod-kernel/storage";
 import { listRoutableModels, mapModel, recordUsage, type LlmUsageStatus, type ModelEntry, type RouteOptions } from "./governor.js";
@@ -65,6 +66,7 @@ export interface ChatRequest {
   model?: string;
   /** Original selector when a chat client explicitly requires visible text. */
   requireTextForModel?: string;
+  recoveryTimeoutMs?: number;
   /** Families that must not serve this request, e.g. the producer's own family for a cross-family audit. */
   excludeFamily?: string;
   /** The OpenAI chat-completions body, governor-only fields removed. Forwarded unchanged except `model`. */
@@ -88,7 +90,7 @@ interface Served {
 export type ChatOutcome =
   | (Served & { ok: true; kind: "json"; data: Record<string, any>; latencyMs: number; usage: { promptTokens: number; completionTokens: number } })
   | (Served & { ok: true; kind: "stream"; stream: ReadableStream<Uint8Array> })
-  | { ok: false; status: number; error: string; code: string; model?: string; attempts: Attempt[]; budget?: BudgetState; emptyOutput?: ReturnType<RequiredText["error"]> };
+  | { ok: false; status: number; error: string; code: string; model?: string; attempts: Attempt[]; budget?: BudgetState; emptyOutput?: ReturnType<RequiredText["error"]>; upstreamTimeout?: ReturnType<typeof timeoutError> };
 
 export function hasTools(body: Record<string, unknown>): boolean {
   return Array.isArray(body.tools) && body.tools.length > 0;
@@ -250,31 +252,53 @@ export async function runChatCompletion(
     const upstreamBody: Record<string, unknown> = { ...request.body, model: model.modelName };
     if (stream) upstreamBody.stream_options = { ...(request.body.stream_options as object | undefined), include_usage: true };
 
+    const requiredText = request.requireTextForModel && requireTextFor(request.body)
+      ? new RequiredText(request.requireTextForModel, model.id, typeof request.body.n === "number" ? request.body.n : 1) : undefined;
+    const timeoutMs = request.recoveryTimeoutMs;
+    if (timeoutMs !== undefined && (!requiredText || !stream || tier !== 0 || request.model !== model.id ||
+        !model.id.startsWith(model.provider + ":") || (request.body.n !== undefined && request.body.n !== 1) ||
+        (request.body.tool_choice != null && request.body.tool_choice !== "none") ||
+        (request.body.function_call != null && request.body.function_call !== "none"))) {
+      return { ok: false, status: 400, error: "timeout recovery requires a single exact free catalog route on a text-only stream",
+        code: "invalid_request", attempts, budget };
+    }
+    const deadline = timeoutMs !== undefined ? new UpstreamDeadline(timeoutMs, lifetime?.deadlineClock) : undefined;
     const started = Date.now();
-    const record = (status: LlmUsageStatus, promptTokens = 0, completionTokens = 0, actualCost?: number, modelId = model.id) =>
+    const record = (status: LlmUsageStatus, promptTokens = 0, completionTokens = 0, actualCost?: number, modelId = model.id, recoveryMetadata?: TimeoutMetadata) =>
       recordUsage(db, {
         podId: request.callerId,
         taskId: request.taskId,
         provider: model.provider,
         modelId,
         actualCost,
+        recoveryMetadata,
         promptTokens,
         completionTokens,
         latencyMs: Date.now() - started,
         status,
       });
 
+    const timedOut = async () => {
+      const meta = requiredText!.timeoutMetadata(deadline!.milliseconds);
+      const event = await record("upstream_timeout", meta.usage.prompt_tokens, meta.usage.completion_tokens,
+        meta.usage.cost, model.id, meta);
+      const error = timeoutError(meta, event.id);
+      attempts.push({model: model.id, tier, status: error.status, reason: error.message});
+      return { ok: false as const, status: error.status, error: error.message, code: error.code, model: model.id,
+        attempts, budget, upstreamTimeout: error };
+    };
     let res: Response;
     const headersAbort = new AbortController();
     const abortHeaders = () => headersAbort.abort();
     lifetime?.signal.addEventListener("abort", abortHeaders, { once: true });
     try {
-      res = await fetcher(url, {
+      const dispatch = () => fetcher(url, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}`, ...(stream ? { Accept: "text/event-stream" } : {}) },
         body: JSON.stringify(upstreamBody),
-        signal: AbortSignal.any([headersAbort.signal, AbortSignal.timeout(stream ? STREAM_TIMEOUT_MS : DEFAULT_TIMEOUT_MS)]),
+        signal: AbortSignal.any([headersAbort.signal, deadline?.signal ?? AbortSignal.timeout(stream ? STREAM_TIMEOUT_MS : DEFAULT_TIMEOUT_MS)]),
       });
+      res = await (deadline ? deadline.wait(dispatch) : dispatch());
     } catch (err) {
       if (lifetime?.signal.aborted) {
         const cancelled = record("cancelled").then(() => {});
@@ -282,6 +306,7 @@ export async function runChatCompletion(
         await cancelled;
         return disconnected();
       }
+      if (deadline?.caused(err) && requiredText?.unresolved) return timedOut();
       await record("error");
       const error = err instanceof Error ? err.message : String(err);
       attempts.push({ model: model.id, tier, status: 502, reason: error });
@@ -302,22 +327,24 @@ export async function runChatCompletion(
       return { ok: false, status: res.status, code: "upstream_error", error, model: model.id, attempts, budget };
     }
 
-    const requiredText = request.requireTextForModel && requireTextFor(request.body)
-      ? new RequiredText(request.requireTextForModel, model.id, typeof request.body.n === "number" ? request.body.n : 1) : undefined;
     let data: Record<string, any>;
     let promptTokens = 0;
     let completionTokens = 0;
     try {
       if (stream) {
         if (!res.body) throw new Error("provider returned an empty stream");
+        if (deadline && res.headers.get("Content-Type")?.split(";")[0].trim().toLowerCase() !== "text/event-stream") {
+          void res.body.cancel().catch(() => {});
+          throw new Error("provider did not return an SSE response");
+        }
         const metered = await openMeteredStream(res.body, {
           validateModel: named ? reported => verifyProviderModel(reported, model.modelName) : undefined,
           choices: typeof request.body.n === "number" ? request.body.n : 1,
-          lifetime, requiredText,
-          async record(usage, status) {
+          lifetime, requiredText, deadline,
+          async record(usage, status, timeout) {
             const modelId = usage.model && usage.model !== model.modelName && usage.model !== model.id
               ? `${model.provider}:${usage.model}` : model.id;
-            return (await record(status, usage.promptTokens, usage.completionTokens, usage.cost, modelId)).id;
+            return (await record(status, usage.promptTokens, usage.completionTokens, usage.cost, modelId, timeout)).id;
           },
         });
         return { ok: true, kind: "stream", model, tier, attempts, budget, stream: metered };
@@ -335,6 +362,7 @@ export async function runChatCompletion(
         await cancelled;
         return disconnected();
       }
+      if (deadline?.caused(err) && requiredText?.unresolved) return timedOut();
       await record("error", promptTokens, completionTokens);
       const error = err instanceof SyntaxError ? "provider returned malformed JSON" : err instanceof Error ? err.message : String(err);
       attempts.push({ model: model.id, tier, status: 502, reason: error });
@@ -343,7 +371,7 @@ export async function runChatCompletion(
     }
     if (requiredText) {
       requiredText.observe(data);
-      if (data.error?.code === "empty_output" || data.error?.type === "governor_error") {
+      if (data.error?.code === "empty_output" || data.error?.code === "upstream_timeout" || data.error?.type === "governor_error") {
         const error = "Provider returned an error using a reserved governor identifier.";
         await record("error", requiredText.usage.prompt_tokens, requiredText.usage.completion_tokens, requiredText.usage.cost);
         attempts.push({ model: model.id, tier, status: 502, reason: error });
