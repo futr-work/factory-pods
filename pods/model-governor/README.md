@@ -314,3 +314,9 @@ These are outcomes for labeled work. Unlabeled traffic is outside the denominato
 - [Production sampling and routing evaluation](PRODUCTION-QUALITY.md) describes an on-demand task sample and quality measures for different task families.
 - [Local plan/write workflow](LOCAL-PLAN-WRITE.md) produces linked OAuth stage receipts for one explicit task.
 - [Narration pacing check](PACING.md) measures one creative-production constraint before rendering.
+
+### Empty-output recovery for local extraction jobs
+
+A local Domain Scout run can opt in with `X-Governor-Require-Output: text`. On a completed text-only response with no visible answer, the Worker records `empty_output` and returns the usage event ID. The on-device runner checks that D1 row against the attempt before invoking an explicitly authorized subscription recovery. The OAuth credential stays on the device. A normal chat request uses the existing behavior.
+
+See [the one-shot extraction runbook](EMPTY-RECOVERY.md) for inputs, the recovery switch, failure conditions and receipts. For authorized diagnostics, `GET /api/governor/usage-receipts?id=<event-id>` reads a single usage row by primary key and requires an admin bearer token.

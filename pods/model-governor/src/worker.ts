@@ -6,7 +6,7 @@ import { activeHandler } from "./handler.js";
 import { renderPodUiHtml } from "./ui.js";
 import { TaskRecord } from "./types.js";
 import { getModelCatalog, resolveOptimalModel, recordUsage, getTelemetryStats, mapModel, getSubscriptionAdvisor } from "./governor.js";
-import { authGate, modelApprovalRoute } from "./auth.js";
+import { isPrivateLedgerRoute, authGate, modelApprovalRoute } from "./auth.js";
 import { EvidenceError, saveEvidence } from "./evidence.js";
 import { evidenceScorecard } from "./evidence-scorecard.js";
 import { runDiscovery, runScheduledDiscovery } from "./discovery.js";
@@ -60,7 +60,7 @@ export default {
     const corsHeaders = {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Governor-Caller, X-Governor-Category",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Governor-Caller, X-Governor-Category, X-Governor-Require-Output",
       "Access-Control-Expose-Headers": "X-Governor-Model, X-Governor-Tier, X-Governor-Caller, X-Governor-Attempts",
     };
 
@@ -81,9 +81,17 @@ export default {
       await ensureSchema(db).catch((err) => console.error("[governor] schema upgrade failed:", err?.message || err));
     }
 
-    if (url.pathname === "/api/governor/evidence" || url.pathname === "/api/governor/scorecard") {
+    if (isPrivateLedgerRoute(url.pathname)) {
       const headers = { ...corsHeaders, "Cache-Control": "private, no-store" };
       try {
+        if (method === "GET" && url.pathname === "/api/governor/usage-receipts") {
+          const id = url.searchParams.get("id");
+          if (!id || id.length > 128 || url.searchParams.getAll("id").length !== 1) {
+            return json({ error: "one usage receipt id is required" }, 400, headers);
+          }
+          const row = await db.prepare("SELECT * FROM llm_usage_events WHERE id = ?").bind(id).first();
+          return row ? json({ rows: [row] }, 200, headers) : json({ error: "usage receipt not found" }, 404, headers);
+        }
         if (method === "POST" && url.pathname === "/api/governor/evidence") {
           const receipt = await saveEvidence(db, request);
           return json(receipt, receipt.created ? 201 : 200, headers);
@@ -316,6 +324,7 @@ export default {
             headers: { ...corsHeaders, "Content-Type": "application/json" },
           });
         }
+        if (body.status === "empty_output") return json({ error: "empty_output is reserved for governor-generated completions" }, 400, corsHeaders);
         const event = await recordUsage(db, {
           podId: body.podId,
           taskId: body.taskId,
@@ -392,6 +401,7 @@ export default {
         taskId: typeof body.taskId === "string" ? body.taskId : undefined,
         category: category || undefined,
         model: pinned,
+        requireTextForModel: isOpenAiPath && request.headers.get("X-Governor-Require-Output") === "text" ? rawModel : undefined,
         excludeFamily: typeof body.excludeFamily === "string" ? body.excludeFamily : undefined,
         body: forward,
       }, undefined, undefined, { signal: request.signal, waitUntil: ctx && (task => ctx.waitUntil(task)) });
@@ -400,6 +410,7 @@ export default {
           requested_model: rawModel,
           model: out.model ?? null,
           attempts: out.attempts,
+          ...out.emptyOutput,
           ...(out.budget ? { budget: { callerId, spentTodayUsd: out.budget.spentTodayUsd, dailyBudgetUsd: out.budget.policy.dailyBudgetUsd } } : {}),
         });
       }
