@@ -14,7 +14,7 @@ const SLOW_RATIO = 2;
 const MAX_EVENTS = 100_000;
 
 function providerFailure(row: UsageRow): boolean {
-  return row.status === "error" || row.status === "rate_limited";
+  return row.status === "error" || row.status === "rate_limited" || row.status === "empty_output";
 }
 
 interface UsageRow {

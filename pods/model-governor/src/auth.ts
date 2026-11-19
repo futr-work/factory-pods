@@ -47,9 +47,13 @@ export function isAdminReadRoute(method: string, pathname: string): boolean {
 }
 
 /** Returns a rejection Response, or null if the request may proceed. */
+export function isPrivateLedgerRoute(path: string): boolean {
+  return path === "/api/governor/evidence" || path === "/api/governor/scorecard" || path === "/api/governor/usage-receipts";
+}
+
 export function authGate(request: Request, env: GovAuthEnv): Response | null {
   const url = new URL(request.url);
-  const evidenceRoute = url.pathname === "/api/governor/evidence" || url.pathname === "/api/governor/scorecard";
+  const evidenceRoute = isPrivateLedgerRoute(url.pathname);
   if (evidenceRoute || isAdminRoute(request.method, url.pathname)) {
     const secret = presentedSecret(request.headers.get("Authorization"));
     const bearer = /^Bearer /i.test(request.headers.get("Authorization") ?? "");

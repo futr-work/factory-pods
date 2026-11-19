@@ -7,6 +7,7 @@
 // API keys only. OAuth/consumer-subscription backends (Claude Pro/Max, ChatGPT, Gemini/Antigravity logins) are
 // never called from here: CALLABLE_PROVIDERS is the allowlist and every entry is a pay-per-use API.
 
+import { RequiredText, requireTextFor } from "./required-text.js";
 import { openMeteredStream, type StreamLifetime } from "./inference-stream.js";
 import type { PodStorage } from "@futr-work/pod-kernel/storage";
 import { listRoutableModels, mapModel, recordUsage, type LlmUsageStatus, type ModelEntry, type RouteOptions } from "./governor.js";
@@ -62,6 +63,8 @@ export interface ChatRequest {
   category?: string;
   /** An exact catalog id or upstream model name. Omitted = route by policy. */
   model?: string;
+  /** Original selector when a chat client explicitly requires visible text. */
+  requireTextForModel?: string;
   /** Families that must not serve this request, e.g. the producer's own family for a cross-family audit. */
   excludeFamily?: string;
   /** The OpenAI chat-completions body, governor-only fields removed. Forwarded unchanged except `model`. */
@@ -85,7 +88,7 @@ interface Served {
 export type ChatOutcome =
   | (Served & { ok: true; kind: "json"; data: Record<string, any>; latencyMs: number; usage: { promptTokens: number; completionTokens: number } })
   | (Served & { ok: true; kind: "stream"; stream: ReadableStream<Uint8Array> })
-  | { ok: false; status: number; error: string; code: string; model?: string; attempts: Attempt[]; budget?: BudgetState };
+  | { ok: false; status: number; error: string; code: string; model?: string; attempts: Attempt[]; budget?: BudgetState; emptyOutput?: ReturnType<RequiredText["error"]> };
 
 export function hasTools(body: Record<string, unknown>): boolean {
   return Array.isArray(body.tools) && body.tools.length > 0;
@@ -299,6 +302,8 @@ export async function runChatCompletion(
       return { ok: false, status: res.status, code: "upstream_error", error, model: model.id, attempts, budget };
     }
 
+    const requiredText = request.requireTextForModel && requireTextFor(request.body)
+      ? new RequiredText(request.requireTextForModel, model.id, typeof request.body.n === "number" ? request.body.n : 1) : undefined;
     let data: Record<string, any>;
     let promptTokens = 0;
     let completionTokens = 0;
@@ -308,11 +313,11 @@ export async function runChatCompletion(
         const metered = await openMeteredStream(res.body, {
           validateModel: named ? reported => verifyProviderModel(reported, model.modelName) : undefined,
           choices: typeof request.body.n === "number" ? request.body.n : 1,
-          lifetime,
+          lifetime, requiredText,
           async record(usage, status) {
             const modelId = usage.model && usage.model !== model.modelName && usage.model !== model.id
               ? `${model.provider}:${usage.model}` : model.id;
-            await record(status, usage.promptTokens, usage.completionTokens, usage.cost, modelId);
+            return (await record(status, usage.promptTokens, usage.completionTokens, usage.cost, modelId)).id;
           },
         });
         return { ok: true, kind: "stream", model, tier, attempts, budget, stream: metered };
@@ -335,6 +340,25 @@ export async function runChatCompletion(
       attempts.push({ model: model.id, tier, status: 502, reason: error });
       last = { status: 502, error, model: model.id };
       continue;
+    }
+    if (requiredText) {
+      requiredText.observe(data);
+      if (data.error?.code === "empty_output" || data.error?.type === "governor_error") {
+        const error = "Provider returned an error using a reserved governor identifier.";
+        await record("error", requiredText.usage.prompt_tokens, requiredText.usage.completion_tokens, requiredText.usage.cost);
+        attempts.push({ model: model.id, tier, status: 502, reason: error });
+        return { ok: false, status: 502, error, code: "upstream_error", model: model.id, attempts, budget };
+      }
+      if (requiredText.emptyCompletion && !data.error) {
+        const usage = requiredText.usage;
+        const actual = requiredText.servedModel;
+        const modelId = actual && actual !== model.modelName && actual !== model.id ? `${model.provider}:${actual}` : model.id;
+        const event = await record("empty_output", usage.prompt_tokens, usage.completion_tokens, usage.cost, modelId);
+        const error = requiredText.error(event.id);
+        attempts.push({ model: model.id, tier, status: error.status, reason: error.message });
+        return { ok: false, status: error.status, error: error.message, code: error.code, model: model.id,
+          attempts, budget, emptyOutput: error };
+      }
     }
     await record("success", promptTokens, completionTokens);
     return { ok: true, kind: "json", model, tier, attempts, budget, data, latencyMs: Date.now() - started, usage: { promptTokens, completionTokens } };

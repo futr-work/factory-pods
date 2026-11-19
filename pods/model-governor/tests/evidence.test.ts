@@ -161,3 +161,19 @@ test("an existing governor database can apply the additive migration or the runt
   assert.equal(sqlite.prepare("SELECT count(*) AS n FROM task_evidence").get()!.n, 1);
   assert.equal(sqlite.prepare("SELECT count(*) AS n FROM caller_policies").get()!.n, 0);
 });
+
+test("single usage receipt readback requires admin and binds to exactly one primary key", async () => {
+  const { request, sqlite } = fixture();
+  sqlite.prepare("INSERT INTO llm_usage_events VALUES(?, 'scout', 'task:attempt-1', 'test', 'model1', 'FREE_TIER', 9, 3, 12, 0, 0, 8, 'empty_output', 123)").run("use_r1");
+  for (const auth of ["Bearer client", "Bearer hub", "", "Basic " + btoa("x:admin")]) {
+    assert.equal((await request("GET", "usage-receipts?id=use_r1", auth)).status, 403);
+  }
+  assert.equal((await request("GET", "usage-receipts")).status, 400);
+  assert.equal((await request("GET", "usage-receipts?id=use_r1&id=other")).status, 400);
+  assert.equal((await request("GET", "usage-receipts?id=absent")).status, 404);
+  const res = await request("GET", "usage-receipts?id=use_r1");
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get("Cache-Control")!, /no-store/);
+  const { rows } = await res.json() as {rows: {id:string;task_id:string;status:string}[]};
+  assert.deepEqual(rows.map(r => [r.id, r.task_id, r.status]), [["use_r1", "task:attempt-1", "empty_output"]]);
+});

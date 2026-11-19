@@ -36,7 +36,7 @@ export interface ModelEntry {
 }
 
 /** Outcome recorded for one model call. */
-export type LlmUsageStatus = "success" | "error" | "rate_limited" | "usage_unavailable" | "cancelled";
+export type LlmUsageStatus = "success" | "error" | "rate_limited" | "usage_unavailable" | "cancelled" | "empty_output";
 
 export interface LlmUsageEvent {
   id: string;

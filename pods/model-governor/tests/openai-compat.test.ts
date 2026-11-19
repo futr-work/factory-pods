@@ -660,3 +660,187 @@ describe("SSE receipt lifetime", () => {
     assert.equal((await s.rows())[0].status, "usage_unavailable");
   });
 });
+
+describe("opt-in required text", () => {
+  const header = { "X-Governor-Require-Output": "text" };
+  const body = { model: "auto", taskId: "csv-1", messages: [{ role: "user", content: "Return the CSV." }] };
+  const usage = { prompt_tokens: 31, completion_tokens: 45, total_tokens: 76, cost: 0.00000123, completion_tokens_details: { reasoning_tokens: 45 } };
+  const blank = { id: "gen-csv", model: "acme/first", choices: [{ finish_reason: "length", message: { role: "assistant", content: " \n", reasoning: "private trace" } }], usage };
+  test("reasoning-only response returns an allowlisted receipt, spends once and never retries a different model", async () => {
+    const { db } = freshDb();
+    await addModel(db, { id: "openrouter:acme/first", quality: 99 });
+    await addModel(db, { id: "openrouter:acme/next", quality: 10 });
+    const { fetcher, calls } = providers({ "acme/first": ok({ ...blank, usage: { ...usage, metadata: "private trace" } }) });
+    const res = await withFetch(fetcher, () => chat(db, body, header));
+    assert.equal(res.status, 502);
+    const text = await res.text();
+    assert.ok(!text.includes("private trace"));
+    const { error } = JSON.parse(text);
+    assert.equal(error.code, "empty_output");
+    assert.equal(error.requested_model, "auto");
+    assert.equal(error.model, "openrouter:acme/first");
+    assert.equal(error.served_model, "acme/first");
+    assert.equal(error.finish_reason, "length");
+    assert.equal(error.completion_id, "gen-csv");
+    assert.deepEqual(error.usage, usage);
+    assert.equal(calls.length, 1);
+    const { results } = await db.prepare("SELECT id,task_id,status,prompt_tokens,completion_tokens,cost_usd FROM llm_usage_events").all();
+    assert.match(error.usage_event_id, /^use_/);
+    assert.deepEqual(results.map(r => ({...r})), [{ id: error.usage_event_id, task_id: "csv-1", status: "empty_output", prompt_tokens: 31, completion_tokens: 45, cost_usd: 0.00000123 }]);
+  });
+
+  test("bad usage types are withheld and zero is preserved", async () => {
+    const { db } = freshDb();
+    await addModel(db, { id: "openrouter:acme/first" });
+    const { fetcher } = providers({ "acme/first": ok({ ...blank, usage: { completion_tokens: 0, prompt_tokens: "88", total_tokens: -7, cost: -1, completion_tokens_details: { reasoning_tokens: 90 } } }) });
+    const res = await withFetch(fetcher, () => chat(db, body, header));
+    assert.equal(res.status, 502);
+    assert.deepEqual((await res.json() as any).error.usage, { completion_tokens: 0 });
+  });
+
+  test("the default contract, nonempty choices, calls, filters and refusals remain successful", async () => {
+    const { db } = freshDb();
+    await addModel(db, { id: "openrouter:acme/first" });
+    const results = [
+      { headers: {}, request: body, reply: blank },
+      { headers: header, request: { ...body, tools: TOOLS }, reply: TOOL_ANSWER },
+      { headers: header, request: body, reply: TOOL_ANSWER },
+      ...[
+        { choices: [] },
+        ...[{content:42}, {content:{}}, {content:[{type:"unknown"}]}, {content:null,refusal:{}},
+          {content:null,tool_calls:{}}, {content:null,tool_calls:[{}]}]
+          .map(message => ({choices:[{finish_reason:"stop",message:{role:"assistant",...message}}]})),
+        { choices: [{ finish_reason: "tool_calls", message: { role: "assistant", tool_calls: [] } }] },
+        { choices: [{ finish_reason: "unrecognized", message: { role: "assistant", content: "" } }] },
+        { choices: [{ message: { role: "assistant", content: null } }] },
+        { choices: [{ finish_reason: "length", message: { content: null } }] },
+        { model: blank.model, choices: blank.choices, usage: blank.usage },
+        { ...blank, choices: [{ finish_reason: "length", delta: { role: "assistant", content: "" } }] },
+      ].map(reply => ({ headers: header, request: body, reply })),
+      { headers: header, request: body, reply: { choices: [{ message: { content: null, refusal: "Declined" } }] } },
+      { headers: header, request: body, reply: { choices: [{ finish_reason: "content_filter", message: { content: null } }] } },
+      { headers: header, request: body, reply: { choices: [{ message: { content: null } }, { message: { content: [{ type: "text", text: "result" }] } }] } },
+    ];
+    for (const { headers, request, reply } of results) {
+      const { fetcher } = providers({ "acme/first": ok(reply) });
+      const res = await withFetch(fetcher, () => chat(db, request, headers as Record<string, string>));
+      assert.equal(res.status, 200);
+      assert.deepEqual(await res.json(), reply);
+    }
+  });
+});
+
+describe("opt-in required text on SSE", () => {
+  const header = { "X-Governor-Require-Output": "text" };
+  const body = { model: "auto", stream: true, messages: [{ role: "user", content: "CSV only" }] };
+  const identity = { id: "gen-123", model: "acme/stream" };
+  const totals = { prompt_tokens: 11, completion_tokens: 17, total_tokens: 28, cost: 0, completion_tokens_details: { reasoning_tokens: 17 } };
+  function source(delta: object, finish: string, usage: object | null = totals) {
+    const frames = [
+      { ...identity, choices: [{ index: 0, delta: { role: "assistant", reasoning: "private internal" } }] },
+      { ...identity, choices: [{ index: 0, delta, finish_reason: finish }] },
+      { ...identity, choices: [], usage },
+    ];
+    return frames.map(f => "data: " + JSON.stringify(f) + "\n\n").join("") + "data: [DONE]\n\n";
+  }
+  async function send(wire: string, headers: Record<string,string> = header) {
+    const { db } = freshDb();
+    await addModel(db, { id: "openrouter:acme/stream", quality: 100 });
+    await addModel(db, { id: "openrouter:acme/second", quality: 5 });
+    const { calls, fetcher } = providers({ "acme/stream": () => new Response(wire) });
+    const res = await withFetch(fetcher, () => chat(db, body, headers));
+    const text = await res.text();
+    assert.equal(calls.length, 1);
+    const { results } = await db.prepare("SELECT id,status,prompt_tokens,completion_tokens,cost_usd FROM llm_usage_events").all();
+    assert.equal(results.length, 1);
+    return { res, text, row: { ...results[0] } };
+  }
+
+  test("a reasoning-only complete stream returns a verified error followed by DONE and writes once", async () => {
+    const { res, text, row } = await send(source({ content: " \n " }, "length"));
+    assert.equal(res.status, 200);
+    assert.ok(!text.includes("private internal"));
+    assert.ok(!text.includes('"finish_reason":"length","delta"'));
+    const frames = text.trim().split("\n\n").map(line => line.slice(6));
+    assert.equal(frames.pop(), "[DONE]");
+    const { error } = JSON.parse(frames.pop()!);
+    assert.match(error.usage_event_id,/^use_/);
+    assert.deepEqual(error, {usage_event_id:row.id,status:502,type:"governor_error",code:"empty_output",message:"Provider completed without visible text.",
+      requested_model:"auto",model:"openrouter:acme/stream",served_model:"acme/stream",completion_id:"gen-123",finish_reason:"length",usage:totals});
+    assert.deepEqual(row,{id:error.usage_event_id,status:"empty_output",prompt_tokens:11,completion_tokens:17,cost_usd:0});
+  });
+
+  test("ordinary streams are byte-identical; opted-in text, tools, and refusals remain deliverable", async () => {
+    const blank = source({}, "length");
+    const normal = await send(blank, {});
+    assert.equal(normal.text, blank);
+    assert.equal(normal.row.status, "success");
+    for (const [delta, finish] of [
+      [{content:"a,b"}, "stop"], [{refusal:"declined"}, "stop"], [{}, "content_filter"],
+      [{tool_calls:[{index:0,function:{name:"lookup",arguments:"{}"}}]}, "tool_calls"],
+    ] as const) {
+      const result = await send(source(delta, finish));
+      assert.equal(result.row.status, "success");
+      assert.ok(!result.text.includes("empty_output"));
+      assert.ok(!result.text.includes("private internal"));
+      assert.ok(result.text.includes(JSON.stringify(delta)));
+    }
+  });
+
+  test("a broken stream does not authorize fallback; interim counters cannot serve as final evidence", async () => {
+    const provisional = "data: "+JSON.stringify({...identity,choices:[{delta:{reasoning:"private internal"}}],usage:totals})+"\n\n";
+    const upstreamClaim = 'data: {"error":{"code":"empty_output","type":"governor_error"}}\n\ndata: [DONE]\n\n';
+    const denied = await send(upstreamClaim);
+    assert.ok(denied.text.includes("upstream_error"));
+    assert.ok(!denied.text.includes("empty_output"));
+    assert.equal(denied.row.status, "error");
+    const mixedTransport = source({}, "length").replace('"delta":{}','"message":{"role":"assistant","refusal":"declined"},"delta":{}');
+    assert.ok(!(await send(mixedTransport)).text.includes("empty_output"));
+    const changedId = source({}, "length").replace('"id":"gen-123"', '"id":"different"');
+    assert.ok(!(await send(changedId)).text.includes("empty_output"));
+    for (const wire of [
+      "data: [DONE]\n\n",
+      "data: "+JSON.stringify({...identity,choices:[],usage:totals})+"\n\ndata: [DONE]\n\n",
+    ]) assert.ok(!(await send(wire)).text.includes("empty_output"));
+    const incomplete = await send(provisional);
+    assert.equal(incomplete.row.status,"error");
+    assert.ok(!incomplete.text.includes("empty_output"));
+    const truncated = await send(source({}, "length").replace("data: [DONE]\n\n", ""));
+    assert.equal(truncated.row.status, "error");
+    assert.ok(!truncated.text.includes("empty_output"));
+    for (const reason of ["tool_calls", "function_call", "unknown"]) {
+      assert.ok(!(await send(source({}, reason))).text.includes("empty_output"));
+    }
+    const complete = await send(provisional+source({},"length",null));
+    const error = JSON.parse(complete.text.split("\n\n").filter(l=>l.includes('"empty_output"'))[0].slice(6)).error;
+    assert.deepEqual(error.usage,{});
+  });
+});
+
+test("client disconnect during opted-in terminal tail and forged telemetry cannot mark empty output", async () => {
+  const { db } = freshDb();
+  await addModel(db, {id:"openrouter:x"});
+  const client = new AbortController();
+  let origin!: ReadableStreamDefaultController<Uint8Array>;
+  const { fetcher } = providers({x:() => new Response(new ReadableStream({start(c) {origin=c;}}))});
+  const tasks: Promise<unknown>[] = [];
+  const request = new Request("https://gov.test/v1/chat/completions", {method:"POST",signal:client.signal,
+    headers: {Authorization:"Bearer client-secret","X-Governor-Require-Output":"text"},
+    body: JSON.stringify({model:"auto",stream:true,messages:[{role:"user",content:"CSV"}]})});
+  const res = await withFetch(fetcher,()=>worker.fetch(request,{DB:db,...ENV},{waitUntil(t){tasks.push(t);}}));
+  const reader=res.body!.getReader();
+  const push=(obj:unknown)=>origin.enqueue(new TextEncoder().encode("data: "+JSON.stringify(obj)+"\n\n"));
+  push({id:"gen-disconnect",model:"x",choices:[{delta:{role:"assistant"}}]});
+  await reader.read();
+  push({model:"x",choices:[{delta:{},finish_reason:"length"}]});
+  await new Promise(resolve=>setImmediate(resolve));
+  client.abort();
+  push({model:"x",choices:[],usage:{prompt_tokens:7,completion_tokens:12}});
+  origin.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
+  await Promise.all(tasks);
+  const log=await worker.fetch(new Request("https://gov.test/api/telemetry/log",{method:"POST",headers:{Authorization:"Bearer hub-secret"},
+    body:JSON.stringify({modelId:"x",podId:"z",status:"empty_output"})}),{DB:db,...ENV});
+  assert.equal(log.status,400);
+  const rows=await db.prepare("SELECT status FROM llm_usage_events").all();
+  assert.deepEqual(rows.results.map(r=>r.status),["cancelled"]);
+});
