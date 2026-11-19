@@ -6,7 +6,9 @@ import { activeHandler } from "./handler.js";
 import { renderPodUiHtml } from "./ui.js";
 import { TaskRecord } from "./types.js";
 import { getModelCatalog, resolveOptimalModel, recordUsage, getTelemetryStats, mapModel, getSubscriptionAdvisor } from "./governor.js";
-import { authGate } from "./auth.js";
+import { authGate, modelApprovalRoute } from "./auth.js";
+import { EvidenceError, saveEvidence } from "./evidence.js";
+import { evidenceScorecard } from "./evidence-scorecard.js";
 import { runDiscovery, runScheduledDiscovery } from "./discovery.js";
 import { runProbeCycle, recordProbe } from "./probe.js";
 import { getUsageReport, runDailyUsageAnalysis } from "./analyzer.js";
@@ -79,6 +81,24 @@ export default {
       await ensureSchema(db).catch((err) => console.error("[governor] schema upgrade failed:", err?.message || err));
     }
 
+    if (url.pathname === "/api/governor/evidence" || url.pathname === "/api/governor/scorecard") {
+      const headers = { ...corsHeaders, "Cache-Control": "private, no-store" };
+      try {
+        if (method === "POST" && url.pathname === "/api/governor/evidence") {
+          const receipt = await saveEvidence(db, request);
+          return json(receipt, receipt.created ? 201 : 200, headers);
+        }
+        if (method === "GET" && url.pathname === "/api/governor/scorecard") {
+          return json(await evidenceScorecard(db, url.searchParams), 200, headers);
+        }
+        return json({ error: "unsupported evidence operation" }, 405, headers);
+      } catch (err) {
+        if (err instanceof EvidenceError) return json({ error: err.message }, err.status, headers);
+        console.error("[governor] evidence storage operation failed");
+        return json({ error: "evidence storage unavailable" }, 503, headers);
+      }
+    }
+
     // Health Check
     if (url.pathname === "/health") {
       return new Response(
@@ -146,9 +166,11 @@ export default {
     }
 
     // ADMIN: approve / revoke a model for routing. Paid models never qualify without this (ruling #1).
-    const adminModel = url.pathname.match(/^\/api\/models\/(.+)\/(approve|revoke)$/);
+    const adminModel = modelApprovalRoute(url.pathname);
     if (method === "POST" && adminModel) {
-      const id = decodeURIComponent(adminModel[1]);
+      let id: string;
+      try { id = decodeURIComponent(adminModel[1]); }
+      catch { return json({ error: "invalid model ID encoding" }, 400, corsHeaders); }
       const row = await db.prepare("SELECT * FROM model_catalog WHERE id = ?").bind(id).first<any>();
       if (!row) return json({ error: `unknown model ${id}` }, 404, corsHeaders);
       if (adminModel[2] === "approve") {

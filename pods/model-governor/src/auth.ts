@@ -21,9 +21,14 @@ export interface GovAuthEnv {
 
 export { timingSafeEqual, presentedSecret };
 
+/** Upstream model names often contain a slash. Authorization and dispatch share this exact matcher. */
+export function modelApprovalRoute(pathname: string) {
+  return /^\/api\/models\/(.+)\/(approve|revoke)$/.exec(pathname);
+}
+
 export function isAdminRoute(method: string, pathname: string): boolean {
   if (method !== "POST") return false;
-  return /^\/api\/models\/[^/]+\/(approve|revoke)$/.test(pathname) || pathname.startsWith("/api/governor/");
+  return modelApprovalRoute(pathname) !== null || pathname.startsWith("/api/governor/");
 }
 
 const CLIENT_POST = new Set(["/v1/chat/completions", "/chat/completions", "/api/inference/chat/completions"]);
@@ -44,9 +49,11 @@ export function isAdminReadRoute(method: string, pathname: string): boolean {
 /** Returns a rejection Response, or null if the request may proceed. */
 export function authGate(request: Request, env: GovAuthEnv): Response | null {
   const url = new URL(request.url);
-  if (isAdminRoute(request.method, url.pathname)) {
+  const evidenceRoute = url.pathname === "/api/governor/evidence" || url.pathname === "/api/governor/scorecard";
+  if (evidenceRoute || isAdminRoute(request.method, url.pathname)) {
     const secret = presentedSecret(request.headers.get("Authorization"));
-    if (env.GOVERNOR_ADMIN_TOKEN && secret !== null && timingSafeEqual(secret, env.GOVERNOR_ADMIN_TOKEN)) return null;
+    const bearer = /^Bearer /i.test(request.headers.get("Authorization") ?? "");
+    if ((!evidenceRoute || bearer) && env.GOVERNOR_ADMIN_TOKEN && secret !== null && timingSafeEqual(secret, env.GOVERNOR_ADMIN_TOKEN)) return null;
     return new Response(JSON.stringify({ error: "admin credential required" }), {
       status: 403,
       headers: { "Content-Type": "application/json" },
