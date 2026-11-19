@@ -269,3 +269,48 @@ curl -sS -H "Authorization: Bearer $FACTORY_HUB_TOKEN" "https://<your-pod-subdom
 Schema: this version adds `model_catalog.supports_tools` and `caller_policies` (`migrations/0007_tools_and_caller_budgets.sql`).
 The Worker also applies these additive steps to its own D1 binding on the first authenticated request
 (`src/schema.ts`), so a deploy works even when the deploying credential has no D1 API permission.
+
+## Task evidence and workflow scorecards
+
+An operator can record evidence about completed work using `Authorization: Bearer <GOVERNOR_ADMIN_TOKEN>`. The ledger accepts human blind comparisons, independent measurements, subjective judgments, and editorial outcomes. Hub and inference client credentials cannot access either endpoint. The governor records every entry as admin-attested. A reference identifies external evidence and is never fetched by the Worker. The operator verifies its provenance and ensures a blind reviewer did not see the workflow identities.
+
+### Record evidence
+
+`POST /api/governor/evidence` accepts one JSON object, up to 16 KiB. The following fields are required for both kinds.
+
+| Field | Meaning |
+|---|---|
+| `evidenceId` | Stable idempotency key for this observation. A first write returns 201, an identical normalized replay returns 200, and a different payload using the same ID returns 409. |
+| `taskClass`, `taskRef` | Task family and original assignment ID. Reuse the task reference across retries, candidate outputs, measurements and reviews of that same assignment. |
+| `briefSha256`, `rubricSha256` | Lowercase SHA-256 hex of the original brief and exact evaluation rubric. |
+| `sourceRef` | Source ballot, evaluation record, or other immutable reference that the operator checked. |
+| `kind` | `blind_preference` or `artifact_review`. |
+
+A workflow artifact is an object containing `workflow` (stable workflow/version label), `receiptRef` (workflow or route execution receipt ID or immutable reference), and `artifactSha256` (exact reviewed bytes). Multi-stage work should reference a workflow receipt identifying its component routes.
+
+For `blind_preference`, provide the two artifacts as `left` and `right` and the human `choice` of `left`, `right`, `tie`, or `abstain`. Each alternative needs its own artifact hash. Preserve the original ballot and the blinded-to-workflow mapping behind the source reference.
+
+For `artifact_review`, provide `artifact` and at least one of these observations.
+
+| Field | Meaning |
+|---|---|
+| `checks` | Up to 16 independently measured results, each with a unique `name`, boolean `passed`, and its own `measurementRef`. A deterministic timing validator is an example. |
+| `judge` | Optional subjective assessment with `name`, numeric `score`, positive `maxScore`, and `receiptRef`. The judge must be distinct from the workflow it evaluates. |
+| `publishApproved` | An observed boolean decision. Omitted or null means no decision was recorded. |
+| `editMinutes` | Observed non-negative editing time. Zero records a measured zero. Omitted or null means unmeasured. |
+
+### Read a scorecard
+
+`GET /api/governor/scorecard?taskClass=editing&rubricSha256=<hash>` returns scope, totals, workflow summaries and a page of source observations. Add `briefSha256` to inspect a single brief. The receipt-time interval is `fromMs` inclusive to `toMs` exclusive, in UTC Unix milliseconds. It defaults to the last 30 days and may span up to 90. Date and scope filters have database indexes.
+
+Both summaries and counts cover the entire selected cohort. The detail page defaults to 25 records and the workflow page defaults to 25 workflows. Set `limit` and `workflowLimit` to integers from 1 to 100. For further pages, repeat the returned scope (omit a null `briefSha256`) with `before=nextBefore` and/or `afterWorkflow=nextAfterWorkflow` for the list being advanced. A null cursor means the end of that list. Keep `asOf`, `fromMs`, and `toMs` fixed so later writes do not move the snapshot.
+
+Each workflow summary counts original tasks, briefs, artifacts, and observations separately. Repeated comparisons on one task count once in its blind outcome. Conflicting judgments are mixed, ties and abstentions are explicit, and comparisons of two outputs of the same workflow are counted separately. Publication decisions use the same task-level treatment. Only measured editing time contributes to the mean: the scorecard averages within each task, then across observed tasks. A task passes its observed checks only when each recorded measurement passes. Subjective judge counts and raw scores are separate from measured check results.
+
+These are outcomes for labeled work. Unlabeled traffic is outside the denominator. A multistage result describes the observed workflow as a whole. It cannot identify the contribution of one component model. The scorecard has no automatic winner or path into model qualification, pricing, routing, or budgets.
+
+### Local tools
+
+- [Production sampling and routing evaluation](PRODUCTION-QUALITY.md) describes an on-demand task sample and quality measures for different task families.
+- [Local plan/write workflow](LOCAL-PLAN-WRITE.md) produces linked OAuth stage receipts for one explicit task.
+- [Narration pacing check](PACING.md) measures one creative-production constraint before rendering.
