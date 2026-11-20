@@ -1014,7 +1014,10 @@ test("the first daily-pool 429 stops peer models and later chat requests report 
     for(let i=0;i<2;i++){
       const r=await chat(db,body,{},undefined,{...ENV,DEFAULT_CALLER_MAX_TIER:"0"});
       assert.equal(r.status,429);
-      assert.equal((await r.json() as any).error.code,"free_pool_exhausted");
+      const {error} = await r.json() as any;
+      assert.equal(error.code,"free_pool_exhausted");
+      assert.equal(error.type,"rate_limit_exceeded");
+      assert.match(error.message,/rate limit/i);
     }
   });
   assert.equal(p.calls.length,1);

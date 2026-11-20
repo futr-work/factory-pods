@@ -167,7 +167,7 @@ async function candidates(db: PodStorage, env: InferenceEnv, request: ChatReques
 }
 
 function poolError(reset: number): string {
-  return `OpenRouter's shared free daily request limit is exhausted until ${new Date(reset).toISOString()}`;
+  return `OpenRouter's free-model rate limit has been reached for this UTC day. Requests resume at ${new Date(reset).toISOString()}`;
 }
 
 /** Upstream said the model cannot take this request's tools, e.g. OpenRouter "No endpoints found that support tool use". */

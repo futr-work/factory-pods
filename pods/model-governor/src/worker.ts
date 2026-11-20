@@ -376,7 +376,7 @@ export default {
     if (method === "POST" && (url.pathname === "/api/inference" || isOpenAiPath)) {
       const fail = (status: number, message: string, code: string, extra: Record<string, unknown> = {}) =>
         isOpenAiPath
-          ? json({ error: { message, type: code === "budget_exceeded" ? "insufficient_quota" : "governor_error", code, ...extra } }, status, corsHeaders)
+          ? json({ error: { message, type: code === "free_pool_exhausted" ? "rate_limit_exceeded" : code === "budget_exceeded" ? "insufficient_quota" : "governor_error", code, ...extra } }, status, corsHeaders)
           : json({ error: message, code, ...extra }, status, corsHeaders);
       const body = (await request.json().catch(() => null)) as Record<string, unknown> | null;
       if (!body || (!isOpenAiPath && !body.podId) || !Array.isArray(body.messages) || body.messages.length === 0) {
