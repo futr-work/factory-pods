@@ -12,7 +12,7 @@ import { evidenceScorecard } from "./evidence-scorecard.js";
 import { runDiscovery, runScheduledDiscovery } from "./discovery.js";
 import { probeStatus } from "./probe-limits.js";
 import { runProbeCycle, recordProbe } from "./probe.js";
-import { getUsageReport, runDailyUsageAnalysis } from "./analyzer.js";
+import { analyzeUsage, getUsageReport, runDailyUsageAnalysis } from "./analyzer.js";
 import { listInferenceModels, runChatCompletion } from "./inference.js";
 import { ensureSchema } from "./schema.js";
 import { callersToday, setCallerPolicy, type PolicyPatch } from "./routing.js";
@@ -203,10 +203,16 @@ export default {
     // Daily usage analysis: read the stored report, or analyze a day now.
     if (method === "GET" && url.pathname === "/api/governor/usage-report") {
       const date = url.searchParams.get("date") ?? undefined;
-      const report = await getUsageReport(db, date);
+      const window = url.searchParams.get("window");
+      if (window !== null && (window !== "today" || date !== undefined))
+        return json({ error: "Use window=today for current UTC usage, or date for a closed report." }, 400, corsHeaders);
+      const now = Date.now();
+      const report = window === "today"
+        ? await analyzeUsage(db, new Date(now).setUTCHours(0, 0, 0, 0), now, now)
+        : await getUsageReport(db, date);
       if (!report) return json({ error: date ? `no report for ${date}` : "no usage report yet" }, 404, corsHeaders);
       // report.pods[] is per caller (pod_id = X-Governor-Caller) for the reported day; callersToday is live spend vs budget.
-      return json({ report, callersToday: await callersToday(db, env) }, 200, corsHeaders);
+      return json({ report, callersToday: await callersToday(db, env) }, 200, { ...corsHeaders, "Cache-Control": "private, no-store" });
     }
     if (method === "POST" && url.pathname === "/api/governor/analyze") {
       const body = (await request.json().catch(() => ({}))) as { date?: string; force?: boolean };
