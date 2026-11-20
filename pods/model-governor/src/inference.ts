@@ -68,6 +68,8 @@ export interface ChatRequest {
   /** Original selector when a chat client explicitly requires visible text. */
   requireTextForModel?: string;
   recoveryTimeoutMs?: number;
+  /** The calling agent owns fallback after a confirmed shared daily quota denial. */
+  failoverOnDailyQuota?: boolean;
   /** Families that must not serve this request, e.g. the producer's own family for a cross-family audit. */
   excludeFamily?: string;
   /** The OpenAI chat-completions body, governor-only fields removed. Forwarded unchanged except `model`. */
@@ -335,7 +337,8 @@ export async function runChatCompletion(
     if (!res.ok) {
       const text = await res.text().catch(() => "");
       await record(res.status === 429 ? "rate_limited" : "error");
-      if (dailyPoolDenial(model.provider, model.tier, res.status, text)) {
+      const dailyDenial = dailyPoolDenial(model.provider, model.tier, res.status, text);
+      if (dailyDenial) {
         await markFreePoolExhausted(db, Date.now());
         sharedPoolReset = await freePoolReset(db, Date.now());
       } else {
@@ -344,6 +347,9 @@ export async function runChatCompletion(
       const error = errorMessage(text, res.status);
       attempts.push({ model: model.id, tier, status: res.status, reason: error });
       last = { status: res.status, error, model: model.id };
+      if (dailyDenial && request.failoverOnDailyQuota && sharedPoolReset) {
+        return {ok:false, status:429, code:"free_pool_exhausted", error:poolError(sharedPoolReset), model:model.id, attempts, budget};
+      }
       if (retryable(res.status, text, needsTools)) continue;
       return { ok: false, status: res.status, code: "upstream_error", error, model: model.id, attempts, budget };
     }
