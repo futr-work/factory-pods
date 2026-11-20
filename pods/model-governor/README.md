@@ -248,6 +248,8 @@ On `429`, `402`, `401`/`403`, `404`/`410`, `408`, `5xx`, a network error or time
 A `402` parks the provider. An OpenRouter daily free-pool rejection pauses all OpenRouter free routes and their probes until the UTC reset. A model-specific `429` marks the affected model `rate_limited`. Any other `4xx` is the
 caller's error and is returned as-is.
 
+For callers that handle their own subscription fallback, set `GOVERNOR_QUOTA_FAILOVER_CALLERS` to their comma-separated caller IDs. A confirmed OpenRouter daily free-pool denial returns HTTP 429 with `error.type=insufficient_quota`, `error.code=free_pool_exhausted`, and `x-should-retry: false` so the client can move immediately to its next route. Transient throttles retain their usual retry behavior.
+
 **A request with `tools` only goes to models known to support tools.** Support comes from OpenRouter's
 `supported_parameters` at discovery. When a provider answers "no endpoints support tool use", the model is
 marked unsupported and skipped from then on. Unknown support never qualifies a model for a tools request.

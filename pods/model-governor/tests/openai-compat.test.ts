@@ -1011,13 +1011,15 @@ test("the first daily-pool 429 stops peer models and later chat requests report 
   const p=providers({primary:status(429,JSON.stringify({error:{message:"Rate limit exceeded: free-models-per-day-high-balance"}}))});
   const body={model:"auto",messages:TOOL_MESSAGES,tools:TOOLS};
   await withFetch(p.fetcher,async()=>{
-    for(let i=0;i<2;i++){
-      const r=await chat(db,body,{},undefined,{...ENV,DEFAULT_CALLER_MAX_TIER:"0"});
-      assert.equal(r.status,429);
+    const env = {...ENV, DEFAULT_CALLER_MAX_TIER: "0", GOVERNOR_QUOTA_FAILOVER_CALLERS: "pilot"};
+    for (const caller of ["pilot", "other", "pilot"]) {
+      const r = await chat(db, body, {"X-Governor-Caller": caller}, undefined, env);
+      assert.equal(r.status, 429);
       const {error} = await r.json() as any;
-      assert.equal(error.code,"free_pool_exhausted");
-      assert.equal(error.type,"rate_limit_exceeded");
-      assert.match(error.message,/rate limit/i);
+      assert.equal(error.code, "free_pool_exhausted");
+      assert.equal(error.type, caller === "pilot" ? "insufficient_quota" : "rate_limit_exceeded");
+      assert.equal(r.headers.get("x-should-retry"), caller === "pilot" ? "false" : null);
+      assert.match(error.message, /rate limit/i);
     }
   });
   assert.equal(p.calls.length,1);
@@ -1025,4 +1027,21 @@ test("the first daily-pool 429 stops peer models and later chat requests report 
   sqlite.exec("UPDATE provider_quotas SET resets_at=0 WHERE provider='openrouter:free'");
   const okProvider=providers({primary:ok(TOOL_ANSWER)});
   await withFetch(okProvider.fetcher,async()=>assert.equal((await chat(db,body)).status,200));
+});
+
+test("only the opted-in caller yields on a daily denial; transient 429s still use eligible alternatives", async () => {
+  for (const [caller, cause, expected] of [
+    ["writer", "free-models-per-day-high-balance", 429],
+    ["neighbor", "free-models-per-day-high-balance", 200],
+    ["writer", "temporary upstream rate limit", 200],
+  ] as const) {
+    const {db} = freshDb();
+    await addModel(db, {id:"openrouter:primary", quality:100});
+    await addModel(db, {id:"cerebras:alternate", provider:"cerebras", quality:90});
+    const env = {...ENV, CEREBRAS_API_KEY:"test", GOVERNOR_QUOTA_FAILOVER_CALLERS:"writer"};
+    const p = providers({primary:status(429,JSON.stringify({error:{message:cause}})), alternate:ok(TOOL_ANSWER)});
+    const res = await withFetch(p.fetcher, () => chat(db, {model:"auto", messages:TOOL_MESSAGES}, {"X-Governor-Caller":caller}, undefined, env));
+    assert.equal(res.status, expected);
+    assert.deepEqual(p.calls.map(c=>c.body.model), expected === 429 ? ["primary"] : ["primary","alternate"]);
+  }
 });

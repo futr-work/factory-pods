@@ -45,6 +45,7 @@ interface Env {
   /** HD-set daily ceiling for probing PAID models. Default 0: paid models are never probed automatically. */
   PROBE_BUDGET_USD_DAILY?: string;
   PROBE_REQUESTS_DAILY?: string;
+  GOVERNOR_QUOTA_FAILOVER_CALLERS?: string;
 }
 
 const json = (body: any, status: number, headers: Record<string, string>) =>
@@ -374,10 +375,16 @@ export default {
     // content and tool-role messages included. The provider's response (tool_calls, finish_reason) comes back as-is.
     const isOpenAiPath = url.pathname === "/v1/chat/completions" || url.pathname === "/chat/completions" || url.pathname === "/api/inference/chat/completions";
     if (method === "POST" && (url.pathname === "/api/inference" || isOpenAiPath)) {
-      const fail = (status: number, message: string, code: string, extra: Record<string, unknown> = {}) =>
-        isOpenAiPath
-          ? json({ error: { message, type: code === "free_pool_exhausted" ? "rate_limit_exceeded" : code === "budget_exceeded" ? "insufficient_quota" : "governor_error", code, ...extra } }, status, corsHeaders)
-          : json({ error: message, code, ...extra }, status, corsHeaders);
+      const fail = (status: number, message: string, code: string, extra: Record<string, unknown> = {}, failoverOnDailyQuota = false) => {
+        if (!isOpenAiPath) return json({ error: message, code, ...extra }, status, corsHeaders);
+        if (code === "free_pool_exhausted" && failoverOnDailyQuota) {
+          // OpenAI-compatible clients may retry transient 429s internally before the agent can switch accounts.
+          return json({ error: { message: "Daily limit exhausted. " + message, type: "insufficient_quota", code, ...extra } },
+            status, { ...corsHeaders, "x-should-retry": "false" });
+        }
+        const type = code === "free_pool_exhausted" ? "rate_limit_exceeded" : code === "budget_exceeded" ? "insufficient_quota" : "governor_error";
+        return json({ error: { message, type, code, ...extra } }, status, corsHeaders);
+      };
       const body = (await request.json().catch(() => null)) as Record<string, unknown> | null;
       if (!body || (!isOpenAiPath && !body.podId) || !Array.isArray(body.messages) || body.messages.length === 0) {
         return fail(400, "podId and a non-empty messages array are required", "invalid_request");
@@ -395,6 +402,7 @@ export default {
       const autoCategory = rawModel.startsWith("auto:") ? rawModel.slice(5) : undefined;
       const pinned = rawModel === "auto" || autoCategory !== undefined ? undefined : rawModel;
       const callerId = (request.headers.get("X-Governor-Caller") || String(body.podId || "") || "openbot").slice(0, 200);
+      const failoverOnDailyQuota = isOpenAiPath && (env.GOVERNOR_QUOTA_FAILOVER_CALLERS ?? "").split(",").some(id => id.trim() === callerId);
       const category = (typeof body.category === "string" ? body.category : undefined) ?? request.headers.get("X-Governor-Category") ?? autoCategory;
 
       const forward: Record<string, unknown> = { ...body };
@@ -417,7 +425,7 @@ export default {
         callerId,
         taskId: typeof body.taskId === "string" ? body.taskId : undefined,
         category: category || undefined,
-        model: pinned, recoveryTimeoutMs,
+        model: pinned, recoveryTimeoutMs, failoverOnDailyQuota,
         requireTextForModel: isOpenAiPath && request.headers.get("X-Governor-Require-Output") === "text" ? rawModel : undefined,
         excludeFamily: typeof body.excludeFamily === "string" ? body.excludeFamily : undefined,
         body: forward,
@@ -432,7 +440,7 @@ export default {
           attempts: out.attempts,
           ...out.emptyOutput,
           ...(out.budget ? { budget: { callerId, spentTodayUsd: out.budget.spentTodayUsd, dailyBudgetUsd: out.budget.policy.dailyBudgetUsd } } : {}),
-        });
+        }, failoverOnDailyQuota);
       }
       const routedHeaders = {
         ...corsHeaders,
