@@ -43,13 +43,19 @@ The **Model Governor Pod** provides intelligent, low-latency LLM routing across 
    - Instantly reroutes active requests to alternative models within the same capability tier.
 
 2. **Honest Model Catalog**:
-   - Automated periodic probing verifies that free/cheap models genuinely pass capability benchmarks.
+   - One scheduled smoke suite measures a newly discovered or materially changed model. Production receipts measure task-level performance.
    - Tracks real-time pricing and latency metrics in local SQLite D1.
 
 3. **Daily Model Radar**:
    - Discovers new models from the OpenRouter and OrcaRouter catalogs once a day (a failed run retries hourly)
-     and publishes `model.discovered` to the hub. Capability probes still run on every 5-minute tick, capped
-     by `PROBE_BUDGET_USD_DAILY`.
+     and publishes `model.discovered` to the hub. Existing routes establish the baseline on upgrade. Subsequent
+     catalog changes to model creation time, context, tool support, or tier queue one smoke suite. An explicit
+     per-model admin probe can recheck an unchanged route. All Worker probe paths share `PROBE_REQUESTS_DAILY`
+     (default 20 upstream requests per UTC day; 0 disables probes). Each smoke suite can use five requests.
+     The independent `PROBE_BUDGET_USD_DAILY` bounds scheduled paid testing. Read authenticated
+     `GET /api/governor/probe-status` for the daily request allowance, reservations, and queued changes.
+     On rollout legacy suites from the current day are conservatively charged their full request count.
+     An OpenRouter daily free-pool rejection suspends free OpenRouter probes and inference until UTC rollover.
 
 4. **Daily Usage Analysis**:
    - Stores one report per UTC day of what pods actually spent: calls, failures, 429s, tokens, cost, and
@@ -239,7 +245,7 @@ then pricier tiers up to the maximum. Within a tier they rank by probe score, th
 (`fast_classification` ranks speed first). Named requests limit this order to the selected model.
 
 On `429`, `402`, `401`/`403`, `404`/`410`, `408`, `5xx`, a network error or timeout, the next candidate is tried, up to 6.
-A `402` parks the provider. A `429` marks the model `rate_limited` until its next probe. Any other `4xx` is the
+A `402` parks the provider. An OpenRouter daily free-pool rejection pauses all OpenRouter free routes and their probes until the UTC reset. A model-specific `429` marks the affected model `rate_limited`. Any other `4xx` is the
 caller's error and is returned as-is.
 
 **A request with `tools` only goes to models known to support tools.** Support comes from OpenRouter's

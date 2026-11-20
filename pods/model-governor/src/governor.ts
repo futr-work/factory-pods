@@ -160,6 +160,9 @@ function routableFilter(opts: RouteOptions, now: number): { where: string; param
     where.push("output_cost_per_1m IS NOT NULL AND output_cost_per_1m <= ?");
     params.push(opts.maxOutputCostPer1M);
   }
+  where.push(`NOT (provider='openrouter' AND tier='FREE_TIER' AND EXISTS
+    (SELECT 1 FROM provider_quotas WHERE provider='openrouter:free' AND status='exhausted' AND resets_at>?))`);
+  params.push(now);
   if (opts.requireTools) where.push("supports_tools = 1");
   // Quota awareness: exclude providers that are exhausted or rate limited. A limit recorded
   // without a reset time is a cooldown, never a permanent ban: probes and callers report 429 without Retry-After,
