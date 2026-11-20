@@ -10,16 +10,29 @@
     {
       "binding": "DB",
       "database_name": "authority-seo-pod-db",
-      "database_id": "REPLACE_WITH_D1_DATABASE_ID"
+      "database_id": "5b4a48ca-a3bc-419b-bb4d-a3fc44a2de94"
     }
   ],
   "ai": {
     "binding": "AI"
   },
-  // Optional: bind a hub worker as FACTORY_HUB and an Orrery worker as ORRERY via "services",
-  // and set INDEXNOW_KEY / ORRERY_URL in "vars". The pod runs without them.
+  "services": [
+    {
+      "binding": "FACTORY_HUB",
+      "service": "factory-hub"
+    },
+    {
+      "binding": "ORRERY",
+      "service": "orrery"
+    }
+  ],
   "vars": {
-    "FACTORY_HUB_URL": ""
+    "POD_ID": "authority-seo-pod",
+    "POD_NAME": "Authority Seo Pod",
+    "POD_ROLE": "seo",
+    "POD_LOB": "authority-network",
+    "FACTORY_HUB_URL": "https://factory-hub.walterhudson462.workers.dev",
+    "ORRERY_URL": "https://orrery.walterhudson462.workers.dev"
   },
   "triggers": {
     "crons": [
