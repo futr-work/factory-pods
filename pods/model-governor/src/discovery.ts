@@ -118,10 +118,22 @@ export async function upsertDiscovered(db: PodStorage, source: string, models: D
       context_window = excluded.context_window, last_seen_at = excluded.last_seen_at, model_created_at = excluded.model_created_at,
       supports_tools = COALESCE(excluded.supports_tools, model_catalog.supports_tools),
       lifecycle = CASE WHEN model_catalog.lifecycle = 'retired' THEN 'candidate' ELSE model_catalog.lifecycle END`);
-  const batch = models.map((m) =>
-    stmt.bind(m.id, m.provider, m.modelName, m.family, m.category, m.tier, m.inputCostPer1M, m.outputCostPer1M,
-      m.contextWindow, now, now, m.createdAt, m.supportsTools === null ? null : m.supportsTools ? 1 : 0),
-  );
+  // Compare the provider's catalog signature, independent of health/status learned at inference.
+  // Adopt existing rows as the baseline. Check and upsert each catalog row in the same D1 batch.
+  const enqueue = db.prepare(`INSERT INTO pod_info(key,value_json,updated_at)
+    VALUES ('probe_change:' || ?, json_object('signature', ?, 'pending',
+      NOT EXISTS(SELECT 1 FROM model_catalog WHERE id=? AND lifecycle!='retired')), ?)
+    ON CONFLICT(key) DO UPDATE SET
+      value_json=json_set(excluded.value_json,'$.pending',1), updated_at=excluded.updated_at
+    WHERE json_extract(pod_info.value_json,'$.signature') != json_extract(excluded.value_json,'$.signature')
+       OR json_extract(excluded.value_json,'$.pending')=1`);
+  const batch = models.flatMap(m => {
+    const tools = m.supportsTools === null ? null : Number(m.supportsTools);
+    const signature = JSON.stringify([m.createdAt, m.contextWindow, tools, m.tier]);
+    return [enqueue.bind(m.id, signature, m.id, now),
+      stmt.bind(m.id, m.provider, m.modelName, m.family, m.category, m.tier, m.inputCostPer1M, m.outputCostPer1M,
+        m.contextWindow, now, now, m.createdAt, tools)];
+  });
   for (let i = 0; i < batch.length; i += 50) await db.batch(batch.slice(i, i + 50));
   const retired = await db
     .prepare("UPDATE model_catalog SET lifecycle = 'retired' WHERE provider = ? AND source = 'discovered' AND lifecycle != 'retired' AND last_seen_at < ?")

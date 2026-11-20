@@ -10,6 +10,7 @@ import { isPrivateLedgerRoute, authGate, modelApprovalRoute } from "./auth.js";
 import { EvidenceError, saveEvidence } from "./evidence.js";
 import { evidenceScorecard } from "./evidence-scorecard.js";
 import { runDiscovery, runScheduledDiscovery } from "./discovery.js";
+import { probeStatus } from "./probe-limits.js";
 import { runProbeCycle, recordProbe } from "./probe.js";
 import { getUsageReport, runDailyUsageAnalysis } from "./analyzer.js";
 import { listInferenceModels, runChatCompletion } from "./inference.js";
@@ -43,6 +44,7 @@ interface Env {
   GOVERNOR_DAILY_BUDGET_USD?: string;
   /** HD-set daily ceiling for probing PAID models. Default 0: paid models are never probed automatically. */
   PROBE_BUDGET_USD_DAILY?: string;
+  PROBE_REQUESTS_DAILY?: string;
 }
 
 const json = (body: any, status: number, headers: Record<string, string>) =>
@@ -165,6 +167,10 @@ export default {
       return json({ recommendedModel: model }, 200, corsHeaders);
     }
 
+    if (method === "GET" && url.pathname === "/api/governor/probe-status") {
+      return json(await probeStatus(db, env.PROBE_REQUESTS_DAILY), 200, corsHeaders);
+    }
+
     // API: Probe history for one model (read-only).
     if (method === "GET" && url.pathname === "/api/governor/probes") {
       const model = url.searchParams.get("model");
@@ -223,8 +229,8 @@ export default {
         if (row.tier !== "FREE_TIER" && !row.approved_by) return json({ error: "paid model: approve it first (spend gate)" }, 409, corsHeaders);
         const { probeModel } = await import("./probe.js");
         const target = { id: row.id, provider: row.provider, modelName: row.model_name, tier: row.tier, inputCostPer1M: row.input_cost_per_1m, outputCostPer1M: row.output_cost_per_1m };
-        const r = await probeModel(target, env);
-        return json({ probe: r, lifecycle: await recordProbe(db, target, r, Date.now()) }, 200, corsHeaders);
+        const r = await probeModel(db, target, env);
+        return json({ probe: r, lifecycle: await recordProbe(db, target, r, Date.now()) }, r.blocked ? 429 : 200, corsHeaders);
       }
       return json({ cycle: await runProbeCycle(db, env) }, 200, corsHeaders);
     }
@@ -370,7 +376,7 @@ export default {
     if (method === "POST" && (url.pathname === "/api/inference" || isOpenAiPath)) {
       const fail = (status: number, message: string, code: string, extra: Record<string, unknown> = {}) =>
         isOpenAiPath
-          ? json({ error: { message, type: code === "budget_exceeded" ? "insufficient_quota" : "governor_error", code, ...extra } }, status, corsHeaders)
+          ? json({ error: { message, type: code === "free_pool_exhausted" ? "rate_limit_exceeded" : code === "budget_exceeded" ? "insufficient_quota" : "governor_error", code, ...extra } }, status, corsHeaders)
           : json({ error: message, code, ...extra }, status, corsHeaders);
       const body = (await request.json().catch(() => null)) as Record<string, unknown> | null;
       if (!body || (!isOpenAiPath && !body.podId) || !Array.isArray(body.messages) || body.messages.length === 0) {

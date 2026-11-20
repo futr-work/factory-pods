@@ -7,6 +7,7 @@
 // API keys only. OAuth/consumer-subscription backends (Claude Pro/Max, ChatGPT, Gemini/Antigravity logins) are
 // never called from here: CALLABLE_PROVIDERS is the allowlist and every entry is a pay-per-use API.
 
+import { dailyPoolDenial, freePoolReset, markFreePoolExhausted } from "./probe-limits.js";
 import { UpstreamDeadline } from "./upstream-deadline.js";
 import { RequiredText, requireTextFor, timeoutError, type TimeoutMetadata } from "./required-text.js";
 import { openMeteredStream, type StreamLifetime } from "./inference-stream.js";
@@ -148,6 +149,10 @@ async function candidates(db: PodStorage, env: InferenceEnv, request: ChatReques
   if (!CALLABLE_PROVIDERS.has(model.provider)) return reason("has no HTTP chat endpoint");
   if (model.tier === "PAID" && !model.approvedBy) return reason("needs paid-model approval");
   if (model.lifecycle !== "qualified") return reason("is awaiting qualification");
+  if (model.provider === "openrouter" && model.tier === "FREE_TIER") {
+    const reset = await freePoolReset(db, Date.now());
+    if (reset) return fail(429, "free_pool_exhausted", poolError(reset));
+  }
   if (model.status !== "active") return reason(`is ${model.status}`);
   if (needsTools && model.supportsTools !== true) return reason("has no qualified tool support");
   if (!endpoint(model.provider, env).key) return fail(503, "provider_unconfigured", `model governor has no ${model.provider} key`);
@@ -159,6 +164,10 @@ async function candidates(db: PodStorage, env: InferenceEnv, request: ChatReques
     return reason("belongs to an excluded family");
   }
   return reason("is unavailable during provider quota cooldown");
+}
+
+function poolError(reset: number): string {
+  return `OpenRouter's free-model rate limit has been reached for this UTC day. Requests resume at ${new Date(reset).toISOString()}`;
 }
 
 /** Upstream said the model cannot take this request's tools, e.g. OpenRouter "No endpoints found that support tool use". */
@@ -224,6 +233,11 @@ export async function runChatCompletion(
 
   if (plan.list.length === 0) {
     const toolsNote = needsTools ? " that supports tools" : "";
+    if (budget.effectiveMaxTier === 0) {
+      const reset = await freePoolReset(db, now);
+      if (reset) return { ok:false, status:429, code:"free_pool_exhausted",
+        error:`${poolError(reset)}; no other eligible free route${toolsNote}`, attempts, budget };
+    }
     if (budget.capped) {
       return {
         ok: false,
@@ -241,7 +255,9 @@ export async function runChatCompletion(
 
   const disconnected = () => ({ ok: false as const, status: 499, code: "client_disconnected", error: "client disconnected", model: request.model, attempts, budget });
   let last: { status: number; error: string; model: string } | null = null;
+  let sharedPoolReset: number | null = null;
   for (const { model, tier } of plan.list) {
+    if (sharedPoolReset && model.provider === "openrouter" && model.tier === "FREE_TIER") continue;
     if (lifetime?.signal.aborted) return disconnected();
     const { url, key } = endpoint(model.provider, env);
     if (!key) {
@@ -319,7 +335,12 @@ export async function runChatCompletion(
     if (!res.ok) {
       const text = await res.text().catch(() => "");
       await record(res.status === 429 ? "rate_limited" : "error");
-      await noteFailure(db, model, res.status, text, needsTools, Date.now());
+      if (dailyPoolDenial(model.provider, model.tier, res.status, text)) {
+        await markFreePoolExhausted(db, Date.now());
+        sharedPoolReset = await freePoolReset(db, Date.now());
+      } else {
+        await noteFailure(db, model, res.status, text, needsTools, Date.now());
+      }
       const error = errorMessage(text, res.status);
       attempts.push({ model: model.id, tier, status: res.status, reason: error });
       last = { status: res.status, error, model: model.id };
@@ -391,6 +412,8 @@ export async function runChatCompletion(
     await record("success", promptTokens, completionTokens);
     return { ok: true, kind: "json", model, tier, attempts, budget, data, latencyMs: Date.now() - started, usage: { promptTokens, completionTokens } };
   }
+  if (sharedPoolReset && last?.status === 429 && /free-models-per-day/i.test(last.error))
+    return {ok:false, status:429, code:"free_pool_exhausted", error:poolError(sharedPoolReset), model:last.model, attempts, budget};
   return { ok: false, status: last?.status ?? 502, code: named ? "named_model_failed" : "all_models_failed", error: last?.error ?? "every candidate model failed", model: last?.model, attempts, budget };
 }
 

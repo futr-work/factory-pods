@@ -6,6 +6,8 @@
 import type { PodStorage } from "@futr-work/pod-kernel/storage";
 import type { Fetcher } from "./discovery.js";
 
+import { dailyPoolDenial, freePoolReset, markFreePoolExhausted, probeRequestLimit, reserveProbeRequest } from "./probe-limits.js";
+
 export const SUITE_VERSION = "smoke-2026-11-v1";
 const MAX_TOKENS = 2000; // generous: reasoning models must not exhaust the budget before answering
 
@@ -61,7 +63,7 @@ export interface ProbeTarget {
 
 export interface ProbeResult {
   modelId: string; passed: number; total: number; latencyMs: number | null; tokensPerSec: number | null;
-  promptTokens: number; completionTokens: number; costUsd: number; device?: string; error?: string; providerError?: boolean;
+  promptTokens: number; completionTokens: number; costUsd: number; device?: string; blocked?: "probe_request_limit" | "free_pool_exhausted"; requestsIssued?: number; error?: string; providerError?: boolean;
 }
 
 function endpoint(provider: string, env: ProbeEnv): { url: string; key?: string } {
@@ -69,15 +71,21 @@ function endpoint(provider: string, env: ProbeEnv): { url: string; key?: string 
   return { url: "https://openrouter.ai/api/v1/chat/completions", key: env.OPENROUTER_API_KEY };
 }
 
-export interface ProbeEnv { OPENROUTER_API_KEY?: string; ORCAROUTER_API_KEY?: string; ORCAROUTER_BASE_URL?: string }
+export interface ProbeEnv { PROBE_REQUESTS_DAILY?: string; OPENROUTER_API_KEY?: string; ORCAROUTER_API_KEY?: string; ORCAROUTER_BASE_URL?: string }
 
-export async function probeModel(target: ProbeTarget, env: ProbeEnv, fetcher: Fetcher = (i, init) => fetch(i, init)): Promise<ProbeResult> {
+export async function probeModel(db: PodStorage, target: ProbeTarget, env: ProbeEnv, fetcher: Fetcher = (i, init) => fetch(i, init)): Promise<ProbeResult> {
   const { url, key } = endpoint(target.provider, env);
   const result: ProbeResult = { modelId: target.id, passed: 0, total: SUITE.length, latencyMs: null, tokensPerSec: null, promptTokens: 0, completionTokens: 0, costUsd: 0 };
+  if (!["openrouter","orcarouter"].includes(target.provider)) return { ...result, error: "no probe adapter for " + target.provider, providerError:true };
   if (!key) return { ...result, error: `no API key for ${target.provider}`, providerError: true };
   let totalMs = 0;
   for (const item of SUITE) {
     const started = Date.now();
+    if (target.provider === "openrouter" && target.tier === "FREE_TIER" && await freePoolReset(db, started))
+      return { ...result, blocked: "free_pool_exhausted", error: "OpenRouter free request pool exhausted" };
+    if (!await reserveProbeRequest(db, probeRequestLimit(env.PROBE_REQUESTS_DAILY), started))
+      return { ...result, blocked: "probe_request_limit", error: "UTC daily probe request limit reached" };
+    result.requestsIssued = (result.requestsIssued ?? 0) + 1;
     let res: Response;
     try {
       res = await fetcher(url, {
@@ -92,7 +100,9 @@ export async function probeModel(target: ProbeTarget, env: ProbeEnv, fetcher: Fe
     const ms = Date.now() - started;
     if (!res.ok) {
       // 429/5xx/404 are provider conditions, not model quality: recorded, never counted as a quality run.
-      return { ...result, error: `${item.name}: HTTP ${res.status} ${(await res.text()).slice(0, 160)}`, providerError: true };
+      const message = await res.text();
+      if (dailyPoolDenial(target.provider, target.tier, res.status, message)) await markFreePoolExhausted(db, Date.now());
+      return { ...result, error: `${item.name}: HTTP ${res.status} ${message.slice(0, 160)}`, providerError: true };
     }
     const data = (await res.json()) as any;
     totalMs += ms;
@@ -125,12 +135,14 @@ const DEMOTE_PASS_RATE = 0.6;
 
 /** Records a probe and re-derives the model's measured fields and lifecycle from stored probes only. */
 export async function recordProbe(db: PodStorage, target: ProbeTarget, r: ProbeResult, now: number): Promise<string> {
+  if (r.blocked) return r.blocked;
   await db.prepare(`INSERT INTO model_probes (id, model_id, suite_version, passed, total, latency_ms, tokens_per_sec,
       prompt_tokens, completion_tokens, cost_usd, device, error, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
     .bind(`prb_${now}_${Math.random().toString(36).slice(2, 7)}`, target.id, SUITE_VERSION, r.passed, r.total, r.latencyMs,
       r.tokensPerSec, r.promptTokens, r.completionTokens, r.costUsd, r.device ?? null, r.error ?? null, now)
     .run();
   if (r.providerError) {
+    if (dailyPoolDenial(target.provider, target.tier, 429, r.error ?? "") && /HTTP 429/.test(r.error ?? "")) return "provider_error";
     if (/HTTP 402/.test(r.error ?? "")) {
       // Account-level: no credit. Pause every paid probe for 24 h instead of retrying model after model.
       await db.prepare(`INSERT INTO pod_info (key, value_json, updated_at) VALUES ('paid_probes_paused_until', ?, ?)
@@ -184,27 +196,36 @@ export async function runProbeCycle(db: PodStorage, env: ProbeEnv & { PROBE_BUDG
   const budget = Math.max(0, Number(env.PROBE_BUDGET_USD_DAILY ?? 0) || 0);
   const spentBefore = await spentToday(db, now);
   const map = (r: any): ProbeTarget => ({ id: r.id, provider: r.provider, modelName: r.model_name, tier: r.tier, inputCostPer1M: r.input_cost_per_1m, outputCostPer1M: r.output_cost_per_1m });
-  const free = await db.prepare(`SELECT * FROM model_catalog WHERE lifecycle != 'retired' AND tier = 'FREE_TIER' AND source = 'discovered'
-      AND (status = 'active' OR (status = 'rate_limited' AND last_benchmarked_at < ?) OR (status = 'degraded' AND last_benchmarked_at < ?))
-      ORDER BY probe_runs ASC, model_created_at DESC LIMIT ?`).bind(now - 3600_000, now - 86_400_000, maxFree).all<any>();
-  const targets = (free.results ?? []).map(map);
+  // A queue entry describes one discovery change. Explicit single-model checks remain available.
+  const pending = `SELECT m.*,p.value_json AS revision FROM model_catalog m
+    JOIN pod_info p ON p.key = 'probe_change:' || m.id WHERE json_extract(p.value_json,'$.pending')=1 AND m.source='discovered' AND m.lifecycle!='retired'`;
+  const free = await db.prepare(pending + " AND m.tier='FREE_TIER' ORDER BY p.updated_at,m.id LIMIT ?").bind(maxFree).all<any>();
+  const targets = [...(free.results ?? [])];
   const skippedPaid: string[] = [];
-  // Paid: newest releases first; never re-spend on a model already measured 3 times unless it is approved.
-  const paid = await db.prepare(`SELECT * FROM model_catalog WHERE lifecycle = 'candidate' AND tier = 'PAID' AND source = 'discovered'
-      AND status = 'active' AND (probe_runs < 3 OR approved_by IS NOT NULL)
-      ORDER BY probe_runs ASC, model_created_at DESC LIMIT 5`).all<any>();
+  const paid = await db.prepare(pending + " AND m.tier='PAID' ORDER BY p.updated_at,m.id LIMIT 5").all<any>();
   let remaining = budget - spentBefore;
   const pause = await db.prepare("SELECT value_json FROM pod_info WHERE key = 'paid_probes_paused_until'").first<{ value_json: string }>();
   const pausedUntil = pause ? Number(JSON.parse(pause.value_json).until ?? 0) : 0;
   if (pausedUntil > now) remaining = -1; // account out of credit: skip paid until the pause expires
-  for (const t of (paid.results ?? []).map(map)) {
+  for (const row of paid.results ?? []) {
+    const t = map(row);
     const est = estimateSuiteCost(t);
-    if (budget > 0 && remaining >= 0 && est !== null && est <= remaining) { targets.push(t); remaining -= est; }
+    if (budget > 0 && remaining >= 0 && est !== null && est <= remaining) { targets.push(row); remaining -= est; }
     else skippedPaid.push(t.id);
   }
   const probed: ProbeCycleReport["probed"] = [];
-  for (const t of targets) {
-    const r = await probeModel(t, env, fetcher);
+  for (const row of targets) {
+    const t = map(row);
+    if (t.provider === "openrouter" && t.tier === "FREE_TIER" && await freePoolReset(db, Date.now())) continue;
+    const key = "probe_change:" + t.id;
+    const claim = await db.prepare("UPDATE pod_info SET value_json=json_set(value_json,'$.pending',0) WHERE key=? AND value_json=?").bind(key,row.revision).run();
+    if (claim.meta?.changes !== 1) continue;
+    const r = await probeModel(db, t, env, fetcher);
+    if (r.blocked && !r.requestsIssued) {
+      await db.prepare("UPDATE pod_info SET value_json=? WHERE key=? AND value_json=json_set(?,'$.pending',0)").bind(row.revision,key,row.revision).run();
+      if (r.blocked === "probe_request_limit") break;
+      continue;
+    }
     const lifecycle = await recordProbe(db, t, r, Date.now());
     probed.push({ id: t.id, passed: r.passed, total: r.total, costUsd: r.costUsd, lifecycle, error: r.error });
   }

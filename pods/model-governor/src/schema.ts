@@ -55,4 +55,20 @@ async function upgrade(db: PodStorage): Promise<void> {
 )`).run();
   await db.prepare(`CREATE INDEX IF NOT EXISTS idx_evidence_scope ON task_evidence(task_class, rubric_sha256, created_at, seq)`).run();
   await db.prepare(`CREATE INDEX IF NOT EXISTS idx_evidence_brief ON task_evidence(task_class, rubric_sha256, brief_sha256, created_at, seq)`).run();
+  // Older Workers recorded the shared OpenRouter 429 as an individual model failure.
+  // Translate verified probe rows once; untouched model-specific cooldowns retain their original meaning.
+  const stamp = "probe_pool_upgrade_v1";
+  if (!await db.prepare("SELECT key FROM pod_info WHERE key=?").bind(stamp).first()) {
+    const now = Date.now(), day = 86_400_000, start = Math.floor(now/day)*day;
+    await db.batch([
+      db.prepare(`INSERT OR IGNORE INTO provider_quotas(provider,status,error,exhausted_at,resets_at,updated_at)
+        SELECT 'openrouter:free','exhausted','OpenRouter free daily request limit',MAX(created_at),?,?
+        FROM model_probes WHERE model_id LIKE 'openrouter:%' AND error LIKE '%HTTP 429%free-models-per-day%' AND created_at >= ?
+        HAVING COUNT(*) > 0`).bind(start+day,now,start),
+      db.prepare(`UPDATE model_catalog SET status='active' WHERE provider='openrouter' AND tier='FREE_TIER'
+        AND status='rate_limited' AND EXISTS(SELECT 1 FROM model_probes WHERE model_id=model_catalog.id
+        AND created_at=model_catalog.last_benchmarked_at AND error LIKE '%HTTP 429%free-models-per-day%')`),
+      db.prepare("INSERT OR IGNORE INTO pod_info(key,value_json,updated_at) VALUES(?,'true',?)").bind(stamp,now)
+    ]);
+  }
 }

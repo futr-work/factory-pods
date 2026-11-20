@@ -89,7 +89,7 @@ describe("probing and promotion", () => {
     const target = { id: "openrouter:acme/free-coder:free", provider: "openrouter", modelName: "acme/free-coder:free", tier: "FREE_TIER", inputCostPer1M: 0, outputCostPer1M: 0 };
     const env = { OPENROUTER_API_KEY: "k" };
     for (let i = 1; i <= 3; i++) {
-      const r = await probeModel(target, env, answering(true) as any);
+      const r = await probeModel(db, target, env, answering(true) as any);
       assert.equal(r.passed, SUITE.length);
       const lifecycle = await recordProbe(db, target, r, Date.now() + i);
       assert.equal(lifecycle, i < 3 ? "candidate" : "qualified");
@@ -104,7 +104,7 @@ describe("probing and promotion", () => {
     const { db, sqlite } = freshDb();
     await runDiscovery(db, {}, fetchCatalog, Date.now());
     const target = { id: "openrouter:acme/free-coder:free", provider: "openrouter", modelName: "acme/free-coder:free", tier: "FREE_TIER", inputCostPer1M: 0, outputCostPer1M: 0 };
-    const r = await probeModel(target, { OPENROUTER_API_KEY: "k" }, (async () => new Response("slow down", { status: 429 })) as any);
+    const r = await probeModel(db, target, { OPENROUTER_API_KEY: "k" }, (async () => new Response("slow down", { status: 429 })) as any);
     assert.equal(await recordProbe(db, target, r, Date.now()), "provider_error");
     const row = sqlite.prepare("SELECT probe_runs, status FROM model_catalog WHERE id = ?").get(target.id) as any;
     assert.equal(row.probe_runs, 0);
@@ -121,7 +121,7 @@ describe("probing and promotion", () => {
     assert.ok(!calls.includes("anthropic/claude-x"), "no paid call at budget 0");
     const paid = { id: "openrouter:anthropic/claude-x", provider: "openrouter", modelName: "anthropic/claude-x", tier: "PAID", inputCostPer1M: 3, outputCostPer1M: 15 };
     assert.ok((estimateSuiteCost(paid) ?? 0) > 0);
-    for (let i = 0; i < 3; i++) await recordProbe(db, paid, await probeModel(paid, { OPENROUTER_API_KEY: "k" }, answering(true) as any), Date.now() + i);
+    for (let i = 0; i < 3; i++) await recordProbe(db, paid, await probeModel(db, paid, { OPENROUTER_API_KEY: "k" }, answering(true) as any), Date.now() + i);
     assert.equal((sqlite.prepare("SELECT lifecycle FROM model_catalog WHERE id = ?").get(paid.id) as any).lifecycle, "candidate", "unapproved paid stays candidate");
   });
 });
@@ -155,7 +155,7 @@ describe("credit exhaustion", () => {
     const second = await runProbeCycle(db, { OPENROUTER_API_KEY: "k", PROBE_BUDGET_USD_DAILY: "10" }, fetcher, Date.now() + 1000);
     assert.equal(paidCalls.length, before, "no paid calls while paused");
     assert.ok(second.paidPausedUntil && second.paidPausedUntil > Date.now());
-    assert.ok(second.probed.some((p) => p.id.endsWith(":free")), "free probing continues");
+    assert.equal(second.probed.length, 0, "unchanged free models consume no new requests");
     assert.ok(first.probed.length >= 1);
   });
 });
@@ -684,5 +684,61 @@ describe("quota cooldowns", () => {
     // An explicit future reset time still blocks regardless of age.
     await db.prepare("UPDATE provider_quotas SET status = 'exhausted', resets_at = ?, updated_at = ? WHERE provider = 'openrouter'").bind(now + 3_600_000, now - 90 * 60_000).run();
     assert.equal((await runInference(db, routeEnv, { podId: "p", messages: [{ role: "user", content: "x" }] }, answer)).ok, false);
+  });
+});
+
+describe("probe request governance", () => {
+  const env = { OPENROUTER_API_KEY:"test" };
+  const target = {id:"openrouter:acme/free-coder:free",provider:"openrouter",modelName:"acme/free-coder:free",tier:"FREE_TIER",inputCostPer1M:0,outputCostPer1M:0};
+  test("unchanged rediscovery stays idle; concurrent ticks consume one change", async () => {
+    const {db,sqlite} = freshDb();
+    await runDiscovery(db,{},fetchCatalog);
+    let calls = 0;
+    const fetcher = async (url:string,init?:RequestInit) => { calls++; return answering(true)(url,init); };
+    await Promise.all([runProbeCycle(db,env,fetcher),runProbeCycle(db,env,fetcher)]);
+    assert.equal(calls,5);
+    await runDiscovery(db,{},fetchCatalog);
+    await runProbeCycle(db,env,fetcher);
+    assert.equal(calls,5);
+    const changed=structuredClone(orModels);
+    changed.data[0].context_length=262144;
+    await runDiscovery(db,{},async()=>Response.json(changed));
+    await runProbeCycle(db,env,fetcher);
+    assert.equal(calls,10);
+    // First discovery after upgrading an existing deployment establishes the baseline without re-probing the fleet.
+    sqlite.exec("DELETE FROM pod_info WHERE key GLOB 'probe_change:*'");
+    await runDiscovery(db,{},async()=>Response.json(changed));
+    await runProbeCycle(db,env,fetcher);
+    assert.equal(calls,10);
+  });
+  test("scheduled and explicit requests reserve the same hard cap across overlapping suites",async()=>{
+    const {db,sqlite}=freshDb();
+    await runDiscovery(db,{},fetchCatalog);
+    let calls=0;
+    const fetcher=async(url:string,init?:RequestInit)=>{calls++;return answering(true)(url,init);};
+    const limited={...env,PROBE_REQUESTS_DAILY:"3"};
+    await Promise.all([runProbeCycle(db,limited,fetcher),probeModel(db,target,limited,fetcher)]);
+    assert.equal(calls,3);
+    assert.equal((await probeModel(db,target,limited,fetcher)).blocked,"probe_request_limit");
+    assert.equal(calls,3);
+    assert.equal((sqlite.prepare("SELECT count(*) n FROM model_probes WHERE error IS NULL").get() as any).n,0);
+  });
+  test("legacy suites reduce the first day's remaining allowance, including partial failures",async()=>{
+    const {db,sqlite}=freshDb();
+    sqlite.prepare("INSERT INTO model_probes(id,model_id,suite_version,passed,total,error,created_at) VALUES('p',?,'legacy',0,5,'network',?)").run(target.id,Date.now());
+    const r=await probeModel(db,target,{...env,PROBE_REQUESTS_DAILY:"5"},()=>{throw new Error("no network allowed");});
+    assert.equal(r.blocked,"probe_request_limit");
+    assert.equal(r.requestsIssued,undefined);
+  });
+  test("daily pool rejection blocks all peer free probes but permits a paid OpenRouter probe",async()=>{
+    const {db,sqlite}=freshDb(); await runDiscovery(db,{},fetchCatalog);
+    let calls=0;
+    const denied=async()=>{calls++;return new Response('{"error":{"message":"Rate limit exceeded: free-models-per-day-high-balance"}}',{status:429});};
+    const first=await probeModel(db,target,env,denied);
+    await recordProbe(db,target,first,Date.now());
+    assert.equal((await probeModel(db,{...target,id:"peer"},env,denied)).blocked,"free_pool_exhausted");
+    assert.equal(calls,1);
+    assert.equal((sqlite.prepare("SELECT status FROM model_catalog WHERE id=?").get(target.id) as any).status,"active");
+    assert.equal((await probeModel(db,{...target,tier:"PAID"},env,answering(true))).passed,5);
   });
 });

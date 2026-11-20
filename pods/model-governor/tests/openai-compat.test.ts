@@ -1003,3 +1003,26 @@ test("provider timeouts, wrong identity and non-SSE error bodies cannot mint gov
   }
   assert.equal((await db.prepare("SELECT COUNT(*) AS n FROM llm_usage_events WHERE status='upstream_timeout'").first<any>())?.n,0);
 });
+
+test("the first daily-pool 429 stops peer models and later chat requests report the shared limit", async()=>{
+  const {db,sqlite}=freshDb();
+  await addModel(db,{id:"openrouter:primary",quality:100});
+  await addModel(db,{id:"openrouter:peer",quality:95});
+  const p=providers({primary:status(429,JSON.stringify({error:{message:"Rate limit exceeded: free-models-per-day-high-balance"}}))});
+  const body={model:"auto",messages:TOOL_MESSAGES,tools:TOOLS};
+  await withFetch(p.fetcher,async()=>{
+    for(let i=0;i<2;i++){
+      const r=await chat(db,body,{},undefined,{...ENV,DEFAULT_CALLER_MAX_TIER:"0"});
+      assert.equal(r.status,429);
+      const {error} = await r.json() as any;
+      assert.equal(error.code,"free_pool_exhausted");
+      assert.equal(error.type,"rate_limit_exceeded");
+      assert.match(error.message,/rate limit/i);
+    }
+  });
+  assert.equal(p.calls.length,1);
+  assert.equal((sqlite.prepare("SELECT status FROM model_catalog WHERE id='openrouter:primary'").get() as any).status,"active");
+  sqlite.exec("UPDATE provider_quotas SET resets_at=0 WHERE provider='openrouter:free'");
+  const okProvider=providers({primary:ok(TOOL_ANSWER)});
+  await withFetch(okProvider.fetcher,async()=>assert.equal((await chat(db,body)).status,200));
+});

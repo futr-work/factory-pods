@@ -39,7 +39,7 @@ export function isClientRoute(method: string, pathname: string): boolean {
   return (method === "POST" && CLIENT_POST.has(pathname)) || (method === "GET" && CLIENT_GET.has(pathname));
 }
 
-const ADMIN_READ_GET = new Set(["/api/governor/callers", "/api/governor/usage-report"]);
+const ADMIN_READ_GET = new Set(["/api/governor/callers", "/api/governor/usage-report", "/api/governor/probe-status"]);
 
 /** Read-only spend views the admin token may open in addition to the hub token. */
 export function isAdminReadRoute(method: string, pathname: string): boolean {
