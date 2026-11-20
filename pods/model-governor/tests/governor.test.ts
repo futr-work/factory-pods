@@ -506,6 +506,23 @@ describe("usage report routes and dashboard", () => {
     assert.equal(body.report.totals.calls, 1);
   });
 
+  test("today reports only the open UTC window and leaves closed-day history alone", async () => {
+    const { db } = freshDb();
+    const start = new Date().setUTCHours(0, 0, 0, 0);
+    await insertUsage(db, [{model:"test/previous",at:start-1}, {model:"test/current",at:start}]);
+    const get = (query:string) => worker.fetch(new Request("https://gov.test/api/governor/usage-report?" + query,
+      {headers:{Authorization:"Bearer admin-secret"}}), env(db));
+    const r = await get("window=today");
+    assert.equal(r.status,200);
+    const {report} = await r.json() as {report:{windowStart:number;totals:{calls:number};models:{modelId:string}[]}};
+    assert.equal(report.windowStart,start);
+    assert.equal(report.totals.calls,1);
+    assert.equal(report.models[0].modelId,"test/current");
+    assert.equal(await getUsageReport(db),null);
+    assert.equal((await get("window=today&date=2026-11-02")).status,400);
+    assert.equal((await get("window=all")).status,400);
+  });
+
   test("POST /api/governor/analyze requires the admin token and forces a fresh analysis", async () => {
     const { db } = freshDb();
     await insertUsage(db, [{ model: "m/x", cost: 2 }]);
