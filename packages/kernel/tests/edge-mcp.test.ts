@@ -369,7 +369,7 @@ describe("edge-mcp MCP v2 (2026-07-28) extensions + Code Mode", () => {
       params: {
         name: "execute",
         arguments: {
-          code: "const sites = await pod.listSites(); const total = await pod.sumMetrics([10, 20, 12]); return { count: sites.length, total };",
+          code: "console.log(null); console.log('noise'); const sites = await pod.listSites(); const total = await pod.sumMetrics([10, 20, 12]); return { count: sites.length, total, big: 'x'.repeat(70000).length };",
         },
       },
     });
@@ -377,7 +377,22 @@ describe("edge-mcp MCP v2 (2026-07-28) extensions + Code Mode", () => {
     const execJson = (await execRes.json()) as any;
     assert.equal(execJson.result.resultType, "complete");
     const execData = JSON.parse(execJson.result.content[0].text);
-    assert.deepEqual(execData, { ok: true, result: { count: 2, total: 42 } });
+    assert.deepEqual(execData, { ok: true, result: { count: 2, total: 42, big: 70000 } });
+
+    const bigRes = await post({
+      jsonrpc: "2.0",
+      id: "e2",
+      method: "tools/call",
+      params: {
+        name: "execute",
+        arguments: { code: "return 'x'.repeat(131072);" },
+      },
+    });
+    assert.equal(bigRes.status, 200);
+    const bigJson = (await bigRes.json()) as any;
+    const bigData = JSON.parse(bigJson.result.content[0].text);
+    assert.equal(bigData.ok, true);
+    assert.equal(bigData.result.length, 131072);
   });
 
   test("Code Mode OS-permission isolate blocks host env secrets, filesystem reads, and loopback network access", async () => {

@@ -383,9 +383,12 @@ export async function executeInDynamicWorkerLoader(
 ): Promise<any> {
   const methodNames = Object.keys(sdk).filter((k) => typeof sdk[k] === "function");
   let revoked = false;
+  const deadlineMs = Date.now() + options.timeoutMs;
+  const isExpired = () => revoked || Date.now() >= deadlineMs;
 
   const dispatchSdk = async (method: string, args: any[]) => {
-    if (revoked) {
+    if (isExpired()) {
+      revoked = true;
       throw new Error("Code Mode execution deadline expired; SDK access revoked");
     }
     if (!methodNames.includes(method)) {
@@ -393,7 +396,8 @@ export async function executeInDynamicWorkerLoader(
     }
     const safeArgs = Array.isArray(args) ? JSON.parse(JSON.stringify(args)) : [];
     const result = await sdk[method](...safeArgs);
-    if (revoked) {
+    if (isExpired()) {
+      revoked = true;
       throw new Error("Code Mode execution deadline expired; SDK access revoked");
     }
     return result === undefined ? null : JSON.parse(JSON.stringify(result));
@@ -500,6 +504,10 @@ export default class CodeModeRunner extends WorkerEntrypoint {
     const execPromise =
       rpcArg && typeof entrypoint.run === "function"
         ? Promise.resolve(entrypoint.run(rpcArg)).then((raw: string) => {
+            if (isExpired()) {
+              revoked = true;
+              throw new Error(`Code Mode execution timed out after ${options.timeoutMs}ms`);
+            }
             const data = typeof raw === "string" ? JSON.parse(raw) : raw;
             if (!data || data.ok === false) {
               throw new Error(data?.error || "Code Mode execution failed");
@@ -509,6 +517,10 @@ export default class CodeModeRunner extends WorkerEntrypoint {
         : entrypoint
             .fetch(new Request("https://sandbox.internal/run", { method: "POST" }))
             .then(async (resp: Response) => {
+              if (isExpired()) {
+                revoked = true;
+                throw new Error(`Code Mode execution timed out after ${options.timeoutMs}ms`);
+              }
               const data = (await resp.json()) as any;
               if (!resp.ok || data.ok === false) {
                 throw new Error(data.error || "Code Mode execution failed");
@@ -554,13 +566,23 @@ export async function executeInIsolatedNodeSubprocess(
     );
   }
 
+  // Fail closed on Node versions (< 26) where `--permission` does not enforce network isolation.
+  const majorNode = Number.parseInt(String(process.versions?.node ?? "0").split(".")[0] || "0", 10);
+  if (!Number.isFinite(majorNode) || majorNode < 26) {
+    throw new Error(
+      `Code Mode local Node sandbox requires Node >= 26 for OS-enforced network permission isolation (detected Node ${process.versions?.node ?? "unknown"}). Use Cloudflare Dynamic Worker Loader (CODE_LOADER) or pass a custom codeMode.executor.`
+    );
+  }
+
   const methodNames = Object.keys(sdk).filter((k) => typeof sdk[k] === "function");
 
-  // Child process runner: reads init payload on line 1 of stdin, then exchanges JSON-lines SDK RPC messages.
+  // Child process runner: uses dedicated Node IPC channel (`process.send` / `process.on("message")`)
+  // so arbitrary `console.log(...)` on stdout never collides with or crashes IPC parsing.
   const childBootstrap = `
-const readline = process.getBuiltinModule("node:readline");
-const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
-const writeMsg = (obj) => { process.stdout.write(JSON.stringify(obj) + "\\n"); };
+const sendIpc = (obj) => new Promise((resolve) => {
+  if (typeof process.send !== "function") { resolve(); return; }
+  process.send(obj, undefined, undefined, () => resolve());
+});
 
 let started = false;
 let nextCallId = 1;
@@ -578,14 +600,12 @@ function invokeSdk(method, args) {
       reject(new Error("SDK arguments must be JSON-serializable"));
       return;
     }
-    writeMsg({ type: "sdk_call", callId, method, args: safeArgs });
+    void sendIpc({ type: "sdk_call", callId, method, args: safeArgs });
   });
 }
 
-rl.on("line", (line) => {
-  if (!line.trim()) return;
-  let msg;
-  try { msg = JSON.parse(line); } catch { return; }
+process.on("message", (msg) => {
+  if (!msg || typeof msg !== "object") return;
   if (!started && msg.type === "init") {
     started = true;
     const pod = Object.create(null);
@@ -596,13 +616,14 @@ rl.on("line", (line) => {
     const AsyncFunction = Object.getPrototypeOf(async function(){}).constructor;
     Promise.resolve()
       .then(() => new AsyncFunction("pod", msg.code)(pod))
-      .then((result) => {
-        writeMsg({ type: "done", ok: true, result: result === undefined ? null : JSON.parse(JSON.stringify(result)) });
-        process.exit(0);
+      .then(async (result) => {
+        const safeResult = result === undefined ? null : JSON.parse(JSON.stringify(result));
+        await sendIpc({ type: "done", ok: true, result: safeResult });
+        if (typeof process.disconnect === "function") process.disconnect();
       })
-      .catch((err) => {
-        writeMsg({ type: "done", ok: false, error: err && err.message ? err.message : String(err) });
-        process.exit(0);
+      .catch(async (err) => {
+        await sendIpc({ type: "done", ok: false, error: err && err.message ? err.message : String(err) });
+        if (typeof process.disconnect === "function") process.disconnect();
       });
     return;
   }
@@ -619,12 +640,13 @@ rl.on("line", (line) => {
   return await new Promise((resolve, reject) => {
     let settled = false;
     let revoked = false;
-    let stdoutBuf = "";
+    const deadlineMs = Date.now() + options.timeoutMs;
+    const isExpired = () => revoked || Date.now() >= deadlineMs;
     let stderrBuf = "";
 
     const child = cp.spawn(process.execPath, ["--permission", "-e", childBootstrap], {
       env: {}, // Physically empty environment — zero host secrets in child process
-      stdio: ["pipe", "pipe", "pipe"],
+      stdio: ["ignore", "ignore", "pipe", "ipc"],
     });
 
     const finish = (err: Error | null, value?: any) => {
@@ -644,68 +666,59 @@ rl.on("line", (line) => {
       finish(new Error(`Code Mode execution timed out after ${options.timeoutMs}ms`));
     }, options.timeoutMs);
 
-    const handleLine = async (line: string) => {
-      if (!line.trim()) return;
-      let msg: any;
-      try {
-        msg = JSON.parse(line);
-      } catch {
-        return;
-      }
+    const handleMessage = async (msg: any) => {
+      if (!msg || typeof msg !== "object" || typeof msg.type !== "string") return;
       if (msg.type === "done") {
+        if (isExpired()) {
+          finish(new Error(`Code Mode execution timed out after ${options.timeoutMs}ms`));
+          return;
+        }
         if (msg.ok) finish(null, msg.result);
-        else finish(new Error(msg.error || "Code Mode execution failed"));
+        else finish(new Error(typeof msg.error === "string" ? msg.error : "Code Mode execution failed"));
         return;
       }
       if (msg.type === "sdk_call") {
-        if (revoked) {
+        if (isExpired()) {
+          revoked = true;
           return;
         }
         const method = String(msg.method ?? "");
         if (!methodNames.includes(method)) {
           try {
-            child.stdin.write(
-              JSON.stringify({ type: "sdk_response", callId: msg.callId, ok: false, error: `Unknown SDK method: ${method}` }) + "\n"
-            );
+            child.send({ type: "sdk_response", callId: msg.callId, ok: false, error: `Unknown SDK method: ${method}` });
           } catch {}
           return;
         }
         try {
           const safeArgs = Array.isArray(msg.args) ? msg.args : [];
           const result = await sdk[method](...safeArgs);
-          if (revoked) return;
-          child.stdin.write(
-            JSON.stringify({
-              type: "sdk_response",
-              callId: msg.callId,
-              ok: true,
-              result: result === undefined ? null : JSON.parse(JSON.stringify(result)),
-            }) + "\n"
-          );
+          if (isExpired()) {
+            revoked = true;
+            return;
+          }
+          child.send({
+            type: "sdk_response",
+            callId: msg.callId,
+            ok: true,
+            result: result === undefined ? null : JSON.parse(JSON.stringify(result)),
+          });
         } catch (err: any) {
-          if (revoked) return;
+          if (isExpired()) return;
           try {
-            child.stdin.write(
-              JSON.stringify({ type: "sdk_response", callId: msg.callId, ok: false, error: err?.message || "SDK call failed" }) + "\n"
-            );
+            child.send({ type: "sdk_response", callId: msg.callId, ok: false, error: err?.message || "SDK call failed" });
           } catch {}
         }
       }
     };
 
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => {
-      stdoutBuf += chunk;
-      let idx: number;
-      while ((idx = stdoutBuf.indexOf("\n")) !== -1) {
-        const line = stdoutBuf.slice(0, idx);
-        stdoutBuf = stdoutBuf.slice(idx + 1);
-        void handleLine(line);
-      }
+    child.on("message", (msg: any) => {
+      void handleMessage(msg).catch((err) => {
+        finish(err instanceof Error ? err : new Error(String(err)));
+      });
     });
 
-    child.stderr.setEncoding("utf8");
-    child.stderr.on("data", (chunk: string) => {
+    child.stderr?.setEncoding("utf8");
+    child.stderr?.on("data", (chunk: string) => {
       if (stderrBuf.length < 2048) stderrBuf += chunk;
     });
 
@@ -713,14 +726,18 @@ rl.on("line", (line) => {
       finish(err);
     });
 
-    child.on("exit", (exitCode: number | null) => {
+    child.on("close", (exitCode: number | null) => {
       if (!settled) {
         const detail = stderrBuf.trim() ? `: ${stderrBuf.trim().slice(0, 240)}` : "";
         finish(new Error(`Code Mode isolate exited unexpectedly (code ${exitCode})${detail}`));
       }
     });
 
-    child.stdin.write(JSON.stringify({ type: "init", code, methodNames }) + "\n");
+    try {
+      child.send({ type: "init", code, methodNames });
+    } catch (err: any) {
+      finish(err instanceof Error ? err : new Error(String(err)));
+    }
   });
 }
 

@@ -32,7 +32,7 @@ A pod that exposes MCP serves a stateless endpoint at `/mcp` with Bearer authent
   - **`search(query)`**: Searches the pod's typed SDK specification (`pod.*` methods and signatures) so agents discover the API in ~1,000 tokens.
   - **`execute(code)`**: Executes a short agent-written JS snippet inside an isolated, network-disabled sandbox with a serialized SDK bridge and deadline revocation:
     - **Cloudflare Workers**: configure `"worker_loaders": [{ "binding": "CODE_LOADER" }]` in `wrangler.jsonc`; the kernel loads `worker.js` with `globalOutbound: null` and bridges `pod.*` over a Cloudflare `RpcTarget` (or custom `createWorkerSdkBinding`).
-    - **Local Node / tests**: spawns an OS-isolated `node --permission` subprocess with empty `env`, zero filesystem/network permissions, JSON-lines stdin/stdout IPC, and hard `SIGKILL` + SDK revocation on timeout.
+    - **Local Node / tests**: spawns an OS-isolated `node --permission` subprocess (requires Node `>= 26` for OS-enforced network permission isolation; fails closed on older Node runtimes unless a custom `codeMode.executor` is provided) with empty `env`, zero filesystem/network permissions, dedicated IPC channel (`stdio: ipc`, isolated from `console.log`), and hard `SIGKILL` + monotonic deadline SDK revocation on timeout.
 
 The five core tools are:
 
