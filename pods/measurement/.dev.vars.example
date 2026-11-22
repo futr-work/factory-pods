@@ -1,0 +1,4 @@
+# Local development secrets (never commit .dev.vars)
+FACTORY_HUB_TOKEN=replace-with-random-token
+# Optional JSON array of ScopedCallerConfig entries (SHA-256 token fingerprints + tenant/resource/action grants)
+SCOPED_CALLER_GRANTS=[]

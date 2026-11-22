@@ -1,0 +1,11 @@
+[pod]
+name = "measurement-pod"
+role = "measurement"
+version = "1.0.0"
+
+[harness]
+runtime = "cloudflare-worker"
+engine = "edge-v8"
+
+[tools]
+mcp = ["submit_task", "task_status", "approve", "cancel", "get_receipt", "ms_register_resource", "ms_define_metric", "ms_record_observations", "ms_query_series", "ms_check_coverage", "ms_annotate_work", "search", "execute"]
