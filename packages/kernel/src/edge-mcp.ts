@@ -1,13 +1,16 @@
 // @futr-work/pod-kernel: Edge-native Cloudflare Workers MCP v2 Server + Code Mode
 // Implements stateless JSON-RPC 2.0 Model Context Protocol (2026-07-28 default, 2024-11-05 compatible)
 // with Cloudflare Code Mode (`search` + `execute` isolated SDK execution).
-// Runs natively in Cloudflare Workers V8 isolates (with Dynamic Worker Loader), Bun, and Node.js.
+// Runs natively in Cloudflare Workers V8 isolates (with Dynamic Worker Loader + ctx.exports/RpcTarget)
+// and locally in Node.js (via OS-level `node --permission` subprocess with zero FS/network/env capabilities).
 
 import type { PodReceipt } from "./types.js";
 
 export const MCP_V2_PROTOCOL_VERSION = "2026-07-28";
 export const MCP_V1_PROTOCOL_VERSION = "2024-11-05";
 export const SUPPORTED_PROTOCOL_VERSIONS = [MCP_V2_PROTOCOL_VERSION, MCP_V1_PROTOCOL_VERSION] as const;
+
+export const MCP_ERROR_HEADER_MISMATCH = -32020;
 
 export interface JsonRpcRequest {
   jsonrpc: "2.0";
@@ -73,7 +76,8 @@ export interface McpTaskSummary {
 }
 
 export interface McpTaskDetail extends McpTaskSummary {
-  resultType?: "complete" | "pending" | "failed" | "cancelled";
+  /** RPC result discriminator is always `"complete"` on the wire regardless of task `status`. */
+  resultType?: "complete";
 }
 
 export interface McpTasksExtension {
@@ -88,7 +92,7 @@ export interface McpTasksExtension {
   cancel?: (
     params: { taskId: string },
     context: McpToolContext
-  ) => Promise<McpTaskDetail> | McpTaskDetail;
+  ) => Promise<Record<string, any>> | Record<string, any>;
 }
 
 export interface CodeModeSpecEntry {
@@ -102,20 +106,31 @@ export interface CodeModeSpecEntry {
 export type CodeModeExecutor = (
   code: string,
   sdk: Record<string, (...args: any[]) => Promise<any> | any>,
-  options: { timeoutMs: number; env?: any }
+  options: { timeoutMs: number; env?: any; ctx?: any }
 ) => Promise<any>;
 
 /**
  * Cloudflare Dynamic Worker Loader binding shape (`env.LOADER` / `env.CODE_LOADER`).
  */
 export interface DynamicWorkerLoaderLike {
-  get: (
+  load?: (config: {
+    compatibilityDate: string;
+    mainModule: string;
+    modules: Record<string, string | { js: string }>;
+    globalOutbound?: any;
+    env?: Record<string, any>;
+  }) => {
+    getEntrypoint: () => {
+      fetch: (request: Request) => Promise<Response>;
+    };
+  };
+  get?: (
     id: string,
     getCode: () => Promise<{
       compatibilityDate: string;
       mainModule: string;
-      modules: Record<string, string>;
-      globalOutbound?: null;
+      modules: Record<string, string | { js: string }>;
+      globalOutbound?: any;
       env?: Record<string, any>;
     }>
   ) => {
@@ -134,14 +149,23 @@ export interface CodeModeOptions {
    * Optional custom sandbox executor.
    * When omitted:
    *  - If `env[workerLoaderBinding]` (default `"CODE_LOADER"`) is present (Cloudflare Workers Dynamic Worker Loader),
-   *    executes inside a fresh network-disabled Dynamic Worker isolate with a serialized RPC bridge.
-   *  - Otherwise in Node.js, executes inside a dedicated, terminable `worker_threads` Worker with a serialized
-   *    JSON-only `MessagePort` SDK bridge, `process.env` cleared, external network disabled, and hard `.terminate()`
-   *    plus SDK revocation on timeout.
+   *    executes inside a fresh network-disabled (`globalOutbound: null`) Dynamic Worker isolate using a `.js` module
+   *    and a Cloudflare `RpcTarget` / Service Binding callback bridge (no plain-object functions passed to `env`).
+   *  - Otherwise in Node.js, executes inside an OS-isolated `node --permission` child process with empty `env`,
+   *    zero filesystem/network permissions, JSON-lines stdin/stdout SDK RPC, and hard `SIGKILL` + SDK revocation on timeout.
    */
   executor?: CodeModeExecutor;
   /** Cloudflare Worker binding name for the Dynamic Worker Loader (default: "CODE_LOADER"). */
   workerLoaderBinding?: string;
+  /**
+   * Optional Cloudflare WorkerEntrypoint / Service Binding factory for bridging `pod.*` into the Dynamic Worker
+   * (e.g. `({ runId }) => ctx.exports.CodeModeSdkBridge({ props: { runId } })`).
+   * If omitted in Cloudflare Workers, the kernel attempts `new RpcTarget` from `cloudflare:workers`.
+   */
+  createWorkerSdkBinding?: (
+    dispatch: (method: string, args: any[]) => Promise<any>,
+    context: { env?: any; ctx?: any; runId: string }
+  ) => Promise<any> | any;
   /** Maximum execution timeout in milliseconds (default: 2000, hard cap: 10000). */
   timeoutMs?: number;
   /** Maximum source code length in bytes (default: 16384). */
@@ -151,6 +175,7 @@ export interface CodeModeOptions {
 export interface McpToolContext {
   request: Request;
   env?: any;
+  ctx?: any;
   podName: string;
   podRole?: string;
   now: number;
@@ -225,45 +250,112 @@ function validateVersionHeader(
 }
 
 /**
- * Validate MCP Streamable HTTP routing headers against the JSON-RPC body before dispatch.
- * Rejects mismatches (e.g. header claiming `tools/list` while body invokes `tools/call`) with HTTP 400.
+ * Validate MCP 2026-07-28 Streamable HTTP routing headers (`Mcp-Method`, `Mcp-Name`, `MCP-Protocol-Version`)
+ * and body `_meta` protocolVersion agreement before dispatch.
+ * Rejects mismatches with HTTP 400 and MCP `HeaderMismatch` error (`-32020`).
  */
 function validateRoutingHeaders(
   request: Request,
-  body: any
-): { ok: true } | { ok: false; status: number; message: string } {
-  const methodHeader = request.headers.get("MCP-Method") || request.headers.get("X-MCP-Method");
-  const toolHeader = request.headers.get("MCP-Tool-Name") || request.headers.get("X-MCP-Tool");
+  body: any,
+  headerVersion: string
+): { ok: true } | { ok: false; status: number; code: number; errorName: string; message: string } {
+  const methodHeader = request.headers.get("Mcp-Method") || request.headers.get("X-MCP-Method");
+  const nameHeader =
+    request.headers.get("Mcp-Name") ||
+    request.headers.get("MCP-Tool-Name") ||
+    request.headers.get("X-MCP-Tool");
 
-  if (!methodHeader && !toolHeader) return { ok: true };
+  const checkSingleBodyMeta = (item: any) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return null;
+    const metaVer =
+      item.params &&
+      typeof item.params === "object" &&
+      item.params._meta &&
+      typeof item.params._meta === "object" &&
+      typeof item.params._meta.protocolVersion === "string"
+        ? item.params._meta.protocolVersion.trim()
+        : null;
+    if (metaVer !== null) {
+      if (!isSupportedProtocolVersion(metaVer)) {
+        return {
+          ok: false as const,
+          status: 400,
+          code: MCP_ERROR_HEADER_MISMATCH,
+          errorName: "HeaderMismatch",
+          message: `Unsupported body _meta.protocolVersion '${metaVer}'. Supported: ${SUPPORTED_PROTOCOL_VERSIONS.join(", ")}`,
+        };
+      }
+      if (metaVer !== headerVersion) {
+        return {
+          ok: false as const,
+          status: 400,
+          code: MCP_ERROR_HEADER_MISMATCH,
+          errorName: "HeaderMismatch",
+          message: `HeaderMismatch: protocol version header '${headerVersion}' disagrees with body _meta.protocolVersion '${metaVer}'`,
+        };
+      }
+    }
+    return null;
+  };
 
   if (Array.isArray(body)) {
+    if (methodHeader || nameHeader) {
+      return {
+        ok: false,
+        status: 400,
+        code: MCP_ERROR_HEADER_MISMATCH,
+        errorName: "HeaderMismatch",
+        message: "HeaderMismatch: Mcp-Method / Mcp-Name headers cannot be used with batch requests",
+      };
+    }
+    for (const item of body) {
+      const metaErr = checkSingleBodyMeta(item);
+      if (metaErr) return metaErr;
+    }
+    return { ok: true };
+  }
+
+  const metaErr = checkSingleBodyMeta(body);
+  if (metaErr) return metaErr;
+
+  if (!methodHeader && !nameHeader) return { ok: true };
+
+  if (!body || typeof body !== "object") {
     return {
       ok: false,
       status: 400,
-      message: "MCP routing headers (MCP-Method / MCP-Tool-Name) cannot be used with batch requests",
+      code: MCP_ERROR_HEADER_MISMATCH,
+      errorName: "HeaderMismatch",
+      message: "HeaderMismatch: invalid JSON-RPC body for routing header validation",
     };
-  }
-
-  if (!body || typeof body !== "object") {
-    return { ok: false, status: 400, message: "Invalid JSON-RPC body for MCP routing header validation" };
   }
 
   if (methodHeader && body.method !== methodHeader.trim()) {
     return {
       ok: false,
       status: 400,
-      message: `MCP routing header mismatch: header declares method '${methodHeader.trim()}' but body invokes '${String(body.method)}'`,
+      code: MCP_ERROR_HEADER_MISMATCH,
+      errorName: "HeaderMismatch",
+      message: `HeaderMismatch: Mcp-Method header '${methodHeader.trim()}' does not match body method '${String(body.method)}'`,
     };
   }
 
-  if (toolHeader) {
-    const bodyTool = body.params && typeof body.params === "object" ? body.params.name : undefined;
-    if (body.method !== "tools/call" || bodyTool !== toolHeader.trim()) {
+  if (nameHeader) {
+    const expectedName = nameHeader.trim();
+    const params = body.params && typeof body.params === "object" ? body.params : {};
+    const bodyName =
+      body.method === "tools/call" || body.method === "prompts/get"
+        ? params.name
+        : body.method === "resources/read"
+          ? params.uri
+          : undefined;
+    if (bodyName !== expectedName) {
       return {
         ok: false,
         status: 400,
-        message: `MCP routing header mismatch: header declares tool '${toolHeader.trim()}' but body invokes '${String(bodyTool)}'`,
+        code: MCP_ERROR_HEADER_MISMATCH,
+        errorName: "HeaderMismatch",
+        message: `HeaderMismatch: Mcp-Name header '${expectedName}' does not match body target '${String(bodyName)}'`,
       };
     }
   }
@@ -273,64 +365,84 @@ function validateRoutingHeaders(
 
 /**
  * Cloudflare Dynamic Worker Loader Code Mode executor.
- * Spins up an isolated V8 worker with `globalOutbound: null` (external network disabled) and
- * bridges `pod.*` calls over a narrow JSON-only Service Binding RPC that revokes access on timeout.
+ * Uses `worker.js` with `globalOutbound: null` (external network disabled) and passes the
+ * `RpcTarget` SDK bridge as an RPC argument to a `WorkerEntrypoint` method on the loaded worker
+ * (workerd allows passing `RpcTarget` in RPC method arguments, whereas `loader.load({ env })`
+ * only accepts static JSON/service bindings).
  */
 export async function executeInDynamicWorkerLoader(
   loader: DynamicWorkerLoaderLike,
   code: string,
   sdk: Record<string, (...args: any[]) => Promise<any> | any>,
-  options: { timeoutMs: number }
+  options: {
+    timeoutMs: number;
+    env?: any;
+    ctx?: any;
+    createWorkerSdkBinding?: CodeModeOptions["createWorkerSdkBinding"];
+  }
 ): Promise<any> {
   const methodNames = Object.keys(sdk).filter((k) => typeof sdk[k] === "function");
   let revoked = false;
 
-  const rpcBridge = {
-    async fetch(req: Request): Promise<Response> {
-      if (revoked) {
-        return new Response(JSON.stringify({ error: "Code Mode execution deadline expired; SDK access revoked" }), {
-          status: 408,
-          headers: { "Content-Type": "application/json" },
-        });
-      }
-      try {
-        const { method, args } = (await req.json()) as { method: string; args: any[] };
-        if (!methodNames.includes(method)) {
-          return new Response(JSON.stringify({ error: `Unknown SDK method: ${method}` }), {
-            status: 404,
-            headers: { "Content-Type": "application/json" },
-          });
-        }
-        const safeArgs = Array.isArray(args) ? JSON.parse(JSON.stringify(args)) : [];
-        const result = await sdk[method](...safeArgs);
-        if (revoked) {
-          return new Response(JSON.stringify({ error: "Code Mode execution deadline expired; SDK access revoked" }), {
-            status: 408,
-            headers: { "Content-Type": "application/json" },
-          });
-        }
-        return new Response(JSON.stringify({ ok: true, result: result ?? null }), {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-        });
-      } catch (err: any) {
-        return new Response(JSON.stringify({ error: err?.message || "SDK call failed" }), {
-          status: 500,
-          headers: { "Content-Type": "application/json" },
-        });
-      }
-    },
+  const dispatchSdk = async (method: string, args: any[]) => {
+    if (revoked) {
+      throw new Error("Code Mode execution deadline expired; SDK access revoked");
+    }
+    if (!methodNames.includes(method)) {
+      throw new Error(`Unknown SDK method: ${method}`);
+    }
+    const safeArgs = Array.isArray(args) ? JSON.parse(JSON.stringify(args)) : [];
+    const result = await sdk[method](...safeArgs);
+    if (revoked) {
+      throw new Error("Code Mode execution deadline expired; SDK access revoked");
+    }
+    return result === undefined ? null : JSON.parse(JSON.stringify(result));
   };
 
   const runId = `codemode-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+
+  let rpcArg: any = null;
+  let envBinding: any = null;
+  if (options.createWorkerSdkBinding) {
+    envBinding = await options.createWorkerSdkBinding(dispatchSdk, {
+      env: options.env,
+      ctx: options.ctx,
+      runId,
+    });
+  } else {
+    try {
+      const cfWorkersSpec = "cloudflare:" + "workers";
+      const cfWorkers: any = await import(/* @vite-ignore */ cfWorkersSpec);
+      if (cfWorkers && typeof cfWorkers.RpcTarget === "function") {
+        class CodeModeRpcBridge extends cfWorkers.RpcTarget {
+          async call(method: string, argsJson: string): Promise<string> {
+            const parsedArgs = JSON.parse(argsJson);
+            const res = await dispatchSdk(String(method), Array.isArray(parsedArgs) ? parsedArgs : []);
+            return JSON.stringify(res);
+          }
+        }
+        rpcArg = new CodeModeRpcBridge();
+      }
+    } catch {
+      // Not running inside workerd/Cloudflare Workers
+    }
+  }
+
   const workerModule = `
-export default {
-  async fetch(request, env) {
-    const methods = ${JSON.stringify(methodNames)};
-    const pod = Object.create(null);
-    for (const m of methods) {
-      pod[m] = async (...args) => {
-        const res = await env.POD_SDK.fetch("https://pod-sdk.internal/call", {
+import { WorkerEntrypoint } from "cloudflare:workers";
+
+function buildPod(bridge) {
+  const methods = ${JSON.stringify(methodNames)};
+  const pod = Object.create(null);
+  for (const m of methods) {
+    pod[m] = async (...args) => {
+      if (!bridge) throw new Error("POD_SDK bridge is unavailable in Dynamic Worker");
+      if (typeof bridge.call === "function") {
+        const raw = await bridge.call(m, JSON.stringify(args));
+        return JSON.parse(raw);
+      }
+      if (typeof bridge.fetch === "function") {
+        const res = await bridge.fetch("https://pod-sdk.internal/call", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ method: m, args }),
@@ -338,47 +450,72 @@ export default {
         const data = await res.json();
         if (!res.ok || data.error) throw new Error(data.error || "SDK call failed");
         return data.result;
-      };
-    }
-    Object.freeze(pod);
+      }
+      throw new Error("Unsupported POD_SDK bridge interface");
+    };
+  }
+  return Object.freeze(pod);
+}
+
+export default class CodeModeRunner extends WorkerEntrypoint {
+  async run(rpcBridge) {
+    const pod = buildPod(rpcBridge || (this.env && this.env.POD_SDK));
     try {
       const result = await (async (pod) => {
         ${code}
       })(pod);
-      return new Response(JSON.stringify({ ok: true, result: result ?? null }), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      });
+      return JSON.stringify({ ok: true, result: result === undefined ? null : result });
     } catch (err) {
-      return new Response(JSON.stringify({ ok: false, error: err && err.message ? err.message : String(err) }), {
-        status: 500,
-        headers: { "Content-Type": "application/json" },
-      });
+      return JSON.stringify({ ok: false, error: err && err.message ? err.message : String(err) });
     }
   }
-};
+
+  async fetch() {
+    const raw = await this.run(null);
+    const parsed = JSON.parse(raw);
+    return new Response(raw, {
+      status: parsed.ok ? 200 : 500,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+}
 `;
 
-  const worker = loader.get(runId, async () => ({
-    compatibilityDate: "2024-11-01",
-    mainModule: "index.mjs",
-    modules: { "index.mjs": workerModule },
+  const workerConfig = {
+    compatibilityDate: "2026-05-01",
+    mainModule: "worker.js",
+    modules: { "worker.js": workerModule },
     globalOutbound: null,
-    env: { POD_SDK: rpcBridge },
-  }));
+    ...(envBinding ? { env: { POD_SDK: envBinding } } : {}),
+  };
+
+  const worker =
+    typeof loader.load === "function"
+      ? loader.load(workerConfig)
+      : loader.get!(runId, async () => workerConfig);
 
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    const execPromise = worker
-      .getEntrypoint()
-      .fetch(new Request("https://sandbox.internal/run", { method: "POST" }))
-      .then(async (resp) => {
-        const data = (await resp.json()) as any;
-        if (!resp.ok || data.ok === false) {
-          throw new Error(data.error || "Code Mode execution failed");
-        }
-        return data.result;
-      });
+    const entrypoint: any = worker.getEntrypoint();
+    const execPromise =
+      rpcArg && typeof entrypoint.run === "function"
+        ? Promise.resolve(entrypoint.run(rpcArg)).then((raw: string) => {
+            const data = typeof raw === "string" ? JSON.parse(raw) : raw;
+            if (!data || data.ok === false) {
+              throw new Error(data?.error || "Code Mode execution failed");
+            }
+            return data.result;
+          })
+        : entrypoint
+            .fetch(new Request("https://sandbox.internal/run", { method: "POST" }))
+            .then(async (resp: Response) => {
+              const data = (await resp.json()) as any;
+              if (!resp.ok || data.ok === false) {
+                throw new Error(data.error || "Code Mode execution failed");
+              }
+              return data.result;
+            });
+
     const timeoutPromise = new Promise((_, reject) => {
       timer = setTimeout(() => {
         revoked = true;
@@ -393,25 +530,24 @@ export default {
 }
 
 /**
- * Isolated Node.js `worker_threads` Code Mode executor (hermetic tests & local Node runtime).
- * - Runs in a separate V8 isolate (`new Worker(..., { eval: true, env: {} })`) with empty `env` so
- *   host `process.env` secrets are physically absent from the isolate.
- * - Disables `fetch`, `WebSocket`, `XMLHttpRequest`, and blocks `node:http`/`node:https`/`node:net`
- *   in the isolate before evaluating user code.
- * - Bridges `pod.*` strictly through JSON-serialized `parentPort` messages; no host objects or
- *   constructors ever cross into the isolate.
- * - On timeout, revokes SDK access immediately and hard-terminates the worker thread (`worker.terminate()`),
- *   stopping both synchronous CPU loops and post-`await` work.
+ * OS-process-isolated Node.js Code Mode executor (hermetic tests & local Node runtime).
+ * Spawns a fresh `node --permission` subprocess with:
+ * - NO `--allow-fs-read`, NO `--allow-fs-write`, NO `--allow-net`, NO `--allow-child-process`, NO `--allow-worker`.
+ *   Even if untrusted code reaches `process.getBuiltinModule("node:fs")` or `node:http` / `node:net`,
+ *   the Node Permission Model rejects every filesystem read/write and network connection with `ERR_ACCESS_DENIED`.
+ * - Physically empty `env: {}` so host secrets are absent from the child process.
+ * - Strictly serialized JSON-lines IPC over stdin/stdout (zero shared V8 heap, zero outer-realm objects).
+ * - Hard `SIGKILL` + SDK revocation on deadline expiry, stopping both synchronous CPU loops and post-`await` work.
  */
-export async function executeInIsolatedWorkerThread(
+export async function executeInIsolatedNodeSubprocess(
   code: string,
   sdk: Record<string, (...args: any[]) => Promise<any> | any>,
   options: { timeoutMs: number }
 ): Promise<any> {
-  let wt: any;
+  let cp: any;
   try {
-    const spec = "node:" + "worker_threads";
-    wt = await import(/* @vite-ignore */ spec);
+    const spec = "node:" + "child_process";
+    cp = await import(/* @vite-ignore */ spec);
   } catch {
     throw new Error(
       "No Code Mode sandbox executor configured for this runtime. Bind a Cloudflare Dynamic Worker Loader (CODE_LOADER) or pass codeMode.executor."
@@ -420,103 +556,75 @@ export async function executeInIsolatedWorkerThread(
 
   const methodNames = Object.keys(sdk).filter((k) => typeof sdk[k] === "function");
 
-  const bootstrap = `
-const { parentPort, workerData } = require("node:worker_threads");
-const vm = require("node:vm");
-const Module = require("node:module");
+  // Child process runner: reads init payload on line 1 of stdin, then exchanges JSON-lines SDK RPC messages.
+  const childBootstrap = `
+const readline = process.getBuiltinModule("node:readline");
+const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+const writeMsg = (obj) => { process.stdout.write(JSON.stringify(obj) + "\\n"); };
 
-// Block all module loading from inside user code and disable network globals
-const origLoad = Module._load;
-Module._load = function() {
-  throw new Error("Sandbox policy violation: module loading is disabled");
-};
-try { Object.defineProperty(globalThis, "fetch", { value: undefined, writable: false, configurable: false }); } catch {}
-try { Object.defineProperty(globalThis, "WebSocket", { value: undefined, writable: false, configurable: false }); } catch {}
-try { Object.defineProperty(globalThis, "XMLHttpRequest", { value: undefined, writable: false, configurable: false }); } catch {}
-for (const k of Object.keys(process.env)) { delete process.env[k]; }
-
+let started = false;
 let nextCallId = 1;
 const pending = new Map();
-parentPort.on("message", (msg) => {
-  if (!msg || msg.type !== "sdk_response") return;
-  const entry = pending.get(msg.callId);
-  if (!entry) return;
-  pending.delete(msg.callId);
-  if (msg.ok) entry.resolve(msg.result);
-  else entry.reject(new Error(msg.error || "SDK call failed"));
-});
 
 function invokeSdk(method, args) {
   return new Promise((resolve, reject) => {
     const callId = nextCallId++;
     pending.set(callId, { resolve, reject });
-    let serializedArgs;
+    let safeArgs;
     try {
-      serializedArgs = JSON.parse(JSON.stringify(args));
+      safeArgs = JSON.parse(JSON.stringify(args));
     } catch {
       pending.delete(callId);
       reject(new Error("SDK arguments must be JSON-serializable"));
       return;
     }
-    parentPort.postMessage({ type: "sdk_call", callId, method, args: serializedArgs });
+    writeMsg({ type: "sdk_call", callId, method, args: safeArgs });
   });
 }
 
-// Create a fresh VM context inside the isolated worker thread with NO host constructors or globals injected.
-// User code only sees its own context's built-ins and a serialized JSON-RPC bridge function.
-const ctx = vm.createContext(
-  {
-    __invokeSdkJson: (method, argsJson) => {
-      const parsed = JSON.parse(argsJson);
-      return invokeSdk(String(method), Array.isArray(parsed) ? parsed : []).then((res) =>
-        JSON.stringify(res === undefined ? null : res)
-      );
-    },
-  },
-  { codeGeneration: { strings: false, wasm: false } }
-);
-
-const runnerSource = \`
-(async () => {
-  const __methods = \${JSON.stringify(workerData.methodNames)};
-  const pod = Object.create(null);
-  for (const m of __methods) {
-    pod[m] = async (...args) => {
-      const raw = await __invokeSdkJson(m, JSON.stringify(args));
-      return JSON.parse(raw);
-    };
+rl.on("line", (line) => {
+  if (!line.trim()) return;
+  let msg;
+  try { msg = JSON.parse(line); } catch { return; }
+  if (!started && msg.type === "init") {
+    started = true;
+    const pod = Object.create(null);
+    for (const m of msg.methodNames || []) {
+      pod[m] = (...args) => invokeSdk(m, args);
+    }
+    Object.freeze(pod);
+    const AsyncFunction = Object.getPrototypeOf(async function(){}).constructor;
+    Promise.resolve()
+      .then(() => new AsyncFunction("pod", msg.code)(pod))
+      .then((result) => {
+        writeMsg({ type: "done", ok: true, result: result === undefined ? null : JSON.parse(JSON.stringify(result)) });
+        process.exit(0);
+      })
+      .catch((err) => {
+        writeMsg({ type: "done", ok: false, error: err && err.message ? err.message : String(err) });
+        process.exit(0);
+      });
+    return;
   }
-  Object.freeze(pod);
-  const __result = await (async (pod) => {
-    \${workerData.code}
-  })(pod);
-  return JSON.stringify(__result === undefined ? null : __result);
-})()
-\`;
-
-(async () => {
-  try {
-    const script = new vm.Script(runnerSource, { filename: "code-mode-isolate.js" });
-    const resultJson = await script.runInContext(ctx);
-    parentPort.postMessage({ type: "done", ok: true, result: JSON.parse(resultJson) });
-  } catch (err) {
-    parentPort.postMessage({
-      type: "done",
-      ok: false,
-      error: err && err.message ? err.message : String(err),
-    });
+  if (msg.type === "sdk_response") {
+    const entry = pending.get(msg.callId);
+    if (!entry) return;
+    pending.delete(msg.callId);
+    if (msg.ok) entry.resolve(msg.result);
+    else entry.reject(new Error(msg.error || "SDK call failed"));
   }
-})();
+});
 `;
 
   return await new Promise((resolve, reject) => {
     let settled = false;
     let revoked = false;
+    let stdoutBuf = "";
+    let stderrBuf = "";
 
-    const worker = new wt.Worker(bootstrap, {
-      eval: true,
-      env: {}, // Physically empty environment — zero host secrets in the isolate
-      workerData: { code, methodNames },
+    const child = cp.spawn(process.execPath, ["--permission", "-e", childBootstrap], {
+      env: {}, // Physically empty environment — zero host secrets in child process
+      stdio: ["pipe", "pipe", "pipe"],
     });
 
     const finish = (err: Error | null, value?: any) => {
@@ -524,7 +632,9 @@ const runnerSource = \`
       settled = true;
       revoked = true;
       clearTimeout(timer);
-      worker.terminate().catch(() => {});
+      try {
+        child.kill("SIGKILL");
+      } catch {}
       if (err) reject(err);
       else resolve(value);
     };
@@ -534,8 +644,14 @@ const runnerSource = \`
       finish(new Error(`Code Mode execution timed out after ${options.timeoutMs}ms`));
     }, options.timeoutMs);
 
-    worker.on("message", async (msg: any) => {
-      if (!msg || typeof msg !== "object") return;
+    const handleLine = async (line: string) => {
+      if (!line.trim()) return;
+      let msg: any;
+      try {
+        msg = JSON.parse(line);
+      } catch {
+        return;
+      }
       if (msg.type === "done") {
         if (msg.ok) finish(null, msg.result);
         else finish(new Error(msg.error || "Code Mode execution failed"));
@@ -543,73 +659,97 @@ const runnerSource = \`
       }
       if (msg.type === "sdk_call") {
         if (revoked) {
-          worker.postMessage({
-            type: "sdk_response",
-            callId: msg.callId,
-            ok: false,
-            error: "Code Mode execution deadline expired; SDK access revoked",
-          });
           return;
         }
         const method = String(msg.method ?? "");
         if (!methodNames.includes(method)) {
-          worker.postMessage({
-            type: "sdk_response",
-            callId: msg.callId,
-            ok: false,
-            error: `Unknown SDK method: ${method}`,
-          });
+          try {
+            child.stdin.write(
+              JSON.stringify({ type: "sdk_response", callId: msg.callId, ok: false, error: `Unknown SDK method: ${method}` }) + "\n"
+            );
+          } catch {}
           return;
         }
         try {
           const safeArgs = Array.isArray(msg.args) ? msg.args : [];
           const result = await sdk[method](...safeArgs);
           if (revoked) return;
-          worker.postMessage({
-            type: "sdk_response",
-            callId: msg.callId,
-            ok: true,
-            result: result === undefined ? null : JSON.parse(JSON.stringify(result)),
-          });
+          child.stdin.write(
+            JSON.stringify({
+              type: "sdk_response",
+              callId: msg.callId,
+              ok: true,
+              result: result === undefined ? null : JSON.parse(JSON.stringify(result)),
+            }) + "\n"
+          );
         } catch (err: any) {
           if (revoked) return;
-          worker.postMessage({
-            type: "sdk_response",
-            callId: msg.callId,
-            ok: false,
-            error: err?.message || "SDK call failed",
-          });
+          try {
+            child.stdin.write(
+              JSON.stringify({ type: "sdk_response", callId: msg.callId, ok: false, error: err?.message || "SDK call failed" }) + "\n"
+            );
+          } catch {}
         }
+      }
+    };
+
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      stdoutBuf += chunk;
+      let idx: number;
+      while ((idx = stdoutBuf.indexOf("\n")) !== -1) {
+        const line = stdoutBuf.slice(0, idx);
+        stdoutBuf = stdoutBuf.slice(idx + 1);
+        void handleLine(line);
       }
     });
 
-    worker.on("error", (err: Error) => {
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk: string) => {
+      if (stderrBuf.length < 2048) stderrBuf += chunk;
+    });
+
+    child.on("error", (err: Error) => {
       finish(err);
     });
 
-    worker.on("exit", (exitCode: number) => {
+    child.on("exit", (exitCode: number | null) => {
       if (!settled) {
-        finish(new Error(`Code Mode isolate exited unexpectedly (code ${exitCode})`));
+        const detail = stderrBuf.trim() ? `: ${stderrBuf.trim().slice(0, 240)}` : "";
+        finish(new Error(`Code Mode isolate exited unexpectedly (code ${exitCode})${detail}`));
       }
     });
+
+    child.stdin.write(JSON.stringify({ type: "init", code, methodNames }) + "\n");
   });
 }
 
 /**
  * Default Code Mode executor: prefers Cloudflare Dynamic Worker Loader when bound on `env`,
- * otherwise falls back to an isolated, terminable Node.js `worker_threads` sandbox.
+ * otherwise falls back to an OS-isolated `node --permission` subprocess.
  */
 export async function defaultIsolatedCodeExecutor(
   code: string,
   sdk: Record<string, (...args: any[]) => Promise<any> | any>,
-  options: { timeoutMs: number; env?: any; workerLoaderBinding?: string }
+  options: {
+    timeoutMs: number;
+    env?: any;
+    ctx?: any;
+    workerLoaderBinding?: string;
+    createWorkerSdkBinding?: CodeModeOptions["createWorkerSdkBinding"];
+  }
 ): Promise<any> {
   const bindingName = options.workerLoaderBinding || "CODE_LOADER";
   const loader = options.env?.[bindingName] as DynamicWorkerLoaderLike | undefined;
-  if (loader && typeof loader.get === "function") {
-    return executeInDynamicWorkerLoader(loader, code, sdk, { timeoutMs: options.timeoutMs });
+  if (loader && (typeof loader.load === "function" || typeof loader.get === "function")) {
+    return executeInDynamicWorkerLoader(loader, code, sdk, {
+      timeoutMs: options.timeoutMs,
+      env: options.env,
+      ctx: options.ctx,
+      createWorkerSdkBinding: options.createWorkerSdkBinding,
+    });
   }
-  return executeInIsolatedWorkerThread(code, sdk, { timeoutMs: options.timeoutMs });
+  return executeInIsolatedNodeSubprocess(code, sdk, { timeoutMs: options.timeoutMs });
 }
 
 /**
@@ -763,16 +903,29 @@ export function buildCodeModeTools(options: CodeModeOptions): McpToolDefinition[
         }
         const sdk = options.createSdk(ctx);
         const value = options.executor
-          ? await options.executor(code, sdk, { timeoutMs, env: ctx.env })
+          ? await options.executor(code, sdk, { timeoutMs, env: ctx.env, ctx: ctx.ctx })
           : await defaultIsolatedCodeExecutor(code, sdk, {
               timeoutMs,
               env: ctx.env,
+              ctx: ctx.ctx,
               workerLoaderBinding: options.workerLoaderBinding,
+              createWorkerSdkBinding: options.createWorkerSdkBinding,
             });
         return { ok: true, result: value ?? null };
       },
     },
   ];
+}
+
+/**
+ * Decorates a JSON-RPC result object with `resultType: "complete"` when responding on MCP v2 (`2026-07-28`).
+ * Always enforces `resultType: "complete"` after spread so caller payloads cannot override the discriminator.
+ */
+function formatVersionedResult(protocolVersion: string, payload: Record<string, any>): Record<string, any> {
+  if (protocolVersion === MCP_V2_PROTOCOL_VERSION) {
+    return { ...payload, resultType: "complete" };
+  }
+  return payload;
 }
 
 /**
@@ -845,6 +998,7 @@ export function createEdgeMcpHandler(options: EdgeMcpServerOptions) {
     body: any,
     request: Request,
     env: any,
+    execCtx: any,
     protocolVersion: string
   ): Promise<{ status: number; response: JsonRpcResponse | null; negotiatedVersion?: string }> {
     if (!body || typeof body !== "object" || Array.isArray(body)) {
@@ -875,7 +1029,7 @@ export function createEdgeMcpHandler(options: EdgeMcpServerOptions) {
     }
 
     if (rawParams !== undefined && (rawParams === null || typeof rawParams !== "object" || Array.isArray(rawParams))) {
-      if (!hasId) return { status: 204, response: null };
+      if (!hasId) return { status: 202, response: null };
       return {
         status: 400,
         response: {
@@ -888,9 +1042,9 @@ export function createEdgeMcpHandler(options: EdgeMcpServerOptions) {
 
     const params: Record<string, any> = rawParams ?? {};
 
-    // Per JSON-RPC 2.0, any message without an `id` member is a notification and receives no response.
+    // Per JSON-RPC 2.0 & MCP 2026-07-28 Streamable HTTP: any message without `id` is a notification -> 202 Accepted, no body.
     if (!hasId) {
-      return { status: 204, response: null };
+      return { status: 202, response: null };
     }
 
     // 1. MCP v2 mandatory `server/discover`
@@ -900,16 +1054,16 @@ export function createEdgeMcpHandler(options: EdgeMcpServerOptions) {
         response: {
           jsonrpc: "2.0",
           id,
-          result: {
+          result: formatVersionedResult(MCP_V2_PROTOCOL_VERSION, {
             protocolVersion: MCP_V2_PROTOCOL_VERSION,
-            supportedProtocolVersions: [...SUPPORTED_PROTOCOL_VERSIONS],
+            supportedVersions: [...SUPPORTED_PROTOCOL_VERSIONS],
             capabilities: buildCapabilities(),
             serverInfo: {
               name: podName,
               role: podRole,
               version,
             },
-          },
+          }),
         },
       };
     }
@@ -926,7 +1080,7 @@ export function createEdgeMcpHandler(options: EdgeMcpServerOptions) {
             error: {
               code: -32602,
               message: `Unsupported protocolVersion '${requested}'. Supported: ${SUPPORTED_PROTOCOL_VERSIONS.join(", ")}`,
-              data: { supportedProtocolVersions: [...SUPPORTED_PROTOCOL_VERSIONS] },
+              data: { supportedVersions: [...SUPPORTED_PROTOCOL_VERSIONS] },
             },
           },
         };
@@ -937,16 +1091,16 @@ export function createEdgeMcpHandler(options: EdgeMcpServerOptions) {
         response: {
           jsonrpc: "2.0",
           id,
-          result: {
+          result: formatVersionedResult(requested, {
             protocolVersion: requested,
-            supportedProtocolVersions: [...SUPPORTED_PROTOCOL_VERSIONS],
+            supportedVersions: [...SUPPORTED_PROTOCOL_VERSIONS],
             capabilities: buildCapabilities(),
             serverInfo: {
               name: podName,
               role: podRole,
               version,
             },
-          },
+          }),
         },
       };
     }
@@ -955,7 +1109,7 @@ export function createEdgeMcpHandler(options: EdgeMcpServerOptions) {
     if (rpcMethod === "ping") {
       return {
         status: 200,
-        response: { jsonrpc: "2.0", id, result: {} },
+        response: { jsonrpc: "2.0", id, result: formatVersionedResult(protocolVersion, {}) },
       };
     }
 
@@ -971,7 +1125,7 @@ export function createEdgeMcpHandler(options: EdgeMcpServerOptions) {
         response: {
           jsonrpc: "2.0",
           id,
-          result: { tools: toolSummaries },
+          result: formatVersionedResult(protocolVersion, { tools: toolSummaries }),
         },
       };
     }
@@ -979,6 +1133,7 @@ export function createEdgeMcpHandler(options: EdgeMcpServerOptions) {
     const context: McpToolContext = {
       request,
       env,
+      ctx: execCtx,
       podName,
       podRole,
       now: Date.now(),
@@ -1020,9 +1175,9 @@ export function createEdgeMcpHandler(options: EdgeMcpServerOptions) {
           response: {
             jsonrpc: "2.0",
             id,
-            result: {
+            result: formatVersionedResult(protocolVersion, {
               content: [{ type: "text", text: textContent }],
-            },
+            }),
           },
         };
       } catch (err: any) {
@@ -1041,7 +1196,10 @@ export function createEdgeMcpHandler(options: EdgeMcpServerOptions) {
     if (rpcMethod === "tasks/list" && tasks) {
       try {
         const res = await tasks.list(params, context);
-        return { status: 200, response: { jsonrpc: "2.0", id, result: res } };
+        return {
+          status: 200,
+          response: { jsonrpc: "2.0", id, result: formatVersionedResult(protocolVersion, res) },
+        };
       } catch (err: any) {
         return {
           status: 500,
@@ -1071,10 +1229,7 @@ export function createEdgeMcpHandler(options: EdgeMcpServerOptions) {
           response: {
             jsonrpc: "2.0",
             id,
-            result: {
-              resultType: detail.resultType ?? "complete",
-              ...detail,
-            },
+            result: formatVersionedResult(protocolVersion, { ...detail }),
           },
         };
       } catch (err: any) {
@@ -1100,10 +1255,7 @@ export function createEdgeMcpHandler(options: EdgeMcpServerOptions) {
           response: {
             jsonrpc: "2.0",
             id,
-            result: {
-              resultType: detail.resultType ?? "cancelled",
-              ...detail,
-            },
+            result: formatVersionedResult(protocolVersion, detail && typeof detail === "object" ? { ...detail } : {}),
           },
         };
       } catch (err: any) {
@@ -1122,7 +1274,10 @@ export function createEdgeMcpHandler(options: EdgeMcpServerOptions) {
         ...(r.description ? { description: r.description } : {}),
         ...(r.mimeType ? { mimeType: r.mimeType } : {}),
       }));
-      return { status: 200, response: { jsonrpc: "2.0", id, result: { resources: list } } };
+      return {
+        status: 200,
+        response: { jsonrpc: "2.0", id, result: formatVersionedResult(protocolVersion, { resources: list }) },
+      };
     }
 
     if (rpcMethod === "resources/read") {
@@ -1145,7 +1300,7 @@ export function createEdgeMcpHandler(options: EdgeMcpServerOptions) {
           response: {
             jsonrpc: "2.0",
             id,
-            result: {
+            result: formatVersionedResult(protocolVersion, {
               contents: [
                 {
                   uri: resource.uri,
@@ -1154,7 +1309,7 @@ export function createEdgeMcpHandler(options: EdgeMcpServerOptions) {
                   ...(content.blob !== undefined ? { blob: content.blob } : {}),
                 },
               ],
-            },
+            }),
           },
         };
       } catch (err: any) {
@@ -1176,13 +1331,13 @@ export function createEdgeMcpHandler(options: EdgeMcpServerOptions) {
     };
   }
 
-  return async function handleMcpRequest(request: Request, env?: any): Promise<Response> {
+  return async function handleMcpRequest(request: Request, env?: any, execCtx?: any): Promise<Response> {
     const method = request.method;
 
     const baseCorsHeaders = {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization, Mcp-Version, MCP-Protocol-Version, MCP-Method, MCP-Tool-Name",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization, Mcp-Version, MCP-Protocol-Version, Mcp-Method, Mcp-Name",
     };
 
     if (method === "OPTIONS") {
@@ -1198,7 +1353,7 @@ export function createEdgeMcpHandler(options: EdgeMcpServerOptions) {
           error: {
             code: -32600,
             message: versionCheck.message,
-            data: { supportedProtocolVersions: [...SUPPORTED_PROTOCOL_VERSIONS] },
+            data: { supportedVersions: [...SUPPORTED_PROTOCOL_VERSIONS] },
           },
         }),
         { status: versionCheck.status, headers: { ...baseCorsHeaders, "Content-Type": "application/json" } }
@@ -1231,7 +1386,7 @@ export function createEdgeMcpHandler(options: EdgeMcpServerOptions) {
         JSON.stringify(
           {
             mcpVersion: protocolVersion,
-            supportedProtocolVersions: [...SUPPORTED_PROTOCOL_VERSIONS],
+            supportedVersions: [...SUPPORTED_PROTOCOL_VERSIONS],
             server: {
               name: podName,
               role: podRole,
@@ -1281,14 +1436,18 @@ export function createEdgeMcpHandler(options: EdgeMcpServerOptions) {
       );
     }
 
-    // Validate routing headers against JSON-RPC body before dispatch
-    const routeCheck = validateRoutingHeaders(request, body);
+    // Validate routing headers (`Mcp-Method`, `Mcp-Name`, `_meta.protocolVersion`) before dispatch
+    const routeCheck = validateRoutingHeaders(request, body, protocolVersion);
     if (!routeCheck.ok) {
       return new Response(
         JSON.stringify({
           jsonrpc: "2.0",
           id: body && typeof body === "object" && !Array.isArray(body) && Object.prototype.hasOwnProperty.call(body, "id") ? body.id : null,
-          error: { code: -32600, message: routeCheck.message },
+          error: {
+            code: routeCheck.code,
+            message: routeCheck.message,
+            data: { error: routeCheck.errorName },
+          },
         }),
         { status: routeCheck.status, headers: makeHeaders(protocolVersion) }
       );
@@ -1309,7 +1468,7 @@ export function createEdgeMcpHandler(options: EdgeMcpServerOptions) {
       const settled = await Promise.all(
         body.map(async (reqItem) => {
           try {
-            return await processSingleRpc(reqItem, request, env, protocolVersion);
+            return await processSingleRpc(reqItem, request, env, execCtx, protocolVersion);
           } catch (err: any) {
             return {
               status: 500,
@@ -1324,7 +1483,7 @@ export function createEdgeMcpHandler(options: EdgeMcpServerOptions) {
       );
       const responses = settled.map((s) => s.response).filter((r): r is JsonRpcResponse => r !== null);
       if (responses.length === 0) {
-        return new Response(null, { status: 204, headers: makeHeaders(protocolVersion) });
+        return new Response(null, { status: 202, headers: makeHeaders(protocolVersion) });
       }
       return new Response(JSON.stringify(responses), {
         status: 200,
@@ -1332,10 +1491,10 @@ export function createEdgeMcpHandler(options: EdgeMcpServerOptions) {
       });
     }
 
-    const { status, response, negotiatedVersion } = await processSingleRpc(body, request, env, protocolVersion);
+    const { status, response, negotiatedVersion } = await processSingleRpc(body, request, env, execCtx, protocolVersion);
     const effectiveVersion = negotiatedVersion ?? protocolVersion;
     if (response === null) {
-      return new Response(null, { status: 204, headers: makeHeaders(effectiveVersion) });
+      return new Response(null, { status: 202, headers: makeHeaders(effectiveVersion) });
     }
     return new Response(JSON.stringify(response), {
       status,
