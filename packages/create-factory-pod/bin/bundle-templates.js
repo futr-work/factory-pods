@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 const pkgRoot = resolve(fileURLToPath(new URL(".", import.meta.url)), "..");
 const repoRoot = resolve(pkgRoot, "..", "..");
 const out = join(pkgRoot, "templates");
-const TEMPLATES = ["starter", "model-governor", "sentinel-radar", "authority-seo"];
+const TEMPLATES = ["starter", "model-governor", "sentinel-radar", "authority-seo", "measurement"];
 
 rmSync(out, { recursive: true, force: true });
 mkdirSync(out, { recursive: true });
@@ -26,4 +26,5 @@ for (const name of TEMPLATES) {
 
 mkdirSync(join(out, "_support"), { recursive: true });
 cpSync(join(repoRoot, "tests", "support", "no-network.mjs"), join(out, "_support", "no-network.mjs"));
+cpSync(join(repoRoot, "tests", "support", "no-external-network.mjs"), join(out, "_support", "no-external-network.mjs"));
 console.log(`bundled ${TEMPLATES.length} templates into ${relative(repoRoot, out)}`);

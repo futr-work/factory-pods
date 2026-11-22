@@ -59,6 +59,7 @@ Every pod lives in `pods/<name>` and ships a `pod.toml` manifest that tests keep
 | [`model-governor`](pods/model-governor) | AI routing | Model radar: daily discovery of new models (OpenRouter, OrcaRouter), budget-capped capability probes, a stored daily usage analysis (calls, failures, p50/p95 latency, cost), plus 429 failover, cost telemetry and subscription routing advice. HTTP API; no MCP endpoint. |
 | [`sentinel-radar`](pods/sentinel-radar) | Sentinel | Proactive anomaly, AI-crawler and security probes. HTTP API; no MCP endpoint. |
 | [`authority-seo`](pods/authority-seo) | SEO governance | Site audits, AI-crawler robots.txt, Schema.org JSON-LD, metadata, IndexNow. |
+| [`measurement`](pods/measurement) | Measurement | Low-frequency typed evidence & time-series plane (SEO, analytics, decimal spend, telemetry rollups), MCP v2 + Code Mode, and Worldview-ready projection cursor. |
 
 ---
 
