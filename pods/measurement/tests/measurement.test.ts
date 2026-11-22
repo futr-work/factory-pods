@@ -525,7 +525,7 @@ describe("Measurement Pod — Typed 4-Family Vertical Slice, Isolation, MCP v2 +
         windowEnd: "2026-11-18T00:05:00Z",
         evidence: {
           evidenceId: "ev-tel-1",
-          uriPointer: "fixture://prom/2026-11-18T00:05Z.json",
+          uriPointer: "fixture://prom/2026-11-18T00-05Z.json",
           sha256: await sha256Hex("synthetic-prom"),
           byteSize: 14,
           mediaType: "application/json",
@@ -638,6 +638,221 @@ describe("Measurement Pod — Typed 4-Family Vertical Slice, Isolation, MCP v2 +
       assert.ok(eventsPage1.nextCursor >= 5);
       const eventsPage2 = (await (await h.call("GET", `/api/measurement/events?tenantId=tenant-alpha&since_cursor=${eventsPage1.nextCursor}&limit=50`, h.tokenA)).json()) as any;
       assert.ok(eventsPage2.events.some((e: any) => e.eventType === "annotation.recorded" && e.entityUrn === "site:tenant-alpha:site-alpha"));
+
+      // 8. Regression checks for verifier findings:
+      // 8a. Replaying an old partial page after successful completion is a true no-op (does not regress run status or cursor)
+      const cursorBeforeReplay = (await (await h.call("GET", "/api/measurement/events?tenantId=tenant-alpha&since_cursor=0&limit=500", h.tokenA)).json() as any).nextCursor;
+      const oldPartialReplay = await h.call("POST", "/api/measurement/ingest", h.tokenA, {
+        tenantId: "tenant-alpha",
+        resourceId: "site-alpha",
+        source: "gsc",
+        runId: "run-seo-1",
+        windowStart: "2026-11-18T00:00:00Z",
+        windowEnd: "2026-11-18T23:59:59Z",
+        cursor: "page=2",
+        evidence: {
+          evidenceId: "ev-seo-1",
+          uriPointer: "fixture://gsc/alpha.test/2026-11-18-p1.json",
+          sha256: seoFixtureSha,
+          byteSize: 26,
+          mediaType: "application/json",
+          privacyClass: "internal",
+          retentionClass: "90d",
+          collectedAt: "2026-11-20T01:00:00Z",
+          sourceAsOf: "2026-11-19T00:00:00Z",
+          adapterName: "gsc-fixture",
+          adapterVersion: "1.0.0",
+        },
+        observations: [
+          {
+            metricId: "gsc.impressions",
+            definitionVersion: "v1",
+            windowStart: "2026-11-18T00:00:00Z",
+            windowEnd: "2026-11-18T23:59:59Z",
+            windowTz: "UTC",
+            grain: "daily",
+            dimensions: { page: "/guide", query: "best guide", country: "USA", device: "MOBILE", searchType: "WEB" },
+            valueNum: 120,
+            interpretationVersion: "interp-1",
+            sourceRevision: 1,
+            sourceAsOf: "2026-11-19T00:00:00Z",
+            idempotencyKey: "seo-alpha-20261118-rev1-p1",
+          },
+        ],
+        coverage: {
+          status: "partial",
+          expectedCadenceSec: 86400,
+          expectedLagSec: 172800,
+          sourceTotalText: "200",
+          interpretedTotalText: "120",
+          discrepancyText: "80",
+          reconciliationStatus: "mismatch",
+        },
+      });
+      assert.equal(oldPartialReplay.status, 200);
+      assert.equal(((await oldPartialReplay.json()) as any).replayedNoop, 1);
+      const runAfterReplay = (await (await h.call("GET", "/api/measurement/runs/run-seo-1?tenantId=tenant-alpha", h.tokenA)).json()) as any;
+      assert.equal(runAfterReplay.status, "succeeded");
+      const cursorAfterReplay = (await (await h.call("GET", "/api/measurement/events?tenantId=tenant-alpha&since_cursor=0&limit=500", h.tokenA)).json() as any).nextCursor;
+      assert.equal(cursorAfterReplay, cursorBeforeReplay);
+
+      // 8b. Recording a failed attempt emits a run.updated event to the delta feed
+      assert.equal(
+        (await h.call("POST", "/api/measurement/runs/run-seo-1/attempts", h.tokenA, {
+          tenantId: "tenant-alpha",
+          status: "failed",
+          errorClass: "upstream_503",
+        })).status,
+        201
+      );
+      const deltaAfterAttempt = (await (await h.call("GET", `/api/measurement/events?tenantId=tenant-alpha&since_cursor=${cursorAfterReplay}`, h.tokenA)).json()) as any;
+      assert.ok(deltaAfterAttempt.events.some((e: any) => e.eventType === "run.updated" && e.payload.status === "failed"));
+
+      // 8c. Independent sources (GSC vs Bing) and currencies (USD vs EUR) never collapse into one revision/lineage and mark comparable=false
+      const bingRun = await h.call("POST", "/api/measurement/runs", h.tokenA, {
+        runId: "run-bing-1",
+        tenantId: "tenant-alpha",
+        resourceId: "site-alpha",
+        source: "bing",
+        sourceResourceId: "bing:alpha.test",
+        idempotencyKey: "run-bing-2026-11-18",
+        windowStart: "2026-11-18T00:00:00Z",
+        windowEnd: "2026-11-18T23:59:59Z",
+      });
+      assert.equal(bingRun.status, 201);
+      assert.equal(
+        (await h.call("POST", "/api/measurement/ingest", h.tokenA, {
+          tenantId: "tenant-alpha",
+          resourceId: "site-alpha",
+          source: "bing",
+          runId: "run-bing-1",
+          windowStart: "2026-11-18T00:00:00Z",
+          windowEnd: "2026-11-18T23:59:59Z",
+          evidence: {
+            evidenceId: "ev-bing-1",
+            uriPointer: "fixture://bing/alpha.test/2026-11-18.json",
+            sha256: await sha256Hex("synthetic-bing-bytes"),
+            byteSize: 20,
+            mediaType: "application/json",
+            privacyClass: "internal",
+            retentionClass: "90d",
+            collectedAt: "2026-11-20T02:00:00Z",
+            sourceAsOf: "2026-11-19T00:00:00Z",
+            adapterName: "bing-fixture",
+            adapterVersion: "1.0.0",
+          },
+          observations: [
+            {
+              metricId: "gsc.impressions",
+              definitionVersion: "v1",
+              windowStart: "2026-11-18T00:00:00Z",
+              windowEnd: "2026-11-18T23:59:59Z",
+              windowTz: "UTC",
+              grain: "daily",
+              dimensions: { page: "/guide", query: "best guide", country: "USA", device: "MOBILE", searchType: "WEB" },
+              valueNum: 33,
+              interpretationVersion: "interp-1",
+              sourceRevision: 1,
+              sourceAsOf: "2026-11-19T00:00:00Z",
+              idempotencyKey: "bing-alpha-20261118-rev1",
+            },
+          ],
+          coverage: { status: "successful", reconciliationStatus: "matched" },
+        })).status,
+        200
+      );
+      const multiSourceSeries = (await (await h.call("GET", "/api/measurement/series?tenantId=tenant-alpha&resourceId=site-alpha&metricId=gsc.impressions", h.tokenA)).json()) as any;
+      assert.equal(multiSourceSeries.points.length, 2);
+      assert.equal(multiSourceSeries.comparable, false);
+
+      // 8d. Rejects embedded data: URI evidence pointers, contradicting gaugeReducer, and altered analytics numeratorRule
+      assert.equal(
+        (await h.call("POST", "/api/measurement/ingest", h.tokenA, {
+          tenantId: "tenant-alpha",
+          resourceId: "site-alpha",
+          source: "gsc",
+          runId: "run-seo-1",
+          windowStart: "2026-11-18T00:00:00Z",
+          windowEnd: "2026-11-18T23:59:59Z",
+          evidence: {
+            evidenceId: "ev-data-uri",
+            uriPointer: "data:text/plain,api_key=sk_test_12345",
+            sha256: await sha256Hex("data-uri"),
+            byteSize: 10,
+            mediaType: "text/plain",
+            privacyClass: "internal",
+            retentionClass: "30d",
+            collectedAt: "2026-11-20T00:00:00Z",
+            sourceAsOf: "2026-11-19T00:00:00Z",
+            adapterName: "gsc-fixture",
+            adapterVersion: "1.0.0",
+          },
+          observations: [],
+        })).status,
+        400
+      );
+
+      assert.equal(
+        (await h.call("POST", "/api/measurement/definitions", h.tokenA, {
+          tenantId: "tenant-alpha",
+          metricId: "ga4.qualified_conversion_rate",
+          version: "v1",
+          family: "analytics",
+          unit: "ratio",
+          valueType: "decimal_string",
+          grain: "daily",
+          windowTz: "America/Los_Angeles",
+          dimensionsSchema: { channel: { type: "string", required: true } },
+          numeratorRule: "changed_rule",
+          denominatorRule: "eligible_consented_sessions",
+          exclusionsRule: "exclude_bots_and_unconsented",
+          aggregationRule: "ratio_from_totals",
+        })).status,
+        409
+      );
+
+      assert.equal(
+        (await h.call("POST", "/api/measurement/ingest", h.tokenA, {
+          tenantId: "tenant-alpha",
+          resourceId: "svc-alpha",
+          source: "prometheus-rollup",
+          runId: "run-tel-1",
+          windowStart: "2026-11-18T00:00:00Z",
+          windowEnd: "2026-11-18T00:05:00Z",
+          evidence: {
+            evidenceId: "ev-tel-1",
+            uriPointer: "fixture://prom/2026-11-18T00-05Z.json",
+            sha256: await sha256Hex("synthetic-prom"),
+            byteSize: 14,
+            mediaType: "application/json",
+            privacyClass: "internal",
+            retentionClass: "30d",
+            collectedAt: "2026-11-18T00:05:10Z",
+            sourceAsOf: "2026-11-18T00:05:00Z",
+            adapterName: "prom-rollup-fixture",
+            adapterVersion: "1.0.0",
+          },
+          observations: [
+            {
+              metricId: "server.cpu_utilization",
+              definitionVersion: "v1",
+              windowStart: "2026-11-18T00:00:00Z",
+              windowEnd: "2026-11-18T00:05:00Z",
+              windowTz: "UTC",
+              grain: "5m_rollup",
+              dimensions: { host: "edge-01" },
+              valueNum: 50,
+              sampleTime: "2026-11-18T00:05:00Z",
+              gaugeReducer: "mean", // contradicts definition 'last'
+              interpretationVersion: "interp-1",
+              sourceRevision: 1,
+              sourceAsOf: "2026-11-18T00:05:00Z",
+              idempotencyKey: "tel-cpu-bad-reducer",
+            },
+          ],
+        })).status,
+        400
+      );
     } finally {
       h.cleanup();
     }
@@ -741,6 +956,92 @@ describe("Measurement Pod — Typed 4-Family Vertical Slice, Isolation, MCP v2 +
       const cmSearchJson = (await cmSearch.json()) as any;
       const parsedSearch = JSON.parse(cmSearchJson.result.content[0].text);
       assert.equal(parsedSearch.entries[0].name, "queryEvents");
+
+      // Ungranted hub token cannot bypass tenant grants via /api/task
+      const hubTaskBypass = await h.call("POST", "/api/task", h.hubToken, {
+        topic: "measurement.register",
+        spec: {
+          tenantId: "tenant-beta",
+          resourceId: "site-hub-bypass",
+          resourceType: "site",
+          sourceResourceId: "sc-domain:bypass.test",
+          activeFrom: "2026-01-01",
+        },
+      });
+      assert.equal(hubTaskBypass.status, 401);
+
+      // Tenant-scoped definitions do not leak across tenants (tenant-b can define same metricId independently)
+      assert.equal(
+        (await h.call("POST", "/api/measurement/definitions", h.tokenA, {
+          tenantId: "tenant-alpha",
+          metricId: "shared.name",
+          version: "v1",
+          family: "seo",
+          unit: "clicks",
+          valueType: "integer",
+          grain: "daily",
+          windowTz: "UTC",
+          dimensionsSchema: {},
+          aggregationRule: "sum",
+        })).status,
+        201
+      );
+      assert.equal(
+        (await h.call("POST", "/api/measurement/definitions", h.tokenB, {
+          tenantId: "tenant-beta",
+          metricId: "shared.name",
+          version: "v1",
+          family: "analytics",
+          unit: "sessions",
+          valueType: "integer",
+          grain: "daily",
+          windowTz: "UTC",
+          dimensionsSchema: {},
+          aggregationRule: "sum",
+        })).status,
+        201
+      );
+
+      // MCP task isolation: caller B submits a task; caller A cannot list, get, cancel, or fetch receipt for it
+      const subB = await h.call(
+        "POST",
+        "/mcp",
+        h.tokenB,
+        {
+          jsonrpc: "2.0",
+          id: "sub-b",
+          method: "tools/call",
+          params: { name: "submit_task", arguments: { repo: "org/b", issue: 1, requestId: "req-b-1" } },
+        },
+        { "MCP-Protocol-Version": "2026-07-28" }
+      );
+      assert.equal(subB.status, 200);
+      const taskIdB = JSON.parse(((await subB.json()) as any).result.content[0].text).taskId;
+
+      const listA = (await (
+        await h.call("POST", "/mcp", h.tokenA, { jsonrpc: "2.0", id: "la", method: "tasks/list" }, { "MCP-Protocol-Version": "2026-07-28" })
+      ).json()) as any;
+      assert.equal(listA.result.tasks.length, 0);
+
+      const cancelCross = await h.call(
+        "POST",
+        "/mcp",
+        h.tokenA,
+        { jsonrpc: "2.0", id: "ca", method: "tasks/cancel", params: { taskId: taskIdB } },
+        { "MCP-Protocol-Version": "2026-07-28" }
+      );
+      assert.equal(cancelCross.status, 500);
+
+      // get_receipt for nonexistent or unfinished task fails rather than fabricating PASS checks
+      const fakeReceipt = await h.call(
+        "POST",
+        "/mcp",
+        h.tokenB,
+        { jsonrpc: "2.0", id: "rc1", method: "tools/call", params: { name: "get_receipt", arguments: { taskId: "nonexistent-task" } } },
+        { "MCP-Protocol-Version": "2026-07-28" }
+      );
+      assert.equal(fakeReceipt.status, 500);
+      assert.match(((await fakeReceipt.json()) as any).error.message, /not found/i);
     } finally {
       h.cleanup();
     }
@@ -753,6 +1054,7 @@ describe("Measurement Pod — Typed 4-Family Vertical Slice, Isolation, MCP v2 +
       const t0 = Date.now();
 
       await svc.defineMetric({
+        tenantId: "tenant-cap",
         metricId: "portfolio.impressions",
         version: "v1",
         family: "seo",

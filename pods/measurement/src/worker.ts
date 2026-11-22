@@ -119,14 +119,13 @@ export default {
           return jsonResponse(result, 201);
         }
 
-        // POST /api/measurement/definitions
+        // POST /api/measurement/definitions (tenant-scoped catalog)
         if (method === "POST" && url.pathname === "/api/measurement/definitions") {
           const body = await parseJsonBody(request);
           const tenantId = typeof body.tenantId === "string" ? body.tenantId.trim() : "";
           const { denied } = await resolveAndAuthorize(request, env, { tenantId, resourceId: "*", action: "write" });
           if (denied) return denied;
-          const { tenantId: _ignored, ...defInput } = body;
-          const result = await service.defineMetric(defInput as any);
+          const result = await service.defineMetric({ ...body, tenantId } as any);
           return jsonResponse(result, 201);
         }
 
@@ -339,16 +338,38 @@ export default {
         const taskId = typeof body.taskId === "string" && body.taskId ? body.taskId : `task_${Date.now()}`;
         const topic = typeof body.topic === "string" && body.topic ? body.topic : "measurement.coverage";
         const source = typeof body.source === "string" && body.source ? body.source : "api";
-        const spec = body.spec || {};
+        const spec = body.spec && typeof body.spec === "object" ? body.spec : {};
+        const payload = spec.payload && typeof spec.payload === "object" ? spec.payload : spec;
+        const action = spec.action || (topic.includes(".") ? topic.split(".")[1] : "coverage");
+
+        // Measurement domain tasks MUST carry a scoped caller credential with explicit tenant/resource/action grant.
+        // An ungranted shared hub token cannot read or write tenant measurement data via /api/task.
+        const isWriteAction = ["register", "register_resource", "define", "define_metric", "ingest", "record", "annotate"].includes(action);
+        const requiredAction = isWriteAction ? "write" : "read";
+        const targetTenantId = typeof payload.tenantId === "string" ? payload.tenantId.trim() : "";
+        const targetResourceId =
+          action === "define" || action === "define_metric"
+            ? "*"
+            : typeof payload.resourceId === "string" && payload.resourceId.trim()
+              ? payload.resourceId.trim()
+              : undefined;
+
+        const { caller, denied: taskDenied } = await resolveAndAuthorize(request, env, {
+          tenantId: targetTenantId,
+          resourceId: targetResourceId,
+          action: requiredAction,
+        });
+        if (taskDenied) return taskDenied;
+
         const now = Date.now();
         const leaseExpiresAt = now + 15 * 60 * 1000;
 
         const insertRes = await db
           .prepare(
-            `INSERT INTO tasks (task_id, topic, source, spec_json, status, lease_expires_at, retry_count, max_retries, created_at, updated_at)
-             VALUES (?, ?, ?, ?, 'running', ?, 0, 3, ?, ?)`
+            `INSERT INTO tasks (task_id, owner_id, topic, source, spec_json, status, lease_expires_at, retry_count, max_retries, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, 'running', ?, 0, 3, ?, ?)`
           )
-          .bind(taskId, topic, source, JSON.stringify(spec), leaseExpiresAt, now, now)
+          .bind(taskId, caller.callerId, topic, source, JSON.stringify(spec), leaseExpiresAt, now, now)
           .run();
 
         const taskRecord: TaskRecord = {

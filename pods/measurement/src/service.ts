@@ -69,8 +69,20 @@ const ANNOTATION_KINDS = new Set(["deploy", "fixpack", "config_change", "inciden
 const DECIMAL_RE = /^-?\d+(?:\.\d+)?$/;
 const SHA256_RE = /^[0-9a-f]{64}$/i;
 const CURRENCY_RE = /^[A-Z]{3}$/;
+const EVIDENCE_URI_RE = /^(?:fixture|r2|s3|gcs|evidence):\/\/[A-Za-z0-9._\-\/:]+$/;
 const MAX_BATCH_OBSERVATIONS = 500;
 const MAX_LIST_LIMIT = 500;
+
+function validateEvidencePointer(val: unknown): string {
+  const uri = requireNonEmptyString(val, "evidence.uriPointer", 512);
+  if (uri.includes("@") || uri.includes("?") || uri.includes("#") || uri.includes("..")) {
+    throw new ValidationError("evidence.uriPointer must be an opaque handle without credentials, query params, fragments, or path traversal");
+  }
+  if (!EVIDENCE_URI_RE.test(uri)) {
+    throw new ValidationError("evidence.uriPointer must use an allowed opaque scheme (fixture://, r2://, s3://, gcs://, evidence://); data: and inline payload URIs are forbidden");
+  }
+  return uri;
+}
 
 export function canonicalJson(value: unknown): string {
   if (value === null || typeof value !== "object") {
@@ -302,6 +314,7 @@ export class MeasurementService {
     assertAllowedKeys(
       raw as any,
       new Set([
+        "tenantId",
         "metricId",
         "version",
         "family",
@@ -319,6 +332,7 @@ export class MeasurementService {
       "definition"
     );
 
+    const tenantId = requireNonEmptyString(raw.tenantId, "tenantId", 128);
     const metricId = requireNonEmptyString(raw.metricId, "metricId", 128);
     const version = requireNonEmptyString(raw.version, "version", 64);
     const family = requireNonEmptyString(raw.family, "family", 32) as MetricFamily;
@@ -336,6 +350,9 @@ export class MeasurementService {
     const grain = requireNonEmptyString(raw.grain, "grain", 64);
     const windowTz = requireNonEmptyString(raw.windowTz, "windowTz", 64);
     const aggregationRule = requireNonEmptyString(raw.aggregationRule, "aggregationRule", 64);
+    if (valueType === "gauge" && !GAUGE_REDUCERS.has(aggregationRule)) {
+      throw new ValidationError(`Gauge definitions require aggregationRule in last|min|max|mean, got '${aggregationRule}'`);
+    }
 
     if (!raw.dimensionsSchema || typeof raw.dimensionsSchema !== "object" || Array.isArray(raw.dimensionsSchema)) {
       throw new ValidationError("Field 'dimensionsSchema' must be an object");
@@ -357,8 +374,8 @@ export class MeasurementService {
     const exclusionsRule = raw.exclusionsRule ?? null;
 
     const existing = await this.db
-      .prepare("SELECT * FROM ms_definitions WHERE metric_id = ? AND version = ?")
-      .bind(metricId, version)
+      .prepare("SELECT * FROM ms_definitions WHERE tenant_id = ? AND metric_id = ? AND version = ?")
+      .bind(tenantId, metricId, version)
       .first<any>();
 
     if (existing) {
@@ -369,12 +386,16 @@ export class MeasurementService {
         existing.grain === grain &&
         existing.window_tz === windowTz &&
         existing.dimensions_schema_json === dimensionsSchemaJson &&
+        existing.numerator_rule === numeratorRule &&
+        existing.denominator_rule === denominatorRule &&
+        existing.exclusions_rule === exclusionsRule &&
         existing.aggregation_rule === aggregationRule &&
         existing.comparability_key === comparabilityKey;
       if (!same) {
         throw new ConflictError(`Metric definition '${metricId}@${version}' already exists with different immutable semantics`);
       }
       return {
+        tenantId: existing.tenant_id,
         metricId: existing.metric_id,
         version: existing.version,
         family: existing.family,
@@ -395,12 +416,13 @@ export class MeasurementService {
     await this.db
       .prepare(
         `INSERT INTO ms_definitions (
-           metric_id, version, family, unit, value_type, grain, window_tz,
+           tenant_id, metric_id, version, family, unit, value_type, grain, window_tz,
            dimensions_schema_json, numerator_rule, denominator_rule, exclusions_rule,
            aggregation_rule, comparability_key, created_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .bind(
+        tenantId,
         metricId,
         version,
         family,
@@ -419,6 +441,7 @@ export class MeasurementService {
       .run();
 
     return {
+      tenantId,
       metricId,
       version,
       family,
@@ -554,6 +577,11 @@ export class MeasurementService {
       throw new NotFoundError(`Run '${runId}' not found for tenant '${tenantId}'`);
     }
 
+    const resource = await this.db
+      .prepare("SELECT entity_urn FROM ms_resources WHERE tenant_id = ? AND resource_id = ?")
+      .bind(tenantId, run.resource_id)
+      .first<any>();
+
     const countRow = await this.db
       .prepare("SELECT COUNT(*) as cnt FROM ms_attempts WHERE run_id = ?")
       .bind(runId)
@@ -562,6 +590,7 @@ export class MeasurementService {
     const attemptId = raw.attemptId ? requireNonEmptyString(raw.attemptId, "attemptId", 128) : `att_${crypto.randomUUID()}`;
     const finishedAt = status === "running" ? null : now;
     const nextRetryCount = status === "failed" || status === "partial" ? Number(run.retry_count) + 1 : Number(run.retry_count);
+    const nextCursor = raw.cursor ?? run.cursor ?? null;
 
     await this.db.batch([
       this.db
@@ -569,7 +598,7 @@ export class MeasurementService {
           `INSERT INTO ms_attempts (attempt_id, run_id, tenant_id, attempt_number, status, cursor, error_class, started_at, finished_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
         )
-        .bind(attemptId, runId, tenantId, attemptNumber, status, raw.cursor ?? run.cursor ?? null, raw.errorClass ?? null, now, finishedAt),
+        .bind(attemptId, runId, tenantId, attemptNumber, status, nextCursor, raw.errorClass ?? null, now, finishedAt),
       this.db
         .prepare(
           `UPDATE ms_runs
@@ -577,6 +606,18 @@ export class MeasurementService {
            WHERE run_id = ? AND tenant_id = ?`
         )
         .bind(status, raw.cursor ?? null, nextRetryCount, raw.errorClass ?? null, now, runId, tenantId),
+      this.db
+        .prepare(
+          `INSERT INTO ms_events (tenant_id, resource_id, entity_urn, event_type, payload_json, created_at)
+           VALUES (?, ?, ?, 'run.updated', ?, ?)`
+        )
+        .bind(
+          tenantId,
+          run.resource_id,
+          resource?.entity_urn ?? `site:${tenantId}:${run.resource_id}`,
+          JSON.stringify({ runId, attemptId, attemptNumber, source: run.source, status, cursor: nextCursor, errorClass: raw.errorClass ?? null }),
+          now
+        ),
     ]);
 
     return {
@@ -696,7 +737,7 @@ export class MeasurementService {
       "evidence"
     );
     const evidenceId = requireNonEmptyString(ev.evidenceId, "evidence.evidenceId", 128);
-    const uriPointer = requireNonEmptyString(ev.uriPointer, "evidence.uriPointer", 512);
+    const uriPointer = validateEvidencePointer(ev.uriPointer);
     const sha256 = requireNonEmptyString(ev.sha256, "evidence.sha256", 64).toLowerCase();
     if (!SHA256_RE.test(sha256)) {
       throw new ValidationError("evidence.sha256 must be a 64-char hex digest");
@@ -826,17 +867,18 @@ export class MeasurementService {
 
       const metricId = requireNonEmptyString(obs.metricId, `observations[${i}].metricId`, 128);
       const defVer = requireNonEmptyString(obs.definitionVersion, `observations[${i}].definitionVersion`, 64);
-      const defKey = `${metricId}@${defVer}`;
+      const defKey = `${tenantId}:${metricId}@${defVer}`;
       let def = defCache.get(defKey);
       if (!def) {
         const defRow = await this.db
-          .prepare("SELECT * FROM ms_definitions WHERE metric_id = ? AND version = ?")
-          .bind(metricId, defVer)
+          .prepare("SELECT * FROM ms_definitions WHERE tenant_id = ? AND metric_id = ? AND version = ?")
+          .bind(tenantId, metricId, defVer)
           .first<any>();
         if (!defRow) {
-          throw new ValidationError(`Unknown metric definition '${defKey}'`);
+          throw new ValidationError(`Unknown metric definition '${metricId}@${defVer}' for tenant '${tenantId}'`);
         }
         def = {
+          tenantId: defRow.tenant_id,
           metricId: defRow.metric_id,
           version: defRow.version,
           family: defRow.family,
@@ -892,6 +934,11 @@ export class MeasurementService {
         }
         if (!obs.gaugeReducer || !GAUGE_REDUCERS.has(obs.gaugeReducer)) {
           throw new ValidationError(`observations[${i}].gaugeReducer must be one of last|min|max|mean`);
+        }
+        if (obs.gaugeReducer !== def.aggregationRule) {
+          throw new ValidationError(
+            `observations[${i}].gaugeReducer '${obs.gaugeReducer}' contradicts metric definition aggregationRule '${def.aggregationRule}'`
+          );
         }
         valueNum = obs.valueNum;
       } else if (def.valueType === "counter") {
@@ -1017,8 +1064,54 @@ export class MeasurementService {
       }
     }
 
-    // Build single atomic batch transaction (evidence + observations + coverage + run update + projection events)
+    // Full-batch replay deduplication: if this exact ingest batch was already committed, return a true zero-mutation no-op
+    // so replaying an older partial page never regresses run status, rewinds cursor, overwrites coverage, or emits duplicate events.
+    const batchDigest = await sha256Hex(
+      canonicalJson({
+        tenantId,
+        resourceId,
+        source,
+        runId,
+        windowStart,
+        windowEnd,
+        cursor: raw.cursor ?? null,
+        runStatus: raw.runStatus ?? null,
+        evidenceId,
+        evidenceSha256: sha256,
+        coverage: coverage ?? null,
+        observationDigests: preparedObs.map((p) => ({
+          idempotencyKey: p.obs.idempotencyKey,
+          payloadDigest: p.payloadDigest,
+        })),
+      })
+    );
+
+    const existingBatch = await this.db
+      .prepare("SELECT * FROM ms_ingest_batches WHERE tenant_id = ? AND batch_digest = ?")
+      .bind(tenantId, batchDigest)
+      .first<any>();
+
+    if (existingBatch) {
+      return {
+        runId,
+        evidenceId,
+        inserted: 0,
+        replayedNoop: preparedObs.length,
+        coverageStatus: existingBatch.coverage_status ?? null,
+      };
+    }
+
+    // Build single atomic batch transaction (evidence + observations + coverage + run update + batch receipt + projection events)
     const statements = [];
+
+    statements.push(
+      this.db
+        .prepare(
+          `INSERT INTO ms_ingest_batches (tenant_id, batch_digest, run_id, evidence_id, observation_count, coverage_status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`
+        )
+        .bind(tenantId, batchDigest, runId, evidenceId, preparedObs.length, coverage?.status ?? null, now)
+    );
 
     if (!existingEv) {
       statements.push(
@@ -1280,13 +1373,18 @@ export class MeasurementService {
       .all<any>();
 
     const allRows = rowsRes.results || [];
-    const comparabilityKeys = [...new Set(allRows.map((r) => String(r.comparability_key)))].sort();
-    const comparable = comparabilityKeys.length <= 1;
+    const effectiveComparabilityKeys = [
+      ...new Set(
+        allRows.map((r) => `${String(r.comparability_key)}|source=${String(r.source)}|currency=${String(r.currency ?? "")}`)
+      ),
+    ].sort();
+    const comparable = effectiveComparabilityKeys.length <= 1;
 
-    // Group by (window_start, window_end, comparability_key, dimensions_hash) to resolve latest compatible revision + correction lineage
+    // Group by (window_start, window_end, source, currency, comparability_key, dimensions_hash)
+    // so independent sources (e.g. GSC vs Bing) or currencies (USD vs EUR) never collapse into a false correction lineage.
     const grouped = new Map<string, any[]>();
     for (const r of allRows) {
-      const key = `${r.window_start}|${r.window_end}|${r.comparability_key}|${r.dimensions_hash}`;
+      const key = `${r.window_start}|${r.window_end}|${r.source}|${r.currency ?? ""}|${r.comparability_key}|${r.dimensions_hash}`;
       const list = grouped.get(key) || [];
       list.push(r);
       grouped.set(key, list);
@@ -1318,8 +1416,8 @@ export class MeasurementService {
       resourceId,
       metricId,
       comparable,
-      comparabilityKeys,
-      ...(comparable ? {} : { incompatibilityReason: "Multiple incompatible metric definition versions/units/windows/grains present; specify definitionVersion to compare" }),
+      comparabilityKeys: effectiveComparabilityKeys,
+      ...(comparable ? {} : { incompatibilityReason: "Multiple incompatible metric definition versions, sources, currencies, units, windows, or grains present; narrow filter to compare" }),
       points: paged,
       total: mapped.length,
       limit,

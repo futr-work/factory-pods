@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS pod_info (
 CREATE TABLE IF NOT EXISTS tasks (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   task_id TEXT UNIQUE NOT NULL,
+  owner_id TEXT NOT NULL DEFAULT 'hub',
   topic TEXT NOT NULL,
   source TEXT NOT NULL,
   spec_json TEXT NOT NULL,
@@ -79,8 +80,9 @@ CREATE TABLE IF NOT EXISTS ms_resources (
   PRIMARY KEY (tenant_id, resource_id)
 );
 
--- 2. Versioned Metric Definitions (explicit unit, grain, window timezone, dimensions, aggregation & comparability)
+-- 2. Tenant-Scoped Versioned Metric Definitions (explicit unit, grain, window timezone, dimensions, aggregation & comparability)
 CREATE TABLE IF NOT EXISTS ms_definitions (
+  tenant_id TEXT NOT NULL,
   metric_id TEXT NOT NULL,
   version TEXT NOT NULL,
   family TEXT NOT NULL CHECK (family IN ('seo', 'analytics', 'spend', 'telemetry')),
@@ -95,7 +97,7 @@ CREATE TABLE IF NOT EXISTS ms_definitions (
   aggregation_rule TEXT NOT NULL,
   comparability_key TEXT NOT NULL,
   created_at INTEGER NOT NULL,
-  PRIMARY KEY (metric_id, version)
+  PRIMARY KEY (tenant_id, metric_id, version)
 );
 
 -- 3. Collection Runs & Attempts (idempotent on tenant + idempotency_key)
@@ -197,9 +199,21 @@ CREATE TABLE IF NOT EXISTS ms_observations (
   created_at INTEGER NOT NULL,
   UNIQUE (tenant_id, idempotency_key),
   FOREIGN KEY (tenant_id, resource_id) REFERENCES ms_resources(tenant_id, resource_id) ON DELETE CASCADE,
-  FOREIGN KEY (metric_id, definition_version) REFERENCES ms_definitions(metric_id, version),
+  FOREIGN KEY (tenant_id, metric_id, definition_version) REFERENCES ms_definitions(tenant_id, metric_id, version),
   FOREIGN KEY (run_id) REFERENCES ms_runs(run_id) ON DELETE CASCADE,
   FOREIGN KEY (evidence_id) REFERENCES ms_evidence(evidence_id) ON DELETE CASCADE
+);
+
+-- 5b. Idempotent Ingest Batch Deduplication Ledger (prevents replaying old partial pages from regressing runs/coverage)
+CREATE TABLE IF NOT EXISTS ms_ingest_batches (
+  tenant_id TEXT NOT NULL,
+  batch_digest TEXT NOT NULL,
+  run_id TEXT NOT NULL,
+  evidence_id TEXT NOT NULL,
+  observation_count INTEGER NOT NULL,
+  coverage_status TEXT,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (tenant_id, batch_digest)
 );
 
 -- 6. Explicit Coverage & Source Reconciliation (missing never synthesizes zero)

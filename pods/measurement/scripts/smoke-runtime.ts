@@ -229,7 +229,7 @@ async function main() {
     ).json()) as any;
     assert.ok(events.events.length >= 5);
 
-    // 7. MCP v2 server/discover + Code Mode search over real loopback HTTP
+    // 7. MCP v2 server/discover + Code Mode search & execute over real loopback HTTP
     const mcpDiscover = await postJson(
       "/mcp",
       tokenA,
@@ -241,6 +241,36 @@ async function main() {
     assert.equal(mcpDiscoverJson.result.protocolVersion, "2026-07-28");
     assert.equal(mcpDiscoverJson.result.resultType, "complete");
 
+    const majorNode = Number.parseInt(String(process.versions?.node ?? "0").split(".")[0] || "0", 10);
+    let codeModeExecuted = false;
+    const cmExec = await postJson(
+      "/mcp",
+      tokenA,
+      {
+        jsonrpc: "2.0",
+        id: "smoke-cm1",
+        method: "tools/call",
+        params: {
+          name: "execute",
+          arguments: {
+            code: "const s = await pod.querySeries({ tenantId: 'tenant-a', resourceId: 'ads-a', metricId: 'ads.spend' }); return { spend: s.points[0].valueText, currency: s.points[0].currency };",
+          },
+        },
+      },
+      { "MCP-Protocol-Version": "2026-07-28", "Mcp-Method": "tools/call", "Mcp-Name": "execute" }
+    );
+    if (majorNode >= 26) {
+      assert.equal(cmExec.status, 200);
+      const cmJson = (await cmExec.json()) as any;
+      const cmOut = JSON.parse(cmJson.result.content[0].text);
+      assert.deepEqual(cmOut, { ok: true, result: { spend: "42.1950", currency: "USD" } });
+      codeModeExecuted = true;
+    } else {
+      assert.equal(cmExec.status, 500);
+      const cmErr = (await cmExec.json()) as any;
+      assert.match(cmErr.error.message, /requires Node >= 26/);
+    }
+
     console.log(
       JSON.stringify({
         ok: true,
@@ -251,6 +281,7 @@ async function main() {
         evidenceSha256: evMeta.sha256,
         eventsEmitted: events.events.length,
         mcpProtocol: mcpDiscoverJson.result.protocolVersion,
+        codeModeExecuted,
       })
     );
   } finally {

@@ -39,10 +39,10 @@ function resolveTemplate(template) {
   return null;
 }
 
-function resolveTestSupport(monorepo) {
+function resolveTestSupport(monorepo, filename = "no-network.mjs") {
   return monorepo
-    ? resolve(pkgRoot, "..", "..", "tests", "support", "no-network.mjs")
-    : join(pkgRoot, "templates", "_support", "no-network.mjs");
+    ? resolve(pkgRoot, "..", "..", "tests", "support", filename)
+    : join(pkgRoot, "templates", "_support", filename);
 }
 
 async function main() {
@@ -108,10 +108,14 @@ async function main() {
     },
   });
 
-  // Tests stay hermetic outside the monorepo: ship the network guard with the pod.
+  // Tests stay hermetic outside the monorepo: ship the network guards with the pod.
   const supportDir = join(destPath, "tests", "support");
   mkdirSync(supportDir, { recursive: true });
-  cpSync(resolveTestSupport(source.monorepo), join(supportDir, "no-network.mjs"));
+  cpSync(resolveTestSupport(source.monorepo, "no-network.mjs"), join(supportDir, "no-network.mjs"));
+  const extGuard = resolveTestSupport(source.monorepo, "no-external-network.mjs");
+  if (existsSync(extGuard)) {
+    cpSync(extGuard, join(supportDir, "no-external-network.mjs"));
+  }
 
   // Customize package.json
   const pkgPath = join(destPath, "package.json");
@@ -124,6 +128,12 @@ async function main() {
     deploy: "wrangler deploy",
     test: "tsx --import ./tests/support/no-network.mjs --test tests/**/*.test.ts",
   };
+  if (typeof pkg.scripts["smoke:runtime"] === "string") {
+    pkg.scripts["smoke:runtime"] = pkg.scripts["smoke:runtime"].replace(
+      "../../tests/support/no-external-network.mjs",
+      "./tests/support/no-external-network.mjs"
+    );
+  }
   delete pkg.scripts.scaffold;
   pkg.dependencies = {
     ...(pkg.dependencies || {}),

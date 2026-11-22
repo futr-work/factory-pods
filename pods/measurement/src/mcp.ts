@@ -1,5 +1,6 @@
 import { createEdgeMcpHandler, type McpToolDefinition } from "@futr-work/pod-kernel/edge-mcp";
 import {
+  authGate,
   isCallerAuthorized,
   parseScopedCallerGrants,
   resolveScopedCaller,
@@ -25,6 +26,35 @@ async function requireGrant(
     throw new Error("Forbidden: caller lacks tenant/resource grant for requested operation");
   }
   return caller;
+}
+
+/**
+ * Resolves the task owner principal for core MCP tools and `tasks/*` operations.
+ * - Scoped callers are isolated to their own `callerId` and require a `write` grant for mutations
+ *   (submit_task, approve, cancel, tasks/cancel).
+ * - The hub token resolves to owner `"hub"` (can only see/manage hub-owned tasks, never scoped-tenant tasks).
+ */
+async function resolveTaskPrincipal(
+  request: Request,
+  env: Record<string, any>,
+  mutation: boolean
+): Promise<{ ownerId: string }> {
+  const configured = parseScopedCallerGrants(env?.SCOPED_CALLER_GRANTS);
+  const scoped = await resolveScopedCaller(request, configured);
+  if (scoped) {
+    if (mutation) {
+      const hasAnyWrite = scoped.grants.some((g) => g.actions.includes("*") || g.actions.includes("write"));
+      if (!hasAnyWrite) {
+        throw new Error("Forbidden: read-only caller cannot mutate or cancel tasks");
+      }
+    }
+    return { ownerId: scoped.callerId };
+  }
+  const hubDenied = authGate(request, env as any, "measurement-pod");
+  if (!hubDenied) {
+    return { ownerId: "hub" };
+  }
+  throw new Error("Unauthorized: valid credential required");
 }
 
 export function createMeasurementMcpHandler(env: Record<string, any>, config: PodConfig) {
@@ -92,9 +122,8 @@ export function createMeasurementMcpHandler(env: Record<string, any>, config: Po
         required: ["tenantId", "metricId", "version", "family", "unit", "valueType", "grain", "windowTz", "dimensionsSchema", "aggregationRule"],
       },
       handler: async (args, ctx) => {
-        const { tenantId, ...defInput } = args;
-        await requireGrant(ctx.request, ctx.env ?? env, tenantId, "write", "*");
-        return new MeasurementService(getDb(ctx.env)).defineMetric(defInput, ctx.now);
+        await requireGrant(ctx.request, ctx.env ?? env, args.tenantId, "write", "*");
+        return new MeasurementService(getDb(ctx.env)).defineMetric(args, ctx.now);
       },
     },
     {
@@ -196,9 +225,13 @@ export function createMeasurementMcpHandler(env: Record<string, any>, config: Po
     authGate: () => true,
     coreHandlers: {
       onSubmitTask: async (params, ctx) => {
+        const { ownerId } = await resolveTaskPrincipal(ctx.request, ctx.env ?? env, true);
         const db = getDb(ctx.env);
-        const taskId = `task_${params.requestId}`;
-        const existing = await db.prepare("SELECT * FROM tasks WHERE task_id = ?").bind(taskId).first<any>();
+        const taskId = `task_${ownerId}_${params.requestId}`;
+        const existing = await db
+          .prepare("SELECT * FROM tasks WHERE task_id = ? AND owner_id = ?")
+          .bind(taskId, ownerId)
+          .first<any>();
         if (existing) {
           return {
             taskId: existing.task_id,
@@ -210,50 +243,80 @@ export function createMeasurementMcpHandler(env: Record<string, any>, config: Po
         }
         await db
           .prepare(
-            `INSERT INTO tasks (task_id, topic, source, spec_json, status, lease_expires_at, created_at, updated_at)
-             VALUES (?, 'mcp.task', 'mcp', ?, 'running', ?, ?, ?)`
+            `INSERT INTO tasks (task_id, owner_id, topic, source, spec_json, status, lease_expires_at, created_at, updated_at)
+             VALUES (?, ?, 'mcp.task', 'mcp', ?, 'running', ?, ?, ?)`
           )
-          .bind(taskId, JSON.stringify(params), ctx.now + 15 * 60 * 1000, ctx.now, ctx.now)
+          .bind(taskId, ownerId, JSON.stringify(params), ctx.now + 15 * 60 * 1000, ctx.now, ctx.now)
           .run();
         return { taskId, requestId: params.requestId, phase: "running", status: "running", existing: false };
       },
       onTaskStatus: async (params, ctx) => {
+        const { ownerId } = await resolveTaskPrincipal(ctx.request, ctx.env ?? env, false);
         const db = getDb(ctx.env);
-        const taskId = String(params.taskId || (params.requestId ? `task_${params.requestId}` : ""));
-        const row = await db.prepare("SELECT * FROM tasks WHERE task_id = ?").bind(taskId).first<any>();
+        const taskId = String(params.taskId || (params.requestId ? `task_${ownerId}_${params.requestId}` : ""));
+        const row = await db
+          .prepare("SELECT * FROM tasks WHERE task_id = ? AND owner_id = ?")
+          .bind(taskId, ownerId)
+          .first<any>();
+        if (!row) {
+          throw new Error(`Task not found or not owned by caller: '${taskId}'`);
+        }
         return {
           taskId,
-          phase: row?.status || "unknown",
-          status: row?.status || "unknown",
-          checks: ["PASS pod-contract"],
-          error: row?.error_message || undefined,
+          phase: row.status,
+          status: row.status,
+          checks: row.status === "completed" ? ["PASS task-completed"] : [],
+          error: row.error_message || undefined,
         };
       },
       onApprove: async (params, ctx) => {
+        const { ownerId } = await resolveTaskPrincipal(ctx.request, ctx.env ?? env, true);
         const db = getDb(ctx.env);
-        await db.prepare("UPDATE tasks SET updated_at = ? WHERE task_id = ?").bind(ctx.now, String(params.taskId)).run();
+        const res = await db
+          .prepare("UPDATE tasks SET updated_at = ? WHERE task_id = ? AND owner_id = ?")
+          .bind(ctx.now, String(params.taskId), ownerId)
+          .run();
+        if (!res.meta.changes) {
+          throw new Error(`Task not found or not owned by caller: '${String(params.taskId)}'`);
+        }
         return { ok: true, decision: params.decision };
       },
       onCancel: async (params, ctx) => {
+        const { ownerId } = await resolveTaskPrincipal(ctx.request, ctx.env ?? env, true);
         const db = getDb(ctx.env);
-        await db
-          .prepare("UPDATE tasks SET status = 'failed', error_message = 'Cancelled by MCP', updated_at = ? WHERE task_id = ?")
-          .bind(ctx.now, String(params.taskId))
+        const res = await db
+          .prepare("UPDATE tasks SET status = 'failed', error_message = 'Cancelled by MCP', updated_at = ? WHERE task_id = ? AND owner_id = ?")
+          .bind(ctx.now, String(params.taskId), ownerId)
           .run();
+        if (!res.meta.changes) {
+          throw new Error(`Task not found or not owned by caller: '${String(params.taskId)}'`);
+        }
         return { ok: true, status: "aborted" };
       },
       onGetReceipt: async (params, ctx) => {
+        const { ownerId } = await resolveTaskPrincipal(ctx.request, ctx.env ?? env, false);
         const db = getDb(ctx.env);
-        const row = await db.prepare("SELECT * FROM tasks WHERE task_id = ?").bind(String(params.taskId)).first<any>();
+        const taskId = String(params.taskId);
+        const row = await db
+          .prepare("SELECT * FROM tasks WHERE task_id = ? AND owner_id = ?")
+          .bind(taskId, ownerId)
+          .first<any>();
+        if (!row) {
+          throw new Error(`Receipt not found for task '${taskId}'`);
+        }
+        if (row.status !== "completed" || !row.result_json) {
+          throw new Error(`Receipt not ready: task '${taskId}' is in status '${row.status}'`);
+        }
+        const parsed = JSON.parse(row.result_json);
         return {
-          taskId: String(params.taskId),
-          pr: "",
-          commit: "",
-          checks: ["PASS pod-contract", "PASS measurement-schema"],
-          diffHash: row?.result_json ? "recorded" : "pending",
-          model: "deterministic",
-          provider: "measurement-pod",
-          family: "deterministic",
+          taskId,
+          pr: String(parsed?.pr || ""),
+          commit: String(parsed?.commit || ""),
+          checks: Array.isArray(parsed?.checks) ? parsed.checks : [],
+          diffHash: String(parsed?.receiptHash || ""),
+          model: String(parsed?.model || "deterministic"),
+          provider: String(parsed?.provider || "measurement-pod"),
+          family: String(parsed?.family || "deterministic"),
           runtime: "pod-kernel",
         };
       },
@@ -261,10 +324,11 @@ export function createMeasurementMcpHandler(env: Record<string, any>, config: Po
     tools: domainTools,
     tasks: {
       list: async ({ limit }, ctx) => {
+        const { ownerId } = await resolveTaskPrincipal(ctx.request, ctx.env ?? env, false);
         const db = getDb(ctx.env);
         const rows = await db
-          .prepare("SELECT task_id, topic, status, created_at, updated_at FROM tasks ORDER BY created_at DESC LIMIT ?")
-          .bind(Math.min(limit ?? 20, 100))
+          .prepare("SELECT task_id, topic, status, created_at, updated_at FROM tasks WHERE owner_id = ? ORDER BY created_at DESC LIMIT ?")
+          .bind(ownerId, Math.min(limit ?? 20, 100))
           .all<any>();
         return {
           tasks: (rows.results || []).map((r) => ({
@@ -276,8 +340,12 @@ export function createMeasurementMcpHandler(env: Record<string, any>, config: Po
         };
       },
       get: async ({ taskId }, ctx) => {
+        const { ownerId } = await resolveTaskPrincipal(ctx.request, ctx.env ?? env, false);
         const db = getDb(ctx.env);
-        const row = await db.prepare("SELECT * FROM tasks WHERE task_id = ?").bind(taskId).first<any>();
+        const row = await db
+          .prepare("SELECT * FROM tasks WHERE task_id = ? AND owner_id = ?")
+          .bind(taskId, ownerId)
+          .first<any>();
         if (!row) return null;
         return {
           taskId: row.task_id,
@@ -287,11 +355,15 @@ export function createMeasurementMcpHandler(env: Record<string, any>, config: Po
         };
       },
       cancel: async ({ taskId }, ctx) => {
+        const { ownerId } = await resolveTaskPrincipal(ctx.request, ctx.env ?? env, true);
         const db = getDb(ctx.env);
-        await db
-          .prepare("UPDATE tasks SET status = 'failed', error_message = 'Cancelled by MCP tasks/cancel', updated_at = ? WHERE task_id = ?")
-          .bind(ctx.now, taskId)
+        const res = await db
+          .prepare("UPDATE tasks SET status = 'failed', error_message = 'Cancelled by MCP tasks/cancel', updated_at = ? WHERE task_id = ? AND owner_id = ?")
+          .bind(ctx.now, taskId, ownerId)
           .run();
+        if (!res.meta.changes) {
+          throw new Error(`Task not found or not owned by caller: '${taskId}'`);
+        }
         return { taskId, status: "cancelled" };
       },
     },

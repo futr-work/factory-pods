@@ -26,4 +26,5 @@ for (const name of TEMPLATES) {
 
 mkdirSync(join(out, "_support"), { recursive: true });
 cpSync(join(repoRoot, "tests", "support", "no-network.mjs"), join(out, "_support", "no-network.mjs"));
+cpSync(join(repoRoot, "tests", "support", "no-external-network.mjs"), join(out, "_support", "no-external-network.mjs"));
 console.log(`bundled ${TEMPLATES.length} templates into ${relative(repoRoot, out)}`);

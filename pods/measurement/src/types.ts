@@ -90,6 +90,7 @@ export interface DimensionFieldSpec {
 }
 
 export interface DefinitionInput {
+  tenantId: string;
   metricId: string;
   version: string;
   family: MetricFamily;
@@ -106,6 +107,7 @@ export interface DefinitionInput {
 }
 
 export interface DefinitionRecord {
+  tenantId: string;
   metricId: string;
   version: string;
   family: MetricFamily;
