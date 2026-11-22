@@ -349,6 +349,8 @@ describe("edge-mcp MCP v2 (2026-07-28) extensions + Code Mode", () => {
     assert.equal(batch[5].error.code, -32602);
   });
 
+  const majorNode = Number.parseInt(String(process.versions?.node ?? "0").split(".")[0] || "0", 10);
+
   test("Code Mode search filters typed SDK spec and execute runs multi-step code in OS-isolated subprocess", async () => {
     const searchRes = await post({
       jsonrpc: "2.0",
@@ -373,6 +375,12 @@ describe("edge-mcp MCP v2 (2026-07-28) extensions + Code Mode", () => {
         },
       },
     });
+    if (majorNode < 26) {
+      assert.equal(execRes.status, 500);
+      const errJson = (await execRes.json()) as any;
+      assert.match(errJson.error.message, /requires Node >= 26/);
+      return;
+    }
     assert.equal(execRes.status, 200);
     const execJson = (await execRes.json()) as any;
     assert.equal(execJson.result.resultType, "complete");
@@ -429,6 +437,11 @@ describe("edge-mcp MCP v2 (2026-07-28) extensions + Code Mode", () => {
       });
       const text = await res.text();
       assert.equal(text.includes("synthetic-host-secret-xyz"), false);
+      if (majorNode < 26) {
+        assert.equal(res.status, 500);
+        assert.match(text, /requires Node >= 26/);
+        return;
+      }
       const json = JSON.parse(text);
       const payload = JSON.parse(json.result.content[0].text).result;
       assert.equal(payload.envLeak, null);
@@ -457,6 +470,11 @@ describe("edge-mcp MCP v2 (2026-07-28) extensions + Code Mode", () => {
     const elapsed = Date.now() - started;
     assert.equal(res.status, 500);
     const json = (await res.json()) as any;
+    if (majorNode < 26) {
+      assert.match(json.error.message, /requires Node >= 26/);
+      assert.equal(writeCount, before);
+      return;
+    }
     assert.match(json.error.message, /timed out/i);
     assert.ok(elapsed < 550, `Expected hard termination well before 800ms spin; took ${elapsed}ms`);
     await new Promise((r) => setTimeout(r, 80));
