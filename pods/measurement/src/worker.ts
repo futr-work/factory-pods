@@ -314,44 +314,31 @@ export default {
       return mcpHandler(request, env, ctx);
     }
 
-    // 4. Operator Cockpit & Hub Mesh routes — protected by shared kernel authGate
-    const denied = authGate(request, env as any, "measurement-pod");
-    if (denied) return denied;
-
-    const tincan = new TincanClient(config, env.FACTORY_HUB);
-
-    if ((method === "GET" || method === "HEAD") && (url.pathname === "/" || url.pathname === "/index.html")) {
-      const snapshot = await service.getCockpitSnapshot();
-      const tasks = await getTasks(db, 30);
-      const hbRow = await db.prepare("SELECT value_json FROM pod_info WHERE key = 'heartbeat'").first<any>();
-      const lastHb = hbRow?.value_json ? JSON.parse(hbRow.value_json) : null;
-      const html = renderPodUiHtml(config, snapshot, tasks, lastHb);
-      return new Response(method === "HEAD" ? null : html, {
-        status: 200,
-        headers: { ...CORS_HEADERS, "Content-Type": "text/html; charset=utf-8" },
-      });
-    }
-
+    // 3b. Scoped Measurement Task Dispatch (/api/task)
+    //     Runs BEFORE the hub-token-only operator gate so valid scoped callers can submit tasks,
+    //     while ungranted hub tokens fail closed (401). Normalizes the payload once for both
+    //     authorization and handler execution.
     if (method === "POST" && url.pathname === "/api/task") {
       try {
         const body = await parseJsonBody(request);
         const taskId = typeof body.taskId === "string" && body.taskId ? body.taskId : `task_${Date.now()}`;
         const topic = typeof body.topic === "string" && body.topic ? body.topic : "measurement.coverage";
         const source = typeof body.source === "string" && body.source ? body.source : "api";
-        const spec = body.spec && typeof body.spec === "object" ? body.spec : {};
-        const payload = spec.payload && typeof spec.payload === "object" ? spec.payload : spec;
-        const action = spec.action || (topic.includes(".") ? topic.split(".")[1] : "coverage");
+        const rawSpec = body.spec && typeof body.spec === "object" && !Array.isArray(body.spec) ? body.spec : {};
+        const normalizedPayload =
+          rawSpec.payload && typeof rawSpec.payload === "object" && !Array.isArray(rawSpec.payload)
+            ? rawSpec.payload
+            : rawSpec;
+        const action = rawSpec.action || (topic.includes(".") ? topic.split(".")[1] : "coverage");
 
-        // Measurement domain tasks MUST carry a scoped caller credential with explicit tenant/resource/action grant.
-        // An ungranted shared hub token cannot read or write tenant measurement data via /api/task.
         const isWriteAction = ["register", "register_resource", "define", "define_metric", "ingest", "record", "annotate"].includes(action);
         const requiredAction = isWriteAction ? "write" : "read";
-        const targetTenantId = typeof payload.tenantId === "string" ? payload.tenantId.trim() : "";
+        const targetTenantId = typeof normalizedPayload.tenantId === "string" ? normalizedPayload.tenantId.trim() : "";
         const targetResourceId =
           action === "define" || action === "define_metric"
             ? "*"
-            : typeof payload.resourceId === "string" && payload.resourceId.trim()
-              ? payload.resourceId.trim()
+            : typeof normalizedPayload.resourceId === "string" && normalizedPayload.resourceId.trim()
+              ? normalizedPayload.resourceId.trim()
               : undefined;
 
         const { caller, denied: taskDenied } = await resolveAndAuthorize(request, env, {
@@ -361,15 +348,17 @@ export default {
         });
         if (taskDenied) return taskDenied;
 
+        const normalizedSpec = { action, payload: normalizedPayload };
         const now = Date.now();
         const leaseExpiresAt = now + 15 * 60 * 1000;
+        const tincan = new TincanClient(config, env.FACTORY_HUB);
 
         const insertRes = await db
           .prepare(
             `INSERT INTO tasks (task_id, owner_id, topic, source, spec_json, status, lease_expires_at, retry_count, max_retries, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, 'running', ?, 0, 3, ?, ?)`
           )
-          .bind(taskId, caller.callerId, topic, source, JSON.stringify(spec), leaseExpiresAt, now, now)
+          .bind(taskId, caller.callerId, topic, source, JSON.stringify(normalizedSpec), leaseExpiresAt, now, now)
           .run();
 
         const taskRecord: TaskRecord = {
@@ -377,7 +366,7 @@ export default {
           taskId,
           topic,
           source,
-          spec,
+          spec: normalizedSpec,
           status: "running",
           leaseExpiresAt,
           retryCount: 0,
@@ -412,6 +401,24 @@ export default {
       } catch (err) {
         return errorResponse(err);
       }
+    }
+
+    // 4. Operator Cockpit & Hub Mesh routes — protected by shared kernel authGate
+    const denied = authGate(request, env as any, "measurement-pod");
+    if (denied) return denied;
+
+    const tincan = new TincanClient(config, env.FACTORY_HUB);
+
+    if ((method === "GET" || method === "HEAD") && (url.pathname === "/" || url.pathname === "/index.html")) {
+      const snapshot = await service.getCockpitSnapshot();
+      const tasks = await getTasks(db, 30);
+      const hbRow = await db.prepare("SELECT value_json FROM pod_info WHERE key = 'heartbeat'").first<any>();
+      const lastHb = hbRow?.value_json ? JSON.parse(hbRow.value_json) : null;
+      const html = renderPodUiHtml(config, snapshot, tasks, lastHb);
+      return new Response(method === "HEAD" ? null : html, {
+        status: 200,
+        headers: { ...CORS_HEADERS, "Content-Type": "text/html; charset=utf-8" },
+      });
     }
 
     if (method === "GET" && url.pathname === "/api/tasks") {

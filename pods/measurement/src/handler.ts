@@ -18,7 +18,8 @@ export class MeasurementPodHandler implements TaskHandler {
   public async handle(task: TaskRecord, context: HandlerContext): Promise<any> {
     const { podConfig, now, storage, publishEvent } = context;
     const service = new MeasurementService(storage);
-    const spec = task.spec || {};
+    const spec = task.spec && typeof task.spec === "object" ? task.spec : {};
+    const payload = spec.payload && typeof spec.payload === "object" ? spec.payload : spec;
     const action = spec.action || (task.topic.includes(".") ? task.topic.split(".")[1] : "coverage");
 
     let domainOutput: any;
@@ -26,33 +27,34 @@ export class MeasurementPodHandler implements TaskHandler {
     switch (action) {
       case "register":
       case "register_resource":
-        domainOutput = await service.registerResource(spec.payload ?? spec, now);
+        domainOutput = await service.registerResource(payload as any, now);
         break;
       case "define":
       case "define_metric":
-        domainOutput = await service.defineMetric(spec.payload ?? spec, now);
+        domainOutput = await service.defineMetric(payload as any, now);
         break;
       case "ingest":
       case "record":
-        domainOutput = await service.ingestBatch(spec.payload ?? spec, now);
+        domainOutput = await service.ingestBatch(payload as any, now);
         break;
       case "query":
       case "compare":
-        domainOutput = await service.querySeries(spec.payload ?? spec);
+        domainOutput = await service.querySeries(payload as any);
         break;
       case "annotate":
-        domainOutput = await service.annotateWork(spec.payload ?? spec, now);
+        domainOutput = await service.annotateWork(payload as any, now);
         break;
       case "coverage":
       case "reconcile":
       default:
-        domainOutput = spec.tenantId
-          ? await service.queryCoverage({
-              tenantId: spec.tenantId,
-              resourceId: spec.resourceId,
-              source: spec.source,
-            })
-          : await service.getCockpitSnapshot();
+        if (!payload.tenantId || typeof payload.tenantId !== "string" || !payload.tenantId.trim()) {
+          throw new Error("Scoped measurement task requires an explicit tenantId");
+        }
+        domainOutput = await service.queryCoverage({
+          tenantId: payload.tenantId.trim(),
+          resourceId: typeof payload.resourceId === "string" && payload.resourceId.trim() ? payload.resourceId.trim() : undefined,
+          source: typeof payload.source === "string" && payload.source.trim() ? payload.source.trim() : undefined,
+        });
         break;
     }
 

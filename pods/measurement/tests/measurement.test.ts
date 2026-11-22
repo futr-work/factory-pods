@@ -970,6 +970,24 @@ describe("Measurement Pod — Typed 4-Family Vertical Slice, Isolation, MCP v2 +
       });
       assert.equal(hubTaskBypass.status, 401);
 
+      // Valid scoped caller CAN submit /api/task with spec.payload and gets ONLY its own scoped coverage (never global snapshot)
+      const scopedTaskOk = await h.call("POST", "/api/task", h.tokenA, {
+        topic: "measurement.coverage",
+        spec: { payload: { tenantId: "tenant-alpha", resourceId: "site-a" } },
+      });
+      assert.equal(scopedTaskOk.status, 200);
+      const scopedTaskJson = (await scopedTaskOk.json()) as any;
+      assert.equal(scopedTaskJson.status, "completed");
+      assert.ok(Array.isArray(scopedTaskJson.result.result.items));
+      assert.equal(scopedTaskJson.result.result.recentAnnotations, undefined);
+
+      // Cross-tenant /api/task by valid scoped caller A targeting tenant-beta fails closed with 403
+      const scopedTaskCross = await h.call("POST", "/api/task", h.tokenA, {
+        topic: "measurement.coverage",
+        spec: { payload: { tenantId: "tenant-beta", resourceId: "site-b" } },
+      });
+      assert.equal(scopedTaskCross.status, 403);
+
       // Tenant-scoped definitions do not leak across tenants (tenant-b can define same metricId independently)
       assert.equal(
         (await h.call("POST", "/api/measurement/definitions", h.tokenA, {
@@ -1021,7 +1039,7 @@ describe("Measurement Pod — Typed 4-Family Vertical Slice, Isolation, MCP v2 +
       const listA = (await (
         await h.call("POST", "/mcp", h.tokenA, { jsonrpc: "2.0", id: "la", method: "tasks/list" }, { "MCP-Protocol-Version": "2026-07-28" })
       ).json()) as any;
-      assert.equal(listA.result.tasks.length, 0);
+      assert.equal(listA.result.tasks.some((t: any) => t.taskId === taskIdB), false);
 
       const cancelCross = await h.call(
         "POST",
