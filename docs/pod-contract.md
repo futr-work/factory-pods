@@ -24,9 +24,16 @@ mcp = ["submit_task", "task_status", "approve", "cancel", "get_receipt"]
 
 ---
 
-## 2. Stateless MCP 2026-07-28 Tools
+## 2. Stateless MCP 2026-07-28 Tools & Code Mode
 
-A pod that exposes MCP serves a stateless endpoint at `/mcp` with Bearer authentication. The core tools are:
+A pod that exposes MCP serves a stateless endpoint at `/mcp` with Bearer authentication using `@futr-work/pod-kernel/edge-mcp` (`2026-07-28` default, backward-compatible with `2024-11-05`, with JSON-RPC batching plus optional `tasks/*` and `resources/*` extensions).
+
+Pods with rich query surfaces can also enable **Code Mode** (`codeMode: { spec, createSdk }`), exposing two compact tools alongside or in place of granular tool lists:
+
+- **`search(query)`**: Searches the pod's typed SDK specification (`pod.*` methods and signatures) so agents discover the API in ~1,000 tokens.
+- **`execute(code)`**: Executes a short agent-written JS snippet inside a restricted, network-disabled sandbox (Cloudflare Dynamic Worker Loader in production / restricted `vm` isolate in local Node tests) with only the caller-scoped `pod` SDK bound and no raw credentials exposed.
+
+The five core tools are:
 
 ### `submit_task`
 Idempotent task submission keyed by `requestId`. If the `requestId` has already been submitted, the pod returns the existing task status without re-executing.

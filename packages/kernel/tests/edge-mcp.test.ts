@@ -97,7 +97,7 @@ describe("edge-mcp & PodConnector test suite", () => {
 
   test("GET /mcp discovery document contains core tools and custom tools", async () => {
     const discovery = await connector.discover();
-    assert.equal(discovery.mcpVersion, "2024-11-05");
+    assert.equal(discovery.mcpVersion, "2026-07-28");
     assert.equal(discovery.server.name, podName);
     assert.equal(discovery.server.role, "spec-architect");
     assert.equal(discovery.server.version, "1.2.0");
@@ -177,5 +177,145 @@ describe("edge-mcp & PodConnector test suite", () => {
       async () => unauthConnector.listTools(),
       (err: any) => err.message.includes("401") || err.message.includes("Unauthorized")
     );
+  });
+});
+
+describe("edge-mcp MCP v2 (2026-07-28) extensions + Code Mode", () => {
+  const TOKEN = "v2-token";
+  const handler = createEdgeMcpHandler({
+    podName: "measurement-pod",
+    podRole: "measurement",
+    version: "2.0.0",
+    bearerToken: TOKEN,
+    resources: [
+      {
+        uri: "pod://measurement/spec",
+        name: "Measurement Spec",
+        mimeType: "application/json",
+        read: async () => ({ text: JSON.stringify({ families: ["seo", "analytics", "spend", "telemetry"] }) }),
+      },
+    ],
+    tasks: {
+      list: async ({ limit }) => ({ tasks: [{ taskId: "t-1", status: "completed", limit: limit ?? 20 }] }),
+      get: async ({ taskId }) => ({ task: taskId === "t-1" ? { taskId: "t-1", status: "completed" } : null }),
+      cancel: async ({ taskId }) => ({ ok: true, status: `cancelled:${taskId}` }),
+    },
+    codeMode: {
+      timeoutMs: 500,
+      spec: [
+        {
+          name: "listSites",
+          method: "pod.listSites()",
+          description: "List registered sites for the caller",
+          signature: "() => Promise<string[]>",
+          tags: ["sites", "resources"],
+        },
+        {
+          name: "sumMetrics",
+          method: "pod.sumMetrics(nums)",
+          description: "Sum numeric observations",
+          signature: "(nums: number[]) => Promise<number>",
+          tags: ["metrics", "series"],
+        },
+      ],
+      createSdk: () => ({
+        listSites: async () => ["alpha.test", "beta.test"],
+        sumMetrics: async (nums: number[]) => nums.reduce((a, b) => a + b, 0),
+      }),
+    },
+  });
+
+  const post = (body: any, headers: Record<string, string> = {}) =>
+    handler(
+      new Request("https://pod.test/mcp", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${TOKEN}`,
+          ...headers,
+        },
+        body: JSON.stringify(body),
+      })
+    );
+
+  test("negotiates 2026-07-28 by default and falls back to 2024-11-05 when requested", async () => {
+    const resV2 = await post({ jsonrpc: "2.0", id: 1, method: "initialize" });
+    assert.equal(resV2.status, 200);
+    assert.equal(resV2.headers.get("Mcp-Version"), "2026-07-28");
+    const jsonV2 = (await resV2.json()) as any;
+    assert.equal(jsonV2.result.protocolVersion, "2026-07-28");
+    assert.equal(jsonV2.result.capabilities.experimental.codeMode.execute, true);
+
+    const resV1 = await post(
+      { jsonrpc: "2.0", id: 2, method: "initialize" },
+      { "Mcp-Version": "2024-11-05" }
+    );
+    assert.equal(resV1.headers.get("Mcp-Version"), "2024-11-05");
+    const jsonV1 = (await resV1.json()) as any;
+    assert.equal(jsonV1.result.protocolVersion, "2024-11-05");
+  });
+
+  test("supports batch JSON-RPC, tasks/*, and resources/*", async () => {
+    const res = await post([
+      { jsonrpc: "2.0", id: "b1", method: "tasks/list", params: { limit: 5 } },
+      { jsonrpc: "2.0", id: "b2", method: "tasks/get", params: { taskId: "t-1" } },
+      { jsonrpc: "2.0", id: "b3", method: "resources/list" },
+      { jsonrpc: "2.0", id: "b4", method: "resources/read", params: { uri: "pod://measurement/spec" } },
+    ]);
+    assert.equal(res.status, 200);
+    const batch = (await res.json()) as any[];
+    assert.equal(batch.length, 4);
+    assert.equal(batch[0].result.tasks[0].taskId, "t-1");
+    assert.equal(batch[1].result.task.status, "completed");
+    assert.equal(batch[2].result.resources[0].uri, "pod://measurement/spec");
+    assert.match(batch[3].result.contents[0].text, /"telemetry"/);
+  });
+
+  test("Code Mode search filters typed SDK spec and execute runs multi-step code in sandbox", async () => {
+    const searchRes = await post({
+      jsonrpc: "2.0",
+      id: "s1",
+      method: "tools/call",
+      params: { name: "search", arguments: { query: "sites" } },
+    });
+    const searchJson = (await searchRes.json()) as any;
+    const searchData = JSON.parse(searchJson.result.content[0].text);
+    assert.equal(searchData.total, 1);
+    assert.equal(searchData.entries[0].name, "listSites");
+
+    const execRes = await post({
+      jsonrpc: "2.0",
+      id: "e1",
+      method: "tools/call",
+      params: {
+        name: "execute",
+        arguments: {
+          code: "const sites = await pod.listSites(); const total = await pod.sumMetrics([10, 20, 12]); return { count: sites.length, total };",
+        },
+      },
+    });
+    assert.equal(execRes.status, 200);
+    const execJson = (await execRes.json()) as any;
+    const execData = JSON.parse(execJson.result.content[0].text);
+    assert.deepEqual(execData, { ok: true, result: { count: 2, total: 42 } });
+  });
+
+  test("Code Mode sandbox blocks forbidden globals (process, fetch, Function, prototype traversal)", async () => {
+    for (const badCode of [
+      "return process.env;",
+      "return await fetch('https://example.com');",
+      "return Function('return 1')();",
+      "return ({}).constructor.constructor('return 1')();",
+    ]) {
+      const res = await post({
+        jsonrpc: "2.0",
+        id: "bad",
+        method: "tools/call",
+        params: { name: "execute", arguments: { code: badCode } },
+      });
+      assert.equal(res.status, 500);
+      const json = (await res.json()) as any;
+      assert.match(json.error.message, /Sandbox policy violation/);
+    }
   });
 });
