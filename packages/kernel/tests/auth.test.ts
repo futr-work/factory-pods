@@ -85,6 +85,23 @@ describe("scoped caller grant resolver (fail-closed tenant/resource isolation)",
     assert.equal(authorizeScopedCaller(sharedCaller, { tenantId: "tenant-a", resourceId: "res-a1", action: "read" })!.status, 401);
     assert.equal(authorizeScopedCaller(callerA, { tenantId: "tenant-b", resourceId: "res-b1", action: "read" })!.status, 403);
     assert.equal(authorizeScopedCaller(callerA, { tenantId: "tenant-a", resourceId: "res-a1", action: "read" }), null);
+
+    // Omitting resourceId requires explicit "*" grant; resource-scoped or empty resourceIds fail closed
+    assert.equal(isCallerAuthorized(callerA, { tenantId: "tenant-a", action: "read" }), false);
+    assert.equal(authorizeScopedCaller(callerA, { tenantId: "tenant-a", action: "read" })!.status, 403);
+
+    const emptyResCaller = {
+      callerId: "empty-res",
+      grants: [{ tenantId: "tenant-a", resourceIds: [], actions: ["read"] }],
+    };
+    assert.equal(isCallerAuthorized(emptyResCaller, { tenantId: "tenant-a", action: "read" }), false);
+
+    const wildcardCaller = {
+      callerId: "tenant-admin",
+      grants: [{ tenantId: "tenant-a", resourceIds: ["*"], actions: ["read"] }],
+    };
+    assert.equal(isCallerAuthorized(wildcardCaller, { tenantId: "tenant-a", action: "read" }), true);
+    assert.equal(isCallerAuthorized(wildcardCaller, { tenantId: "tenant-b", action: "read" }), false);
   });
 
   test("parseScopedCallerGrants fails closed on malformed JSON or invalid sha256", () => {

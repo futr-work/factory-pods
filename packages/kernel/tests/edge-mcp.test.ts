@@ -182,6 +182,8 @@ describe("edge-mcp & PodConnector test suite", () => {
 
 describe("edge-mcp MCP v2 (2026-07-28) extensions + Code Mode", () => {
   const TOKEN = "v2-token";
+  let writeCount = 0;
+
   const handler = createEdgeMcpHandler({
     podName: "measurement-pod",
     podRole: "measurement",
@@ -197,11 +199,12 @@ describe("edge-mcp MCP v2 (2026-07-28) extensions + Code Mode", () => {
     ],
     tasks: {
       list: async ({ limit }) => ({ tasks: [{ taskId: "t-1", status: "completed", limit: limit ?? 20 }] }),
-      get: async ({ taskId }) => ({ task: taskId === "t-1" ? { taskId: "t-1", status: "completed" } : null }),
-      cancel: async ({ taskId }) => ({ ok: true, status: `cancelled:${taskId}` }),
+      get: async ({ taskId }) =>
+        taskId === "t-1" ? { taskId: "t-1", status: "completed", resultType: "complete" } : null,
+      cancel: async ({ taskId }) => ({ taskId, status: "cancelled", resultType: "cancelled" }),
     },
     codeMode: {
-      timeoutMs: 500,
+      timeoutMs: 120,
       spec: [
         {
           name: "listSites",
@@ -217,15 +220,26 @@ describe("edge-mcp MCP v2 (2026-07-28) extensions + Code Mode", () => {
           signature: "(nums: number[]) => Promise<number>",
           tags: ["metrics", "series"],
         },
+        {
+          name: "recordWrite",
+          method: "pod.recordWrite(tag)",
+          description: "Record a write call for deadline-revocation testing",
+          signature: "(tag: string) => Promise<number>",
+          tags: ["write"],
+        },
       ],
       createSdk: () => ({
         listSites: async () => ["alpha.test", "beta.test"],
         sumMetrics: async (nums: number[]) => nums.reduce((a, b) => a + b, 0),
+        recordWrite: async () => {
+          writeCount += 1;
+          return writeCount;
+        },
       }),
     },
   });
 
-  const post = (body: any, headers: Record<string, string> = {}) =>
+  const post = (body: any, headers: Record<string, string> = {}, env?: any) =>
     handler(
       new Request("https://pod.test/mcp", {
         method: "POST",
@@ -235,43 +249,78 @@ describe("edge-mcp MCP v2 (2026-07-28) extensions + Code Mode", () => {
           ...headers,
         },
         body: JSON.stringify(body),
-      })
+      }),
+      env
     );
 
-  test("negotiates 2026-07-28 by default and falls back to 2024-11-05 when requested", async () => {
-    const resV2 = await post({ jsonrpc: "2.0", id: 1, method: "initialize" });
-    assert.equal(resV2.status, 200);
-    assert.equal(resV2.headers.get("Mcp-Version"), "2026-07-28");
-    const jsonV2 = (await resV2.json()) as any;
-    assert.equal(jsonV2.result.protocolVersion, "2026-07-28");
-    assert.equal(jsonV2.result.capabilities.experimental.codeMode.execute, true);
-
-    const resV1 = await post(
-      { jsonrpc: "2.0", id: 2, method: "initialize" },
-      { "Mcp-Version": "2024-11-05" }
-    );
-    assert.equal(resV1.headers.get("Mcp-Version"), "2024-11-05");
-    const jsonV1 = (await resV1.json()) as any;
-    assert.equal(jsonV1.result.protocolVersion, "2024-11-05");
+  test("server/discover returns 2026-07-28 capabilities and io.modelcontextprotocol/tasks extension", async () => {
+    const res = await post({ jsonrpc: "2.0", id: "d1", method: "server/discover" });
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get("MCP-Protocol-Version"), "2026-07-28");
+    const json = (await res.json()) as any;
+    assert.equal(json.result.protocolVersion, "2026-07-28");
+    assert.deepEqual(json.result.supportedProtocolVersions, ["2026-07-28", "2024-11-05"]);
+    assert.equal(json.result.capabilities.extensions["io.modelcontextprotocol/tasks"].get, true);
+    assert.equal(json.result.capabilities.experimental.codeMode.execute, true);
   });
 
-  test("supports batch JSON-RPC, tasks/*, and resources/*", async () => {
+  test("validates exact MCP protocol version headers and rejects unsupported versions or routing mismatches with 400", async () => {
+    // Unsupported header version -> 400
+    const badVer = await post(
+      { jsonrpc: "2.0", id: 1, method: "ping" },
+      { "MCP-Protocol-Version": "2099-01-01" }
+    );
+    assert.equal(badVer.status, 400);
+
+    // Legacy initialize body negotiation aligns response header to negotiated version
+    const v1Init = await post({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "initialize",
+      params: { protocolVersion: "2024-11-05" },
+    });
+    assert.equal(v1Init.status, 200);
+    assert.equal(v1Init.headers.get("MCP-Protocol-Version"), "2024-11-05");
+    const v1Json = (await v1Init.json()) as any;
+    assert.equal(v1Json.result.protocolVersion, "2024-11-05");
+
+    // Routing header mismatch (header claims tools/list, body invokes tools/call) -> 400, tool NOT executed
+    const beforeWrites = writeCount;
+    const mismatch = await post(
+      {
+        jsonrpc: "2.0",
+        id: 3,
+        method: "tools/call",
+        params: { name: "execute", arguments: { code: "return await pod.recordWrite('smuggled');" } },
+      },
+      { "MCP-Method": "tools/list" }
+    );
+    assert.equal(mismatch.status, 400);
+    assert.equal(writeCount, beforeWrites);
+  });
+
+  test("supports isolated batch JSON-RPC, flat tasks/get resultType, resources/*, and omits notification responses", async () => {
     const res = await post([
       { jsonrpc: "2.0", id: "b1", method: "tasks/list", params: { limit: 5 } },
       { jsonrpc: "2.0", id: "b2", method: "tasks/get", params: { taskId: "t-1" } },
       { jsonrpc: "2.0", id: "b3", method: "resources/list" },
       { jsonrpc: "2.0", id: "b4", method: "resources/read", params: { uri: "pod://measurement/spec" } },
+      { jsonrpc: "2.0", id: "b5", method: "tools/call", params: null }, // malformed member isolated
+      { jsonrpc: "2.0", method: "ping" }, // notification (no id) -> no response
     ]);
     assert.equal(res.status, 200);
     const batch = (await res.json()) as any[];
-    assert.equal(batch.length, 4);
+    assert.equal(batch.length, 5);
     assert.equal(batch[0].result.tasks[0].taskId, "t-1");
-    assert.equal(batch[1].result.task.status, "completed");
+    assert.equal(batch[1].result.taskId, "t-1");
+    assert.equal(batch[1].result.resultType, "complete");
     assert.equal(batch[2].result.resources[0].uri, "pod://measurement/spec");
     assert.match(batch[3].result.contents[0].text, /"telemetry"/);
+    assert.equal(batch[4].id, "b5");
+    assert.equal(batch[4].error.code, -32602);
   });
 
-  test("Code Mode search filters typed SDK spec and execute runs multi-step code in sandbox", async () => {
+  test("Code Mode search filters typed SDK spec and execute runs multi-step code in isolated worker", async () => {
     const searchRes = await post({
       jsonrpc: "2.0",
       id: "s1",
@@ -300,22 +349,91 @@ describe("edge-mcp MCP v2 (2026-07-28) extensions + Code Mode", () => {
     assert.deepEqual(execData, { ok: true, result: { count: 2, total: 42 } });
   });
 
-  test("Code Mode sandbox blocks forbidden globals (process, fetch, Function, prototype traversal)", async () => {
-    for (const badCode of [
-      "return process.env;",
-      "return await fetch('https://example.com');",
-      "return Function('return 1')();",
-      "return ({}).constructor.constructor('return 1')();",
-    ]) {
+  test("Code Mode isolate cannot read host process.env secrets or escape via Object['constructor']", async () => {
+    const prevSecret = process.env.TEST_HOST_SECRET_PROBE;
+    process.env.TEST_HOST_SECRET_PROBE = "synthetic-host-secret-xyz";
+    try {
       const res = await post({
         jsonrpc: "2.0",
-        id: "bad",
+        id: "esc1",
         method: "tools/call",
-        params: { name: "execute", arguments: { code: badCode } },
+        params: {
+          name: "execute",
+          arguments: {
+            code: "try { const p = Object['constructor']('return pro' + 'cess')(); return { env: p.env }; } catch (e) { return { blocked: e.message }; }",
+          },
+        },
       });
-      assert.equal(res.status, 500);
-      const json = (await res.json()) as any;
-      assert.match(json.error.message, /Sandbox policy violation/);
+      const text = await res.text();
+      assert.equal(text.includes("synthetic-host-secret-xyz"), false);
+    } finally {
+      if (prevSecret === undefined) delete process.env.TEST_HOST_SECRET_PROBE;
+      else process.env.TEST_HOST_SECRET_PROBE = prevSecret;
     }
+  });
+
+  test("Code Mode hard-terminates post-await CPU spin and revokes SDK writes on timeout", async () => {
+    const before = writeCount;
+    const started = Date.now();
+    const res = await post({
+      jsonrpc: "2.0",
+      id: "to1",
+      method: "tools/call",
+      params: {
+        name: "execute",
+        arguments: {
+          code: "await 0; const end = Date.now() + 600; while (Date.now() < end) {} await pod.recordWrite('after-timeout'); return 'late';",
+        },
+      },
+    });
+    const elapsed = Date.now() - started;
+    assert.equal(res.status, 500);
+    const json = (await res.json()) as any;
+    assert.match(json.error.message, /timed out/i);
+    assert.ok(elapsed < 450, `Expected hard termination well before 600ms spin; took ${elapsed}ms`);
+    await new Promise((r) => setTimeout(r, 80));
+    assert.equal(writeCount, before, "SDK write must not execute after timeout revocation");
+  });
+
+  test("Code Mode uses Cloudflare Dynamic Worker Loader binding (CODE_LOADER) with globalOutbound: null when bound", async () => {
+    let capturedConfig: any = null;
+    const mockLoader = {
+      get: (_id: string, getCode: () => Promise<any>) => ({
+        getEntrypoint: () => ({
+          fetch: async () => {
+            capturedConfig = await getCode();
+            // Exercise the injected POD_SDK bridge directly
+            const rpcRes = await capturedConfig.env.POD_SDK.fetch(
+              new Request("https://pod-sdk.internal/call", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ method: "sumMetrics", args: [[3, 4, 5]] }),
+              })
+            );
+            const rpcJson = (await rpcRes.json()) as any;
+            return new Response(JSON.stringify({ ok: true, result: { viaLoader: rpcJson.result } }), {
+              status: 200,
+              headers: { "Content-Type": "application/json" },
+            });
+          },
+        }),
+      }),
+    };
+
+    const res = await post(
+      {
+        jsonrpc: "2.0",
+        id: "wl1",
+        method: "tools/call",
+        params: { name: "execute", arguments: { code: "return await pod.sumMetrics([3, 4, 5]);" } },
+      },
+      {},
+      { CODE_LOADER: mockLoader }
+    );
+    assert.equal(res.status, 200);
+    assert.equal(capturedConfig.globalOutbound, null);
+    const json = (await res.json()) as any;
+    const data = JSON.parse(json.result.content[0].text);
+    assert.deepEqual(data, { ok: true, result: { viaLoader: 12 } });
   });
 });

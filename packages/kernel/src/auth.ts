@@ -169,8 +169,11 @@ export async function resolveScopedCaller(
 
 /**
  * Pure fail-closed authorization check against a resolved caller's server-side grants.
- * Checks tenantId, optional resourceId, and action. Wildcard "*" is supported on resourceIds and actions,
- * never on tenantId (tenants are always explicit).
+ * Checks tenantId, resourceId, and action.
+ * - Wildcard "*" is supported on resourceIds and actions, never on tenantId (tenants are always explicit).
+ * - If `resourceId` is omitted (e.g. a tenant-wide/list operation), the caller MUST hold an explicit
+ *   wildcard resource grant (`resourceIds` containing `"*"`). Resource-scoped or empty `resourceIds`
+ *   never satisfy a resource-less request.
  */
 export function isCallerAuthorized(
   caller: ResolvedCaller | null,
@@ -181,7 +184,10 @@ export function isCallerAuthorized(
     if (grant.tenantId !== req.tenantId) continue;
     const actionAllowed = grant.actions.includes("*") || grant.actions.includes(req.action);
     if (!actionAllowed) continue;
-    if (req.resourceId === undefined) return true;
+    if (req.resourceId === undefined) {
+      if (grant.resourceIds.includes("*")) return true;
+      continue;
+    }
     if (grant.resourceIds.includes("*") || grant.resourceIds.includes(req.resourceId)) {
       return true;
     }

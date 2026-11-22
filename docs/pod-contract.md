@@ -26,12 +26,13 @@ mcp = ["submit_task", "task_status", "approve", "cancel", "get_receipt"]
 
 ## 2. Stateless MCP 2026-07-28 Tools & Code Mode
 
-A pod that exposes MCP serves a stateless endpoint at `/mcp` with Bearer authentication using `@futr-work/pod-kernel/edge-mcp` (`2026-07-28` default, backward-compatible with `2024-11-05`, with JSON-RPC batching plus optional `tasks/*` and `resources/*` extensions).
-
-Pods with rich query surfaces can also enable **Code Mode** (`codeMode: { spec, createSdk }`), exposing two compact tools alongside or in place of granular tool lists:
-
-- **`search(query)`**: Searches the pod's typed SDK specification (`pod.*` methods and signatures) so agents discover the API in ~1,000 tokens.
-- **`execute(code)`**: Executes a short agent-written JS snippet inside a restricted, network-disabled sandbox (Cloudflare Dynamic Worker Loader in production / restricted `vm` isolate in local Node tests) with only the caller-scoped `pod` SDK bound and no raw credentials exposed.
+A pod that exposes MCP serves a stateless endpoint at `/mcp` with Bearer authentication using `@futr-work/pod-kernel/edge-mcp`:
+- **Protocol & Discovery**: Defaults to `2026-07-28` (backward-compatible with `2024-11-05`), implements mandatory `server/discover`, validates exact `MCP-Protocol-Version` / `Mcp-Version` and routing headers (`MCP-Method`, `MCP-Tool-Name`) against the JSON-RPC body before dispatch, supports isolated JSON-RPC batches (omitting responses for ID-less notifications), and implements the `io.modelcontextprotocol/tasks` and `resources/*` extensions.
+- **Code Mode (`codeMode: { spec, createSdk }`)**: Exposes two compact tools alongside or in place of granular tool lists:
+  - **`search(query)`**: Searches the pod's typed SDK specification (`pod.*` methods and signatures) so agents discover the API in ~1,000 tokens.
+  - **`execute(code)`**: Executes a short agent-written JS snippet inside an isolated, network-disabled sandbox with a JSON-only SDK bridge and deadline revocation:
+    - **Cloudflare Workers**: bind a Dynamic Worker Loader as `CODE_LOADER` (or custom `workerLoaderBinding`) in `wrangler.jsonc`; the kernel creates an ephemeral worker with `globalOutbound: null`.
+    - **Local Node / tests**: falls back to an isolated, hard-terminable `worker_threads` Worker with empty `env` and network disabled.
 
 The five core tools are:
 
