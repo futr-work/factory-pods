@@ -24,9 +24,17 @@ mcp = ["submit_task", "task_status", "approve", "cancel", "get_receipt"]
 
 ---
 
-## 2. Stateless MCP 2026-07-28 Tools
+## 2. Stateless MCP 2026-07-28 Tools & Code Mode
 
-A pod that exposes MCP serves a stateless endpoint at `/mcp` with Bearer authentication. The core tools are:
+A pod that exposes MCP serves a stateless endpoint at `/mcp` with Bearer authentication using `@futr-work/pod-kernel/edge-mcp`:
+- **Protocol & Discovery**: Defaults to `2026-07-28` (backward-compatible with `2024-11-05`), implements mandatory `server/discover` (returning `supportedVersions` and `resultType: "complete"`), validates exact `MCP-Protocol-Version` / `Mcp-Version`, `Mcp-Method`, `Mcp-Name`, and body `_meta.protocolVersion` agreement before dispatch (`400` / `HeaderMismatch`), returns `202 Accepted` with no body for ID-less notifications, supports isolated JSON-RPC batches, and implements the `io.modelcontextprotocol/tasks` and `resources/*` extensions with `resultType: "complete"`.
+- **Code Mode (`codeMode: { spec, createSdk }`)**: Exposes two compact tools alongside or in place of granular tool lists:
+  - **`search(query)`**: Searches the pod's typed SDK specification (`pod.*` methods and signatures) so agents discover the API in ~1,000 tokens.
+  - **`execute(code)`**: Executes a short agent-written JS snippet inside an isolated, network-disabled sandbox with a serialized SDK bridge and deadline revocation:
+    - **Cloudflare Workers**: configure `"worker_loaders": [{ "binding": "CODE_LOADER" }]` in `wrangler.jsonc`; the kernel loads `worker.js` with `globalOutbound: null` and bridges `pod.*` over a Cloudflare `RpcTarget` (or custom `createWorkerSdkBinding`).
+    - **Local Node / tests**: spawns an OS-isolated `node --permission` subprocess (requires Node `>= 26` for OS-enforced network permission isolation; fails closed on older Node runtimes unless a custom `codeMode.executor` is provided) with empty `env`, zero filesystem/network permissions, dedicated IPC channel (`stdio: ipc`, isolated from `console.log`), and hard `SIGKILL` + monotonic deadline SDK revocation on timeout.
+
+The five core tools are:
 
 ### `submit_task`
 Idempotent task submission keyed by `requestId`. If the `requestId` has already been submitted, the pod returns the existing task status without re-executing.

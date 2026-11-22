@@ -1,7 +1,7 @@
 {
   "name": "@futr-work/pod-kernel",
   "version": "0.1.0",
-  "description": "Versioned kernel library for factory pods: contract, durable jobs, gates, MCP v2",
+  "description": "Versioned kernel library for factory pods: contract, durable jobs, gates, MCP v2, Code Mode",
   "engines": {
     "node": ">=22.16.0"
   },
