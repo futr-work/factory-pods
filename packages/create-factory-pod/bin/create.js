@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const pkgRoot = resolve(__dirname, "..");
 const self = JSON.parse(readFileSync(join(pkgRoot, "package.json"), "utf8"));
-const TEMPLATES = ["starter", "model-governor", "sentinel-radar", "authority-seo"];
+const TEMPLATES = ["starter", "model-governor", "sentinel-radar", "authority-seo", "measurement"];
 
 function printUsage() {
   console.log(`
