@@ -6,6 +6,11 @@ import { activeHandler } from "./handler.js";
 import { renderPodUiHtml } from "./ui.js";
 import { handleMcpRequest } from "./mcp.js";
 import { TaskRecord } from "./types.js";
+import {
+  getPortfolioSweepState,
+  PORTFOLIO_SWEEP_DOMAINS,
+  runPortfolioSweep,
+} from "./portfolio-sweep.js";
 
 interface Env {
   DB: D1Database | PodStorage;
@@ -235,17 +240,69 @@ export default {
       }
     }
 
+    // API: Portfolio SEO/AEO Sweep (Latest Snapshot & On-Demand Trigger)
+    if (method === "GET" && url.pathname === "/api/sweep/latest") {
+      const state = await getPortfolioSweepState(db);
+      return new Response(
+        JSON.stringify({
+          podId: config.id,
+          trackedDomains: PORTFOLIO_SWEEP_DOMAINS.length,
+          ...state,
+        }),
+        { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
+    if (method === "POST" && url.pathname === "/api/sweep") {
+      try {
+        const body = (await request.json().catch(() => ({}))) as any;
+        const sweepResult = await runPortfolioSweep(env, db, {
+          batchSize: typeof body.batchSize === "number" ? body.batchSize : 6,
+          domains: Array.isArray(body.domains) ? body.domains : undefined,
+          cursor: typeof body.cursor === "number" ? body.cursor : undefined,
+        });
+        await tincan.publish("seo.sweep.completed", "pod:pm", {
+          podId: config.id,
+          sweptCount: sweepResult.sweptCount,
+          nextCursor: sweepResult.nextCursor,
+          totalPortfolio: sweepResult.totalPortfolio,
+        });
+        return new Response(JSON.stringify({ success: true, ...sweepResult }), {
+          status: 200,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      } catch (err: any) {
+        return new Response(JSON.stringify({ error: err?.message || "Sweep failed" }), {
+          status: 500,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
+    }
+
     return new Response(JSON.stringify({ error: "Not found" }), {
       status: 404,
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
   },
 
-  // Scheduled cron worker: runs periodic heartbeats & polls Factory Hub for tasks
+  // Scheduled cron worker: runs periodic heartbeats, polls Factory Hub, and executes rotating portfolio SEO/AEO sweeps
   async scheduled(event: any, env: Env): Promise<void> {
     const config = loadPodConfig(env as any);
     const tincan = new TincanClient(config, env.FACTORY_HUB);
     const db: PodStorage = toPodStorage(env.DB);
+
+    // 0. Rotating portfolio SEO/AEO sweep on the 4-hour cron
+    if (event?.cron === "0 */4 * * *") {
+      const sweepResult = await runPortfolioSweep(env, db, { batchSize: 6 });
+      await tincan.publish("seo.sweep.completed", "pod:pm", {
+        podId: config.id,
+        scheduled: true,
+        sweptCount: sweepResult.sweptCount,
+        nextCursor: sweepResult.nextCursor,
+        totalPortfolio: sweepResult.totalPortfolio,
+      });
+      return;
+    }
     // 1. Send heartbeat & persist locally
     const hbOk = await tincan.sendHeartbeat();
     await recordPodHeartbeat(db, config.id, {
