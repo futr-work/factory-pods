@@ -1,6 +1,6 @@
 {
   "name": "factory-pods",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Factory Pods: open-source autonomous edge workers on Cloudflare Workers, by futr.work",
   "private": true,
   "type": "module",
