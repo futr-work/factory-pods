@@ -291,9 +291,9 @@ export default {
     const tincan = new TincanClient(config, env.FACTORY_HUB);
     const db: PodStorage = toPodStorage(env.DB);
 
-    // 0. Rotating portfolio SEO/AEO sweep on the 4-hour cron
+    // 0. Rotating portfolio SEO/AEO sweep on the 4-hour cron (8 sites/run -> full 52-site sweep ~daily)
     if (event?.cron === "0 */4 * * *") {
-      const sweepResult = await runPortfolioSweep(env, db, { batchSize: 6 });
+      const sweepResult = await runPortfolioSweep(env, db, { batchSize: 8 });
       await tincan.publish("seo.sweep.completed", "pod:pm", {
         podId: config.id,
         scheduled: true,

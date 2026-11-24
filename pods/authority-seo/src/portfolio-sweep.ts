@@ -2,10 +2,12 @@ import { PodStorage } from "@futr-work/pod-kernel/storage";
 import { OrreryConnector, OrreryConnectorEnv } from "./orrery-connector.js";
 
 /**
- * Canonical active portfolio domains for scheduled SEO/AEO sweeps.
+ * Canonical full active portfolio domains (52 live/active sites across Walter CF,
+ * Huw CF, and Netlify/External DNS) for scheduled SEO/AEO sweeps.
  * Excludes lost/dropped domains and cold-email redirect aliases.
  */
 export const PORTFOLIO_SWEEP_DOMAINS: string[] = [
+  // Walter CF + Netlify / External (GSC /u/2 - walterhudson462@gmail.com)
   "https://birthverse.com",
   "https://caryemergencytreeremoval.com",
   "https://brazenkitchen.com",
@@ -16,24 +18,49 @@ export const PORTFOLIO_SWEEP_DOMAINS: string[] = [
   "https://applyforsavings.com",
   "https://nailfungusalert.com",
   "https://aaa-credit.com",
-  "https://quoteotter.com",
-  "https://callfinix.com",
-  "https://mediwells.com",
-  "https://callexchange.io",
-  "https://pearlfinancing.com",
+  "https://backflowfittings.com",
+  "https://blynkstyle.com",
+  "https://cannabiscreate.com",
+  "https://character-toys.co.uk",
+  "https://divisionathletics.com",
+  "https://eesa.app",
+  "https://elritoholdings.com",
+  "https://firehawkcoffee.com",
+  "https://flexformlabs.com",
   "https://fractionpath.com",
+  "https://funnelventures.com",
   "https://futr.work",
-  "https://rxrev.com",
   "https://golfinggurus.com",
-  "https://astrologytraining.com",
+  "https://hayekgold.co",
+  "https://homesavingsdirect.com",
+  "https://lifeartwork.com",
+  "https://olivebuildingltd.com",
+  "https://patriotwarrior.org",
+  "https://potlucktime.com",
+  "https://realestateinthesanjuans.com",
+  "https://redcloudventures.co",
   "https://stock-market-lessons.com",
   "https://supplementheadquarters.com",
   "https://usefulspaces.net",
-  "https://firehawkcoffee.com",
-  "https://flexformlabs.com",
-  "https://patriotwarrior.org",
-  "https://realestateinthesanjuans.com",
-  "https://hayekgold.co",
+  "https://werkplaces.com",
+  "https://whitechapel.world",
+  "https://workbot.work",
+  "https://astrologytraining.com",
+  // Huw CF (GSC /u/4 - huw@quoteotter.com)
+  "https://assuredautoinsurance.com",
+  "https://assuredfinalexpense.com",
+  "https://callexchange.io",
+  "https://callfinix.com",
+  "https://healthcoveragepros.com",
+  "https://heritagefamilysolutions.com",
+  "https://insuranceratesfinder.com",
+  "https://mediwells.com",
+  "https://pearlfinancing.com",
+  "https://quoteotter.com",
+  "https://rxrev.com",
+  "https://totalbenefitsguide.com",
+  "https://westhavenpartners.co",
+  "https://yellowtack.com",
 ];
 
 export interface SweepDomainSummary {
@@ -87,7 +114,7 @@ export async function runPortfolioSweep(
 ): Promise<PortfolioSweepResult> {
   const state = await getPortfolioSweepState(db);
   const totalPortfolio = PORTFOLIO_SWEEP_DOMAINS.length;
-  const batchSize = Math.max(1, Math.min(options.batchSize ?? 6, 12));
+  const batchSize = Math.max(1, Math.min(options.batchSize ?? 8, 12));
   const startCursor =
     typeof options.cursor === "number" && options.cursor >= 0
       ? options.cursor % totalPortfolio
