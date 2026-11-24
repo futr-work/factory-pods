@@ -1,6 +1,6 @@
 {
   "name": "@futr-work/create-factory-pod",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Scaffold a new autonomous worker pod on Cloudflare Workers and MCP v2",
   "type": "module",
   "bin": {
@@ -19,7 +19,7 @@
   ],
   "author": "futr.work",
   "license": "MIT",
-  "kernelVersion": "0.1.0",
+  "kernelVersion": "0.2.0",
   "homepage": "https://futr.work",
   "bugs": {
     "url": "https://github.com/futr-work/factory-pods/issues"

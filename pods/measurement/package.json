@@ -1,6 +1,6 @@
 {
   "name": "measurement-pod",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "Autonomous low-frequency measurement and evidence pod: typed multi-family observations, immutable provenance, coverage/reconciliation, MCP v2 + Code Mode, and Worldview-ready projection",
@@ -23,6 +23,6 @@
     "wrangler": "^4.158.0"
   },
   "dependencies": {
-    "@futr-work/pod-kernel": "^0.1.0"
+    "@futr-work/pod-kernel": "^0.2.0"
   }
 }
