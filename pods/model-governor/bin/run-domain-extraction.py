@@ -2,6 +2,7 @@
 """Run one frozen Domain Scout merge. One authorized native retry can follow a verified empty output or upstream timeout."""
 import argparse
 import csv
+import fcntl
 import json
 import os
 import runpy
@@ -116,6 +117,12 @@ def deadline(seconds):
         signal.signal(signal.SIGALRM, old)
 
 
+def timestamp(value):
+    t = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    require(t.tzinfo is not None, "quota reset must include its UTC offset")
+    return t
+
+
 def freeze(args):
     require(ident(args.task_ref) and ident(args.caller) and len(args.caller) <= 200, "invalid task reference or caller")
     require(args.model.startswith("openrouter:") and args.model.endswith(":free") and ident(args.model),
@@ -129,6 +136,10 @@ def freeze(args):
     if timeout_ms is not None:
         require("upstream_timeout" in recover_on and type(timeout_ms) is int and 1000 <= timeout_ms <= DEFAULT_UPSTREAM_TIMEOUT_MS,
                 "a shorter upstream deadline requires --oauth-on-timeout and 1000..120000 milliseconds")
+    not_before = getattr(args, "oauth_not_before", None)
+    if not_before is not None:
+        require(recover_on, "quota reset requires an authorized OAuth recovery")
+        not_before = timestamp(not_before).astimezone(timezone.utc).isoformat()
     park, dyn = read_file(args.park), read_file(args.dynadot)
     inventory, rows, _ = COLLECTOR["source_inventory"](park, dyn)
     inputs = {}
@@ -151,6 +162,8 @@ def freeze(args):
              "briefSha256": sha(brief), "sourceSha256": {"park.csv": sha(park), "dynadot.csv": sha(dyn)},
              "sourceRows": rows, "sourceUnionDomains": len(inventory), "rubric": RUN_RUBRIC, "baseRubric": COLLECTOR["RUBRIC"],
              "rubricSha256": sha(canonical(RUN_RUBRIC))}
+    if not_before:
+        facts["oauthNotBefore"] = not_before
     save(args.out / "frozen.json", facts)
     return park, dyn, brief, facts
 
@@ -491,11 +504,10 @@ def run(args, governor, native=invoke_native):
     park, dyn, brief, frozen = freeze(args)
     base = {"taskRef": args.task_ref, "runId": frozen["runId"], "briefSha256": sha(brief)}
     tid = "domain-extract:" + frozen["runId"]
-    steps, batch = [], []
+    batch = []
     first = dict(base, attempt=1, taskId=tid + ":1", caller=args.caller, requestedRoute=args.model,
                  startedAt=stamp(), accepted=False, requestIssued=False, authorizedRecovery=frozen["authorizedRecovery"],
                  timeoutMs=frozen["upstreamTimeoutMs"], explicitTimeoutOverride=frozen["explicitTimeoutOverride"])
-    steps.append(first)
     folder = args.out / "attempt-1"
     folder.mkdir()
     prior = folder / "step.json"
@@ -532,8 +544,19 @@ def run(args, governor, native=invoke_native):
     save(prior, first)
     if event:
         batch.append(link(event, first, args.model))
-    if first.get("trigger") in frozen["authorizedRecovery"]:
-        folder = args.out / "attempt-2"
+    return finish(args.out, park, dyn, brief, frozen, first, batch, started, tic, native)
+
+
+def finish(out, park, dyn, brief, frozen, first, batch, started, tic, native):
+    base = {k: first[k] for k in ("taskRef", "runId", "briefSha256")}
+    tid = "domain-extract:" + frozen["runId"]
+    prior = out / "attempt-1/step.json"
+    steps = [first]
+    eligible = first.get("trigger") in frozen["authorizedRecovery"]
+    reset = frozen.get("oauthNotBefore")
+    deferred = eligible and reset is not None and timestamp(reset) > datetime.now(timezone.utc)
+    if eligible and not deferred:
+        folder = out / "attempt-2"
         second = dict(base, attempt=2, taskId=tid + ":2", startedAt=stamp(), accepted=False,
                       trigger=first["trigger"], priorTaskId=first["taskId"], priorReceiptSha256=sha(prior.read_bytes()),
                       requestedRoute="anthropic-oauth/" + NATIVE, oauthQuotaDebit=None)
@@ -541,7 +564,7 @@ def run(args, governor, native=invoke_native):
         event = None
         native_clock = time.monotonic()
         try:
-            native(args.out / "brief.txt", folder, prior)
+            native(out / "brief.txt", folder, prior)
             n, artifact, digest = verify_native(folder, prior, first, brief)
             second.update(reportedModel=n["providerReportedModel"], generationId=n["responseId"], usage=n["usage"],
                           generationInvocations=1, nativeReceiptSha256=digest, finishReason=n["stopReason"], nativeTurnCompleted=True,
@@ -590,13 +613,56 @@ def run(args, governor, native=invoke_native):
                   observedTokenSubtotals={"prompt": inputs, "output": outputs, "combined": observed_total},
                   exactTokenTotalsKnown=known, apiCostUsd=usage1.get("cost") if first.get("trigger") != "upstream_timeout" else None,
                   observedPrimaryCostUsd=usage1.get("cost"), oauthQuotaDebit=None, steps=steps)
-    save(args.out / "batch.json", batch)
-    save(args.out / "summary.json", report)
+    if deferred:
+        report.update(recoveryStatus="deferred_quota", oauthNotBefore=reset,
+                      priorReceiptSha256=sha(prior.read_bytes()))
+    save(out / "batch.json", batch)
+    save(out / "summary.json", report)
     return report
+
+
+def resume(out, native=invoke_native):
+    # Only a recorded zero-invocation deferral is resumable. Never replay an ambiguous native exit.
+    with (out / "frozen.json").open("rb") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        frozen = json.load(lock)
+        report = json.loads(read_file(out / "summary.json"))
+        prior = out / "attempt-1/step.json"
+        first = json.loads(read_file(prior))
+        require(report.get("recoveryStatus") == "deferred_quota" and report.get("steps") == [first]
+                and report.get("nativeGenerationInvocations") == 0
+                and report.get("priorReceiptSha256") == sha(prior.read_bytes())
+                and not (out / "attempt-2").exists()
+                and not (prior.parent / ".claude-oauth-recovery.once").exists(),
+                "requires an unclaimed, quota-deferred run")
+        require(first.get("trigger") in frozen["authorizedRecovery"]
+                and all(first[k] == frozen[k] for k in ("runId", "taskRef", "briefSha256", "caller"))
+                and report["oauthNotBefore"] == frozen["oauthNotBefore"]
+                and frozen["rubric"] == RUN_RUBRIC and frozen["rubricSha256"] == sha(canonical(RUN_RUBRIC)), "deferred run lineage changed")
+        if timestamp(frozen["oauthNotBefore"]) > datetime.now(timezone.utc):
+            return report
+        park, dyn = (read_file(out / "sources" / k) for k in ("park.csv", "dynadot.csv"))
+        brief = read_file(out / "brief.txt")
+        require(frozen["sourceSha256"] == {"park.csv": sha(park), "dynadot.csv": sha(dyn)}
+                and frozen["briefSha256"] == sha(brief), "deferred run input changed")
+        batch = json.loads(read_file(out / "batch.json"))
+        tic = time.monotonic() - (datetime.now(timezone.utc) - timestamp(report["startedAt"])).total_seconds()
+        return finish(out, park, dyn, brief, frozen, first, batch, report["startedAt"], tic, native)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    if sys.argv[1:2] == ["--resume-oauth"]:
+        parser.add_argument("--resume-oauth", type=Path, required=True, metavar="RUN")
+        args = parser.parse_args()
+        os.umask(0o077)
+        try:
+            report = resume(args.resume_oauth)
+        except FAILURES as err:
+            parser.exit(2, f"Could not resume OAuth recovery: {error_info(err)}\n")
+        print(json.dumps({k: report.get(k) for k in ("runId", "accepted", "nativeGenerationInvocations", "recoveryStatus")}))
+        return 0 if report["accepted"] else 1
+    parser.add_argument("--oauth-not-before", help="earliest OAuth retry (ISO 8601 offset timestamp) from a known provider quota reset; resume the saved run using --resume-oauth RUN")
     for name in ("park", "dynadot", "out", "admin-token-file", "client-token-file"):
         parser.add_argument("--" + name, type=Path, required=True)
     for name in ("origin", "task-ref", "caller"):

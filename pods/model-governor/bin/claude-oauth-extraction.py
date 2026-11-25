@@ -159,11 +159,65 @@ def child_env():
     return env
 
 
+class NativeExit(Unverified):
+    def __init__(self, code, category, reset=None):
+        self.code, self.category, self.reset = code, category, reset
+        super().__init__("native CLI failed: " + category)
+
+
+def native_reset(stdout):
+    resets = []
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except (ValueError, UnicodeError):
+            continue
+        if not isinstance(event, dict) or event.get("type") != "rate_limit_event":
+            continue
+        info = event.get("rate_limit_info")
+        if not isinstance(info, dict) or info.get("status") != "rejected":
+            continue
+        seconds = info.get("resetsAt")
+        # Native CLI uses Unix seconds. Never persist free-form error text as a timestamp.
+        if type(seconds) is int and 0 < seconds < 4102444800:
+            resets.append(seconds)
+    return datetime.fromtimestamp(max(resets), timezone.utc).isoformat() if resets else None
+
+
+def failure_category(stdout, stderr):
+    """Return a fixed diagnostic label only. Never echo model output, error text, arguments or account data."""
+    text = stderr[:4096].decode("utf-8", errors="replace")
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except (ValueError, UnicodeError):
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "rate_limit_event" and isinstance(event.get("rate_limit_info"), dict):
+            if event["rate_limit_info"].get("status") == "rejected":
+                return "native_rate_limit"
+        if event.get("type") == "result" and event.get("is_error") is True:
+            if event.get("subtype") in ("error_max_turns", "error_max_budget_usd"):
+                return event["subtype"]
+            if isinstance(event.get("result"), str):
+                text += "\n" + event["result"][:4096]
+    # Use reported API status rather than inference from timing or text from a normal assistant reply.
+    match = re.search(r"(?im)^\s*(?:error:\s*)?api error:?\s*(401|402|403|429|500|502|503|504|529)\b", text)
+    if match:
+        return "native_api_http_" + match.group(1)
+    if re.search(r"(?im)^you['’]ve hit your (?:5-hour|weekly|session) limit(?:\s|[·.]|$)", text):
+        return "native_rate_limit"
+    if re.search(r"(?im)^\s*error:\s*(unknown option|missing required argument|option .+ argument missing)\b", text):
+        return "native_cli_arguments"
+    return "unclassified_native_exit"
+
+
 def invoke(args, cwd, env, timeout, stdin=b""):
     with subprocess.Popen(args, cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                          stderr=subprocess.DEVNULL, start_new_session=True) as proc:
+                          stderr=subprocess.PIPE, start_new_session=True) as proc:
         try:
-            output, _ = proc.communicate(stdin, timeout=timeout)
+            output, stderr = proc.communicate(stdin, timeout=timeout)
         except BaseException:
             if proc.poll() is None:
                 try:
@@ -172,6 +226,8 @@ def invoke(args, cwd, env, timeout, stdin=b""):
                     pass
             proc.wait()
             raise
+        if proc.returncode:
+            raise NativeExit(proc.returncode, failure_category(output, stderr), native_reset(output))
         return proc.returncode, output
 
 
@@ -294,6 +350,11 @@ def recover(prompt_file, out, previous, timeout, *, upstream_timeout_ms=None):
             tmp.write_bytes(data)
             tmp.replace(out / "inventory.csv")
             info["status"] = "returned-ungraded"
+    except NativeExit as e:
+        info.update(status="unverified", exit=e.code, nativeFailureCategory=e.category, error=str(e))
+        if e.reset:
+            info["oauthNotBefore"] = e.reset
+        raise
     except subprocess.TimeoutExpired:
         info.update(status="timeout", error="native command exceeded its time bound")
         raise Unverified(info["error"]) from None

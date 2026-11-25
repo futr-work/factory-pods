@@ -231,6 +231,38 @@ class Recovery(unittest.TestCase):
                 self.assertEqual(json.loads((out/"native.json").read_text())["generationInvocations"], 0)
                 self.assertFalse((out/"inventory.csv").exists())
 
+    def test_native_exit_records_only_allowlisted_diagnostics_without_retrying(self):
+        secret = "private-diagnostic-material"
+        scenarios = [
+            ({"type":"rate_limit_event","rate_limit_info":{"status":"rejected"}}, "", "native_rate_limit"),
+            ({"type":"result","is_error":True,"result":"API Error: 401 " + secret}, "", "native_api_http_401"),
+            ({"type":"assistant","message":{"content":[{"type":"text","text":"API Error: 429"}]}}, secret, "unclassified_native_exit"),
+            ({"type":"result","is_error":True,"subtype":"error_max_turns"}, "", "error_max_turns"),
+            ({}, "error: unknown option " + secret, "native_cli_arguments"),
+        ]
+        scenarios.append(({"type":"result","is_error":True,"result":"You’ve hit your 5-hour limit · resets 12:10am"}, "", "native_rate_limit"))
+        event = {"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1795075800}}
+        self.assertEqual(helper.native_reset(lines([event])), "2026-11-19T08:10:00+00:00")
+        self.assertIsNone(helper.native_reset(lines([{"type":"assistant","rate_limit_info":event["rate_limit_info"]}])))
+        for event, stderr, category in scenarios:
+            with self.subTest(category=category):
+                self.assertEqual(helper.failure_category(lines([event]), stderr.encode()), category)
+        def fail_cli(args, *rest):
+            if args[1:] == ["auth","status"]:
+                return self.fake(args,*rest)
+            # No model or network: this local subprocess mimics the failing CLI exit.
+            return original(["/bin/sh","-c",'echo "API Error: 429 private-diagnostic-material" >&2; exit 1'],
+                            self.root, {}, 3)
+        original = helper.invoke
+        with patch.object(helper,"invoke",fail_cli), self.assertRaises(helper.NativeExit):
+            self.run_helper()
+        receipt = json.loads((self.out/"native.json").read_text())
+        self.assertEqual(receipt["exit"],1)
+        self.assertEqual(receipt["generationInvocations"],1)
+        self.assertEqual(receipt["nativeFailureCategory"],"native_api_http_429")
+        self.assertNotIn(secret,json.dumps(receipt))
+        self.assertFalse((self.out/"inventory.csv").exists())
+
     def test_timeout_consumes_claim_and_replay_is_blocked(self):
         def slow(*args, **kwargs):
             if args[0][1:]==["auth","status"]:

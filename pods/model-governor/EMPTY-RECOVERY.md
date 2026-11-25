@@ -20,6 +20,16 @@ A nonempty result is retained byte-for-byte in each attempt's `inventory.csv`. T
 `summary.json` records the actual stages, timestamps, measured usage and acceptance. Partial or unavailable totals remain unknown. `frozen.json`, the original inputs, step receipts, the linked D1 row on empty output, native receipt (when reached), and per-artifact measurements allow offline review. `batch.json` is a compatible evidence-import batch; posting to D1 is a separate explicit action. Exit code 0 indicates an accepted final artifact, 1 an unsuccessful run, and 2 an invalid setup or already claimed run directory. An interrupted run directory cannot be resumed or reused to make a second generation.
 
 
+## Known Claude quota reset
+
+If Claude reports an exhausted quota window, pass its next reset as an offset-aware ISO timestamp with `--oauth-not-before` on the original run. A verified primary failure before that time records `deferred_quota`, the D1 receipt, and zero OAuth invocations. After the reset, resume that directory once:
+
+```sh
+python3 bin/run-domain-extraction.py --resume-oauth ./extraction-run
+```
+
+An early resume returns the deferred status. A due resume verifies the frozen inputs, rubric and prior receipt before claiming the single native attempt. The runner includes the quota wait in end-to-end elapsed time. Native failure receipts retain a recognized error category and a structured provider reset time when available.
+
 ## Optional upstream timeout recovery
 
 Add `--oauth-on-timeout` to accept an authenticated, Governor-owned upstream deadline failure that produced no visible artifact. This option can stand alone or accompany `--oauth-on-empty`. They share one recovery slot and one claim for the frozen run. Both requests use the original brief bytes. The primary token cap stays at 12,000.
