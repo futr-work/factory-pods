@@ -1591,6 +1591,51 @@ describe("Measurement Pod — Typed 4-Family Vertical Slice, Isolation, MCP v2 +
       });
       assert.equal(res1000.inserted, 1000);
       assert.ok(dbQueries < 30, `Expected < 30 DB queries for 1,000-obs atomic batch, got ${dbQueries}`);
+
+      // 7. Delimiter collision regression: registering metric 'clicks@v1' version 'blue' must NOT match 'clicks' version 'v1@blue'
+      assert.equal(
+        (await h.call("POST", "/api/measurement/definitions", h.tokenA, {
+          tenantId: "tenant-alpha",
+          metricId: "clicks@v1",
+          version: "blue",
+          family: "seo",
+          unit: "count",
+          valueType: "integer",
+          grain: "daily",
+          windowTz: "UTC",
+          dimensionsSchema: { page: { type: "string", required: true } },
+          aggregationRule: "sum",
+        })).status,
+        201
+      );
+      const delimRes = await h.call("POST", "/api/measurement/ingest-atomic", h.tokenA, {
+        tenantId: "tenant-alpha",
+        groups: [{
+          resourceId: "site-alpha",
+          source: "gsc_export",
+          runId: "run-delim-check",
+          runIdempotencyKey: "idem-delim-check",
+          sourceResourceId: "sc-domain:alpha.test",
+          windowStart: "2026-11-26",
+          windowEnd: "2026-11-26",
+          evidence: mkEv("ev-delim-check", await sha256Hex("ev-delim-check")),
+          observations: [{
+            metricId: "clicks",
+            definitionVersion: "v1@blue",
+            windowStart: "2026-11-26",
+            windowEnd: "2026-11-26",
+            windowTz: "UTC",
+            grain: "daily",
+            dimensions: { page: "/delim" },
+            valueNum: 5,
+            interpretationVersion: "v1",
+            sourceRevision: 1,
+            sourceAsOf: "2026-11-26T00:00:00Z",
+            idempotencyKey: "obs-delim-check",
+          }],
+        }],
+      });
+      assert.equal(delimRes.status, 400);
     } finally {
       h.cleanup();
     }

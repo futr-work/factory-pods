@@ -717,7 +717,7 @@ export class MeasurementService {
       .bind(tenantId)
       .all<any>();
     for (const defRow of defRows.results || []) {
-      const defKey = `${tenantId}:${defRow.metric_id}@${defRow.version}`;
+      const defKey = JSON.stringify([tenantId, defRow.metric_id, defRow.version]);
       defCache.set(defKey, {
         tenantId: defRow.tenant_id,
         metricId: defRow.metric_id,
@@ -1208,7 +1208,7 @@ export class MeasurementService {
 
       const metricId = requireNonEmptyString(obs.metricId, `observations[${i}].metricId`, 128);
       const defVer = requireNonEmptyString(obs.definitionVersion, `observations[${i}].definitionVersion`, 64);
-      const defKey = `${tenantId}:${metricId}@${defVer}`;
+      const defKey = JSON.stringify([tenantId, metricId, defVer]);
       let def = defCache.get(defKey);
       if (!def) {
         const defRow = await this.db
