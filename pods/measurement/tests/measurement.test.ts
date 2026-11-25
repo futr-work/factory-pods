@@ -1760,6 +1760,145 @@ describe("Measurement Pod — Typed 4-Family Vertical Slice, Isolation, MCP v2 +
       const afterBad = (await (await h.call("GET", "/api/measurement/series?tenantId=tenant-alpha&resourceId=site-alpha&metricId=gsc.clicks&windowStart=2026-11-29&windowEnd=2026-11-29", h.tokenA)).json()) as any;
       assert.equal(afterBad.total, 0);
       assert.equal((await h.call("POST", "/api/measurement/imports/imp-bad/abort", h.tokenA, { tenantId: "tenant-alpha" })).status, 200);
+
+      // 10. Regression checks for staged-import races, TOCTOU isolation, and batched read query budget:
+      // 10a. Batched prefetch reads keep a multi-chunk staged import with 1,200 single-observation groups to <= 4 DB calls!
+      const singleObsGroups = await Promise.all(
+        Array.from({ length: 1200 }, async (_, i) => ({
+          resourceId: "site-alpha",
+          source: "gsc_export",
+          runId: `run-q4-${i}`,
+          runIdempotencyKey: `idem-q4-${i}`,
+          sourceResourceId: "sc-domain:alpha.test",
+          windowStart: "2026-11-30",
+          windowEnd: "2026-11-30",
+          evidence: mkEv(`ev-q4-${i}`, await sha256Hex(`ev-q4-${i}`)),
+          observations: [{
+            metricId: "gsc.clicks", definitionVersion: "v1",
+            windowStart: "2026-11-30", windowEnd: "2026-11-30", windowTz: "UTC", grain: "daily",
+            dimensions: { page: `/q4/${i}` }, valueNum: i,
+            interpretationVersion: "v1", sourceRevision: 1, sourceAsOf: "2026-11-30T00:00:00Z",
+            idempotencyKey: `obs-q4-${i}`,
+          }],
+        }))
+      );
+      await countedSvc.stageImportChunk({ tenantId: "tenant-alpha", importId: "imp-q4", chunkIndex: 0, groups: singleObsGroups.slice(0, 600) });
+      await countedSvc.stageImportChunk({ tenantId: "tenant-alpha", importId: "imp-q4", chunkIndex: 1, groups: singleObsGroups.slice(600, 1200) });
+      dbQueries = 0;
+      const q4Commit = await countedSvc.commitStagedImport({ tenantId: "tenant-alpha", importId: "imp-q4", expectedChunks: 2 });
+      assert.equal(q4Commit.inserted, 1200);
+      assert.ok(dbQueries <= 4, `Expected <= 4 DB invocation calls (batched reads + write) for 1,200-group staged commit, got ${dbQueries}`);
+
+      // 10b. Concurrent/duplicate staging returns 200 (identical) or 409 (conflicting), never 500
+      const raceGroup = [{
+        resourceId: "site-alpha", source: "gsc_export",
+        runId: "run-race-stage", runIdempotencyKey: "idem-race-stage",
+        sourceResourceId: "sc-domain:alpha.test",
+        windowStart: "2026-12-01", windowEnd: "2026-12-01",
+        evidence: mkEv("ev-race-stage", await sha256Hex("ev-race-stage")),
+        observations: [{
+          metricId: "gsc.clicks", definitionVersion: "v1",
+          windowStart: "2026-12-01", windowEnd: "2026-12-01", windowTz: "UTC", grain: "daily",
+          dimensions: { page: "/race-stage" }, valueNum: 1,
+          interpretationVersion: "v1", sourceRevision: 1, sourceAsOf: "2026-12-01T00:00:00Z",
+          idempotencyKey: "obs-race-stage",
+        }],
+      }];
+      const [rStage1, rStage2] = await Promise.all([
+        h.call("POST", "/api/measurement/imports/stage", h.tokenA, { tenantId: "tenant-alpha", importId: "imp-race", chunkIndex: 0, groups: raceGroup }),
+        h.call("POST", "/api/measurement/imports/stage", h.tokenA, { tenantId: "tenant-alpha", importId: "imp-race", chunkIndex: 0, groups: raceGroup }),
+      ]);
+      assert.deepEqual([rStage1.status, rStage2.status].sort(), [200, 201]);
+      const diffStage = await h.call("POST", "/api/measurement/imports/stage", h.tokenA, {
+        tenantId: "tenant-alpha", importId: "imp-race", chunkIndex: 0,
+        groups: [{ ...raceGroup[0], observations: [{ ...raceGroup[0].observations[0], valueNum: 2 }] }],
+      });
+      assert.equal(diffStage.status, 409);
+
+      // 10c. Concurrent unseen chunk arriving AFTER commit/abort snapshot read is NEVER committed without auth and NEVER deleted!
+      let injectedAfterRead = false;
+      const interceptDb = {
+        prepare(sql: string) {
+          const stmt = origPrepare(sql);
+          return {
+            bind(...params: any[]) {
+              const bound = stmt.bind(...params);
+              return {
+                first: (...a: any[]) => (bound.first as any)(...a),
+                all: async (...a: any[]) => {
+                  const res = await (bound.all as any)(...a);
+                  if (!injectedAfterRead && sql.includes("FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ?")) {
+                    injectedAfterRead = true;
+                    // Simulate chunk 1 for site-beta arriving right after snapshot read!
+                    await origPrepare(
+                      "INSERT INTO ms_staged_imports (tenant_id, import_id, chunk_index, resource_ids_json, groups_json, created_at) VALUES (?, ?, ?, ?, ?, ?)"
+                    )
+                      .bind(
+                        "tenant-alpha",
+                        "imp-race",
+                        1,
+                        JSON.stringify(["site-beta"]),
+                        JSON.stringify([{
+                          resourceId: "site-beta", source: "gsc_export",
+                          runId: "run-beta-unseen", runIdempotencyKey: "idem-beta-unseen",
+                          sourceResourceId: "sc-domain:beta.test",
+                          windowStart: "2026-12-01", windowEnd: "2026-12-01",
+                          evidence: mkEv("ev-beta-unseen", await sha256Hex("ev-beta-unseen")),
+                          observations: [{
+                            metricId: "gsc.clicks", definitionVersion: "v1",
+                            windowStart: "2026-12-01", windowEnd: "2026-12-01", windowTz: "UTC", grain: "daily",
+                            dimensions: { page: "/beta-unseen" }, valueNum: 77,
+                            interpretationVersion: "v1", sourceRevision: 1, sourceAsOf: "2026-12-01T00:00:00Z",
+                            idempotencyKey: "obs-beta-unseen",
+                          }],
+                        }]),
+                        Date.now()
+                      )
+                      .run();
+                  }
+                  return res;
+                },
+                run: (...a: any[]) => (bound.run as any)(...a),
+                _raw: bound,
+              };
+            },
+            first: (...a: any[]) => (stmt.first as any)(...a),
+            all: (...a: any[]) => (stmt.all as any)(...a),
+            run: (...a: any[]) => (stmt.run as any)(...a),
+          };
+        },
+        batch(stmts: any[]) {
+          return origBatch(stmts.map((s) => s._raw ?? s));
+        },
+      };
+      const interceptSvc = new MeasurementService(interceptDb as any);
+      const narrowCommit = await interceptSvc.commitStagedImport(
+        { tenantId: "tenant-alpha", importId: "imp-race", expectedChunks: 1 },
+        Date.now(),
+        {
+          authorizeResourceWrite: (rid: string) => {
+            if (rid !== "site-alpha") throw new Error("forbidden");
+          },
+        }
+      );
+      assert.equal(narrowCommit.inserted, 1);
+      // Chunk 1 (site-beta) MUST still remain intact in ms_staged_imports (NOT deleted!) and NOT committed!
+      const remainingStaged = await h.db
+        .prepare("SELECT chunk_index FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ?")
+        .bind("tenant-alpha", "imp-race")
+        .all<any>();
+      assert.deepEqual((remainingStaged.results || []).map((r: any) => Number(r.chunk_index)), [1]);
+      assert.equal((await h.call("GET", "/api/measurement/runs/run-beta-unseen?tenantId=tenant-alpha", h.tokenA)).status, 404);
+      // Narrow caller attempting to abort now sees site-beta chunk 1 and MUST receive 403!
+      assert.equal(
+        (await h.call("POST", "/api/measurement/imports/imp-race/abort", narrowToken, { tenantId: "tenant-alpha" })).status,
+        403
+      );
+      // Authorized full caller can abort cleanly
+      assert.equal(
+        (await h.call("POST", "/api/measurement/imports/imp-race/abort", h.tokenA, { tenantId: "tenant-alpha" })).status,
+        200
+      );
     } finally {
       h.cleanup();
     }

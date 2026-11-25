@@ -48,6 +48,14 @@ export class NotFoundError extends Error {
   }
 }
 
+export class ForbiddenError extends Error {
+  public readonly status = 403;
+  constructor(message: string) {
+    super(message);
+    this.name = "ForbiddenError";
+  }
+}
+
 const RESOURCE_TYPES = new Set<ResourceType>(["site", "analytics_property", "ad_account", "server_service"]);
 const METRIC_FAMILIES = new Set<MetricFamily>(["seo", "analytics", "spend", "telemetry"]);
 const VALUE_TYPES = new Set<ValueType>(["integer", "decimal_string", "gauge", "counter"]);
@@ -716,93 +724,106 @@ export class MeasurementService {
       }
     }
 
-    const defRows = await this.db
-      .prepare("SELECT * FROM ms_definitions WHERE tenant_id = ?")
-      .bind(tenantId)
-      .all<any>();
-    for (const defRow of defRows.results || []) {
-      const defKey = JSON.stringify([tenantId, defRow.metric_id, defRow.version]);
-      defCache.set(defKey, {
-        tenantId: defRow.tenant_id,
-        metricId: defRow.metric_id,
-        version: defRow.version,
-        family: defRow.family,
-        unit: defRow.unit,
-        valueType: defRow.value_type,
-        grain: defRow.grain,
-        windowTz: defRow.window_tz,
-        dimensionsSchema: JSON.parse(defRow.dimensions_schema_json),
-        numeratorRule: defRow.numerator_rule,
-        denominatorRule: defRow.denominator_rule,
-        exclusionsRule: defRow.exclusions_rule,
-        aggregationRule: defRow.aggregation_rule,
-        comparabilityKey: defRow.comparability_key,
-        createdAt: defRow.created_at,
-      });
-    }
+    // Batch ALL bounded prefetch reads into ONE db.batch() invocation (counts as 1 D1 query even for 20,000 groups!)
+    const readStmts: any[] = [];
+    const readKinds: Array<"def" | "res" | "runId" | "runIdem" | "ev" | "obs"> = [];
+
+    readStmts.push(this.db.prepare("SELECT * FROM ms_definitions WHERE tenant_id = ?").bind(tenantId));
+    readKinds.push("def");
 
     const rids = [...resourceIds];
     for (let i = 0; i < rids.length; i += MAX_IN_CLAUSE_ITEMS) {
       const chunk = rids.slice(i, i + MAX_IN_CLAUSE_ITEMS);
       const placeholders = chunk.map(() => "?").join(", ");
-      const res = await this.db
-        .prepare(`SELECT resource_id, entity_urn, source_resource_id FROM ms_resources WHERE tenant_id = ? AND resource_id IN (${placeholders})`)
-        .bind(tenantId, ...chunk)
-        .all<any>();
-      for (const row of res.results || []) {
-        resourceMap.set(row.resource_id, row);
-      }
+      readStmts.push(
+        this.db
+          .prepare(`SELECT resource_id, entity_urn, source_resource_id FROM ms_resources WHERE tenant_id = ? AND resource_id IN (${placeholders})`)
+          .bind(tenantId, ...chunk)
+      );
+      readKinds.push("res");
     }
 
     const rIds = [...runIds];
     for (let i = 0; i < rIds.length; i += MAX_IN_CLAUSE_ITEMS) {
       const chunk = rIds.slice(i, i + MAX_IN_CLAUSE_ITEMS);
       const placeholders = chunk.map(() => "?").join(", ");
-      const res = await this.db
-        .prepare(`SELECT * FROM ms_runs WHERE run_id IN (${placeholders})`)
-        .bind(...chunk)
-        .all<any>();
-      for (const row of res.results || []) {
-        existingRunByIdMap.set(row.run_id, row);
-      }
+      readStmts.push(
+        this.db.prepare(`SELECT * FROM ms_runs WHERE run_id IN (${placeholders})`).bind(...chunk)
+      );
+      readKinds.push("runId");
     }
 
     const rIdems = [...runIdemKeys];
     for (let i = 0; i < rIdems.length; i += MAX_IN_CLAUSE_ITEMS) {
       const chunk = rIdems.slice(i, i + MAX_IN_CLAUSE_ITEMS);
       const placeholders = chunk.map(() => "?").join(", ");
-      const res = await this.db
-        .prepare(`SELECT run_id, idempotency_key, request_digest FROM ms_runs WHERE tenant_id = ? AND idempotency_key IN (${placeholders})`)
-        .bind(tenantId, ...chunk)
-        .all<any>();
-      for (const row of res.results || []) {
-        existingRunByIdemMap.set(row.idempotency_key, row);
-      }
+      readStmts.push(
+        this.db
+          .prepare(`SELECT run_id, idempotency_key, request_digest FROM ms_runs WHERE tenant_id = ? AND idempotency_key IN (${placeholders})`)
+          .bind(tenantId, ...chunk)
+      );
+      readKinds.push("runIdem");
     }
 
     const evIds = [...evidenceIds];
     for (let i = 0; i < evIds.length; i += MAX_IN_CLAUSE_ITEMS) {
       const chunk = evIds.slice(i, i + MAX_IN_CLAUSE_ITEMS);
       const placeholders = chunk.map(() => "?").join(", ");
-      const res = await this.db
-        .prepare(`SELECT * FROM ms_evidence WHERE evidence_id IN (${placeholders})`)
-        .bind(...chunk)
-        .all<any>();
-      for (const row of res.results || []) {
-        existingEvMap.set(row.evidence_id, row);
-      }
+      readStmts.push(
+        this.db.prepare(`SELECT * FROM ms_evidence WHERE evidence_id IN (${placeholders})`).bind(...chunk)
+      );
+      readKinds.push("ev");
     }
 
     const oKeys = [...obsIdemKeys];
     for (let i = 0; i < oKeys.length; i += MAX_IN_CLAUSE_ITEMS) {
       const chunk = oKeys.slice(i, i + MAX_IN_CLAUSE_ITEMS);
       const placeholders = chunk.map(() => "?").join(", ");
-      const res = await this.db
-        .prepare(`SELECT obs_id, idempotency_key, payload_digest FROM ms_observations WHERE tenant_id = ? AND idempotency_key IN (${placeholders})`)
-        .bind(tenantId, ...chunk)
-        .all<any>();
-      for (const row of res.results || []) {
-        existingObsMap.set(row.idempotency_key, { obs_id: row.obs_id, payload_digest: row.payload_digest });
+      readStmts.push(
+        this.db
+          .prepare(`SELECT obs_id, idempotency_key, payload_digest FROM ms_observations WHERE tenant_id = ? AND idempotency_key IN (${placeholders})`)
+          .bind(tenantId, ...chunk)
+      );
+      readKinds.push("obs");
+    }
+
+    const batchResults = await this.db.batch<any>(readStmts);
+    for (let idx = 0; idx < batchResults.length; idx++) {
+      const kind = readKinds[idx];
+      const rows = batchResults[idx]?.results || [];
+      if (kind === "def") {
+        for (const defRow of rows) {
+          const defKey = JSON.stringify([tenantId, defRow.metric_id, defRow.version]);
+          defCache.set(defKey, {
+            tenantId: defRow.tenant_id,
+            metricId: defRow.metric_id,
+            version: defRow.version,
+            family: defRow.family,
+            unit: defRow.unit,
+            valueType: defRow.value_type,
+            grain: defRow.grain,
+            windowTz: defRow.window_tz,
+            dimensionsSchema: JSON.parse(defRow.dimensions_schema_json),
+            numeratorRule: defRow.numerator_rule,
+            denominatorRule: defRow.denominator_rule,
+            exclusionsRule: defRow.exclusions_rule,
+            aggregationRule: defRow.aggregation_rule,
+            comparabilityKey: defRow.comparability_key,
+            createdAt: defRow.created_at,
+          });
+        }
+      } else if (kind === "res") {
+        for (const row of rows) resourceMap.set(row.resource_id, row);
+      } else if (kind === "runId") {
+        for (const row of rows) existingRunByIdMap.set(row.run_id, row);
+      } else if (kind === "runIdem") {
+        for (const row of rows) existingRunByIdemMap.set(row.idempotency_key, row);
+      } else if (kind === "ev") {
+        for (const row of rows) existingEvMap.set(row.evidence_id, row);
+      } else if (kind === "obs") {
+        for (const row of rows) {
+          existingObsMap.set(row.idempotency_key, { obs_id: row.obs_id, payload_digest: row.payload_digest });
+        }
       }
     }
 
@@ -825,14 +846,20 @@ export class MeasurementService {
   private async fetchExistingBatches(tenantId: string, batchDigests: string[]): Promise<Map<string, any>> {
     const out = new Map<string, any>();
     const unique = [...new Set(batchDigests)];
+    if (unique.length === 0) return out;
+    const stmts: any[] = [];
     for (let i = 0; i < unique.length; i += MAX_IN_CLAUSE_ITEMS) {
       const chunk = unique.slice(i, i + MAX_IN_CLAUSE_ITEMS);
       const placeholders = chunk.map(() => "?").join(", ");
-      const res = await this.db
-        .prepare(`SELECT * FROM ms_ingest_batches WHERE tenant_id = ? AND batch_digest IN (${placeholders})`)
-        .bind(tenantId, ...chunk)
-        .all<any>();
-      for (const row of res.results || []) {
+      stmts.push(
+        this.db
+          .prepare(`SELECT * FROM ms_ingest_batches WHERE tenant_id = ? AND batch_digest IN (${placeholders})`)
+          .bind(tenantId, ...chunk)
+      );
+    }
+    const results = await this.db.batch<any>(stmts);
+    for (const res of results) {
+      for (const row of res?.results || []) {
         out.set(row.batch_digest, row);
       }
     }
@@ -1009,31 +1036,36 @@ export class MeasurementService {
     const groupsJson = canonicalJson(raw.groups);
     const resourceIdsJson = canonicalJson([...resourceIds].sort());
 
-    const existing = await this.db
-      .prepare("SELECT groups_json FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ? AND chunk_index = ?")
-      .bind(tenantId, importId, raw.chunkIndex)
-      .first<any>();
-    if (existing) {
-      if (existing.groups_json !== groupsJson) {
-        throw new ConflictError(`Staged import '${importId}' chunk ${raw.chunkIndex} already exists with different payload`);
-      }
-      return { importId, chunkIndex: raw.chunkIndex, observations: chunkObs, existing: true };
-    }
-
-    await this.db
+    // Race-safe idempotent insert: INSERT OR IGNORE avoids unhandled PK 500 under concurrent staging
+    const insertRes = await this.db
       .prepare(
-        `INSERT INTO ms_staged_imports (tenant_id, import_id, chunk_index, resource_ids_json, groups_json, created_at)
+        `INSERT OR IGNORE INTO ms_staged_imports (tenant_id, import_id, chunk_index, resource_ids_json, groups_json, created_at)
          VALUES (?, ?, ?, ?, ?, ?)`
       )
       .bind(tenantId, importId, raw.chunkIndex, resourceIdsJson, groupsJson, now)
       .run();
 
-    return { importId, chunkIndex: raw.chunkIndex, observations: chunkObs, existing: false };
+    if (Number(insertRes.meta?.changes ?? 0) > 0) {
+      return { importId, chunkIndex: raw.chunkIndex, observations: chunkObs, existing: false };
+    }
+
+    const existing = await this.db
+      .prepare("SELECT groups_json FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ? AND chunk_index = ?")
+      .bind(tenantId, importId, raw.chunkIndex)
+      .first<any>();
+    if (!existing) {
+      throw new ConflictError(`Staged import '${importId}' chunk ${raw.chunkIndex} changed concurrently`);
+    }
+    if (existing.groups_json !== groupsJson) {
+      throw new ConflictError(`Staged import '${importId}' chunk ${raw.chunkIndex} already exists with different payload`);
+    }
+    return { importId, chunkIndex: raw.chunkIndex, observations: chunkObs, existing: true };
   }
 
   public async commitStagedImport(
     raw: CommitStagedImportInput,
-    now = Date.now()
+    now = Date.now(),
+    auth?: { authorizeResourceWrite?: (resourceId: string) => void }
   ): Promise<{
     importId: string;
     inserted: number;
@@ -1056,42 +1088,59 @@ export class MeasurementService {
       throw new ValidationError(`expectedChunks must be an integer in [1, ${MAX_STAGED_IMPORT_CHUNKS}]`);
     }
 
+    // Single authoritative read: authorization, validation, commit, and exact-row cleanup all bind to THIS exact snapshot!
     const res = await this.db
-      .prepare("SELECT chunk_index, groups_json FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ? ORDER BY chunk_index ASC")
+      .prepare("SELECT chunk_index, resource_ids_json, groups_json FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ? ORDER BY chunk_index ASC")
       .bind(tenantId, importId)
       .all<any>();
     const rows = res.results || [];
     if (rows.length === 0) {
+      auth?.authorizeResourceWrite?.("*");
       throw new NotFoundError(`Staged import '${importId}' not found`);
-    }
-    if (rows.length !== raw.expectedChunks) {
-      throw new ValidationError(`Staged import '${importId}' has ${rows.length} chunks, expected ${raw.expectedChunks}`);
     }
 
     const allGroups: Array<Record<string, any>> = [];
+    const seenResourceIds = new Set<string>();
     let totalObservations = 0;
     for (let idx = 0; idx < rows.length; idx++) {
-      if (Number(rows[idx].chunk_index) !== idx) {
-        throw new ValidationError(`Staged import '${importId}' is missing chunk index ${idx}`);
-      }
       const parsed = JSON.parse(rows[idx].groups_json);
       if (!Array.isArray(parsed)) {
         throw new ValidationError(`Staged import '${importId}' chunk ${idx} is malformed`);
       }
       for (const grp of parsed) {
+        if (typeof grp?.resourceId === "string" && grp.resourceId.trim()) {
+          seenResourceIds.add(grp.resourceId.trim());
+        }
         if (Array.isArray(grp?.observations)) {
           totalObservations += grp.observations.length;
         }
         allGroups.push(grp);
       }
     }
+    // Authorize EVERY resource present in the exact read snapshot BEFORE validating/committing
+    for (const rid of seenResourceIds) {
+      auth?.authorizeResourceWrite?.(rid);
+    }
+
+    if (rows.length !== raw.expectedChunks) {
+      throw new ValidationError(`Staged import '${importId}' has ${rows.length} chunks, expected ${raw.expectedChunks}`);
+    }
+    for (let idx = 0; idx < rows.length; idx++) {
+      if (Number(rows[idx].chunk_index) !== idx) {
+        throw new ValidationError(`Staged import '${importId}' is missing chunk index ${idx}`);
+      }
+    }
     if (totalObservations > MAX_STAGED_IMPORT_OBSERVATIONS) {
       throw new ValidationError(`Staged import exceeds maximum size (${MAX_STAGED_IMPORT_OBSERVATIONS} observations)`);
     }
 
-    const cleanupStmt = this.db
-      .prepare("DELETE FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ?")
-      .bind(tenantId, importId);
+    // Delete ONLY the exact (chunk_index, groups_json) rows we read, authorized, and committed —
+    // never wipe out a concurrently staged unseen or replacement chunk!
+    const cleanupStmts = rows.map((row) =>
+      this.db
+        .prepare("DELETE FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ? AND chunk_index = ? AND groups_json = ?")
+        .bind(tenantId, importId, Number(row.chunk_index), String(row.groups_json))
+    );
 
     const out = await this.commitGroupsAtomically(
       tenantId,
@@ -1099,7 +1148,7 @@ export class MeasurementService {
       {
         maxObservationsPerGroup: MAX_ATOMIC_OBSERVATIONS,
         allowInlineRunCreate: true,
-        extraStatements: [cleanupStmt],
+        extraStatements: cleanupStmts,
       },
       now
     );
@@ -1110,18 +1159,48 @@ export class MeasurementService {
     };
   }
 
-  public async abortStagedImport(tenantId: string, importId: string): Promise<{ aborted: true; discardedChunks: number }> {
+  public async abortStagedImport(
+    tenantId: string,
+    importId: string,
+    auth?: { authorizeResourceWrite?: (resourceId: string) => void }
+  ): Promise<{ aborted: true; discardedChunks: number }> {
     const tid = requireNonEmptyString(tenantId, "tenantId", 128);
     const iid = requireNonEmptyString(importId, "importId", 128);
-    const countRow = await this.db
-      .prepare("SELECT COUNT(*) as cnt FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ?")
+    // Single authoritative read: authorize EVERY resource in the read snapshot, then delete ONLY those exact rows!
+    const res = await this.db
+      .prepare("SELECT chunk_index, resource_ids_json, groups_json FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ?")
       .bind(tid, iid)
-      .first<any>();
-    await this.db
-      .prepare("DELETE FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ?")
-      .bind(tid, iid)
-      .run();
-    return { aborted: true, discardedChunks: Number(countRow?.cnt ?? 0) };
+      .all<any>();
+    const rows = res.results || [];
+    if (rows.length === 0) {
+      auth?.authorizeResourceWrite?.("*");
+      return { aborted: true, discardedChunks: 0 };
+    }
+    const seenResourceIds = new Set<string>();
+    for (const row of rows) {
+      for (const rid of JSON.parse(row.resource_ids_json || "[]")) {
+        seenResourceIds.add(String(rid));
+      }
+      const parsed = JSON.parse(row.groups_json || "[]");
+      if (Array.isArray(parsed)) {
+        for (const g of parsed) {
+          if (typeof g?.resourceId === "string" && g.resourceId.trim()) {
+            seenResourceIds.add(g.resourceId.trim());
+          }
+        }
+      }
+    }
+    for (const rid of seenResourceIds) {
+      auth?.authorizeResourceWrite?.(rid);
+    }
+    const delStmts = rows.map((row) =>
+      this.db
+        .prepare("DELETE FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ? AND chunk_index = ? AND groups_json = ?")
+        .bind(tid, iid, Number(row.chunk_index), String(row.groups_json))
+    );
+    const delRes = await this.db.batch(delStmts);
+    const discarded = delRes.reduce((sum, r) => sum + Number(r.meta?.changes ?? 0), 0);
+    return { aborted: true, discardedChunks: discarded };
   }
 
   private async prepareIngestGroup(

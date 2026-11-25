@@ -10,7 +10,7 @@ import { TincanClient } from "@futr-work/pod-kernel/tincan";
 import { loadPodConfig } from "./config.js";
 import { activeHandler } from "./handler.js";
 import { createMeasurementMcpHandler } from "./mcp.js";
-import { ConflictError, MeasurementService, NotFoundError, ValidationError } from "./service.js";
+import { ConflictError, ForbiddenError, MeasurementService, NotFoundError, ValidationError } from "./service.js";
 import { renderPodUiHtml } from "./ui.js";
 import type { TaskRecord } from "./types.js";
 
@@ -42,6 +42,7 @@ function jsonResponse(body: unknown, status = 200): Response {
 
 function errorResponse(err: unknown): Response {
   if (err instanceof ValidationError) return jsonResponse({ error: err.message }, 400);
+  if (err instanceof ForbiddenError) return jsonResponse({ error: err.message }, 403);
   if (err instanceof ConflictError) return jsonResponse({ error: err.message }, 409);
   if (err instanceof NotFoundError) return jsonResponse({ error: err.message }, 404);
   const message = err instanceof Error ? err.message : "Internal error";
@@ -270,7 +271,7 @@ export default {
           return jsonResponse(result, result.existing ? 200 : 201);
         }
 
-        // POST /api/measurement/imports/:importId/commit (atomically finalize all staged chunks in one db.batch())
+        // POST /api/measurement/imports/:importId/commit (authorizes and commits the EXACT same read snapshot atomically)
         const commitImportMatch = url.pathname.match(/^\/api\/measurement\/imports\/([^/]+)\/commit$/);
         if (method === "POST" && commitImportMatch) {
           const importId = decodeURIComponent(commitImportMatch[1]);
@@ -282,35 +283,24 @@ export default {
           if (!tenantId) {
             return jsonResponse({ error: "Field 'tenantId' must be a non-empty string" }, 400);
           }
-          const stagedRows = await db
-            .prepare("SELECT resource_ids_json FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ?")
-            .bind(tenantId, importId)
-            .all<any>();
-          const rows = stagedRows.results || [];
-          if (rows.length === 0) {
-            const tenantDenied = authorizeScopedCaller(caller, { tenantId, resourceId: "*", action: "write" }, "measurement-pod");
-            if (tenantDenied) return tenantDenied;
-            return jsonResponse({ error: `Staged import '${importId}' not found` }, 404);
-          }
-          const uniqueResourceIds = new Set<string>();
-          for (const row of rows) {
-            for (const rid of JSON.parse(row.resource_ids_json || "[]")) {
-              uniqueResourceIds.add(String(rid));
+          const result = await service.commitStagedImport(
+            {
+              tenantId,
+              importId,
+              expectedChunks: body.expectedChunks,
+            },
+            Date.now(),
+            {
+              authorizeResourceWrite: (rid: string) => {
+                const denied = authorizeScopedCaller(caller, { tenantId, resourceId: rid, action: "write" }, "measurement-pod");
+                if (denied) throw new ForbiddenError(`Caller not authorized for resource '${rid}'`);
+              },
             }
-          }
-          for (const rid of uniqueResourceIds) {
-            const denied = authorizeScopedCaller(caller, { tenantId, resourceId: rid, action: "write" }, "measurement-pod");
-            if (denied) return denied;
-          }
-          const result = await service.commitStagedImport({
-            tenantId,
-            importId,
-            expectedChunks: body.expectedChunks,
-          });
+          );
           return jsonResponse(result, 200);
         }
 
-        // POST /api/measurement/imports/:importId/abort (discard staged invisible chunks)
+        // POST /api/measurement/imports/:importId/abort (authorizes and discards ONLY the exact authorized snapshot rows)
         const abortImportMatch = url.pathname.match(/^\/api\/measurement\/imports\/([^/]+)\/abort$/);
         if (method === "POST" && abortImportMatch) {
           const importId = decodeURIComponent(abortImportMatch[1]);
@@ -322,27 +312,12 @@ export default {
           if (!tenantId) {
             return jsonResponse({ error: "Field 'tenantId' must be a non-empty string" }, 400);
           }
-          const stagedRows = await db
-            .prepare("SELECT resource_ids_json FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ?")
-            .bind(tenantId, importId)
-            .all<any>();
-          const rows = stagedRows.results || [];
-          if (rows.length === 0) {
-            const tenantDenied = authorizeScopedCaller(caller, { tenantId, resourceId: "*", action: "write" }, "measurement-pod");
-            if (tenantDenied) return tenantDenied;
-            return jsonResponse({ aborted: true, discardedChunks: 0 }, 200);
-          }
-          const uniqueResourceIds = new Set<string>();
-          for (const row of rows) {
-            for (const rid of JSON.parse(row.resource_ids_json || "[]")) {
-              uniqueResourceIds.add(String(rid));
-            }
-          }
-          for (const rid of uniqueResourceIds) {
-            const denied = authorizeScopedCaller(caller, { tenantId, resourceId: rid, action: "write" }, "measurement-pod");
-            if (denied) return denied;
-          }
-          const result = await service.abortStagedImport(tenantId, importId);
+          const result = await service.abortStagedImport(tenantId, importId, {
+            authorizeResourceWrite: (rid: string) => {
+              const denied = authorizeScopedCaller(caller, { tenantId, resourceId: rid, action: "write" }, "measurement-pod");
+              if (denied) throw new ForbiddenError(`Caller not authorized for resource '${rid}'`);
+            },
+          });
           return jsonResponse(result, 200);
         }
 
