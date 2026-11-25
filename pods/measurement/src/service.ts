@@ -74,6 +74,7 @@ const EVIDENCE_URI_RE = /^(?:fixture|r2|s3|gcs|evidence):\/\/[A-Za-z0-9._\-\/:]+
 const MAX_BATCH_OBSERVATIONS = 500;
 const MAX_ATOMIC_OBSERVATIONS = 1000;
 const MAX_ATOMIC_GROUPS = 100;
+const MAX_IN_CLAUSE_ITEMS = 90;
 const MAX_LIST_LIMIT = 500;
 
 function validateEvidencePointer(val: unknown): string {
@@ -662,6 +663,161 @@ export class MeasurementService {
     };
   }
 
+  private async prefetchIngestState(
+    tenantId: string,
+    groups: Array<Record<string, any>>
+  ): Promise<{
+    defCache: Map<string, DefinitionRecord>;
+    resourceMap: Map<string, any>;
+    existingRunByIdMap: Map<string, any>;
+    existingRunByIdemMap: Map<string, any>;
+    existingEvMap: Map<string, any>;
+    existingObsMap: Map<string, { obs_id: string; payload_digest: string }>;
+    seenBatchKeys: Map<string, string>;
+    seenEvidence: Map<string, { tenantId: string; resourceId: string; sha256: string; uriPointer: string; byteSize: number; mediaType: string }>;
+    seenRuns: Map<string, { tenantId: string; resourceId: string; source: string; idempotencyKey: string; requestDigest: string }>;
+    seenRunIdemKeys: Map<string, { runId: string; requestDigest: string }>;
+    seenBatchDigests: Set<string>;
+    statements: any[];
+  }> {
+    const defCache = new Map<string, DefinitionRecord>();
+    const resourceMap = new Map<string, any>();
+    const existingRunByIdMap = new Map<string, any>();
+    const existingRunByIdemMap = new Map<string, any>();
+    const existingEvMap = new Map<string, any>();
+    const existingObsMap = new Map<string, { obs_id: string; payload_digest: string }>();
+
+    const resourceIds = new Set<string>();
+    const runIds = new Set<string>();
+    const runIdemKeys = new Set<string>();
+    const evidenceIds = new Set<string>();
+    const obsIdemKeys = new Set<string>();
+
+    for (const grp of groups) {
+      if (!grp || typeof grp !== "object" || Array.isArray(grp)) continue;
+      if (typeof grp.resourceId === "string" && grp.resourceId.trim()) resourceIds.add(grp.resourceId.trim());
+      if (typeof grp.runId === "string" && grp.runId.trim()) runIds.add(grp.runId.trim());
+      if (typeof grp.runIdempotencyKey === "string" && grp.runIdempotencyKey.trim()) {
+        runIdemKeys.add(grp.runIdempotencyKey.trim());
+      }
+      if (grp.evidence && typeof grp.evidence === "object" && typeof grp.evidence.evidenceId === "string" && grp.evidence.evidenceId.trim()) {
+        evidenceIds.add(grp.evidence.evidenceId.trim());
+      }
+      if (Array.isArray(grp.observations)) {
+        for (const obs of grp.observations) {
+          if (obs && typeof obs === "object" && typeof obs.idempotencyKey === "string" && obs.idempotencyKey.trim()) {
+            obsIdemKeys.add(obs.idempotencyKey.trim());
+          }
+        }
+      }
+    }
+
+    const defRows = await this.db
+      .prepare("SELECT * FROM ms_definitions WHERE tenant_id = ?")
+      .bind(tenantId)
+      .all<any>();
+    for (const defRow of defRows.results || []) {
+      const defKey = `${tenantId}:${defRow.metric_id}@${defRow.version}`;
+      defCache.set(defKey, {
+        tenantId: defRow.tenant_id,
+        metricId: defRow.metric_id,
+        version: defRow.version,
+        family: defRow.family,
+        unit: defRow.unit,
+        valueType: defRow.value_type,
+        grain: defRow.grain,
+        windowTz: defRow.window_tz,
+        dimensionsSchema: JSON.parse(defRow.dimensions_schema_json),
+        numeratorRule: defRow.numerator_rule,
+        denominatorRule: defRow.denominator_rule,
+        exclusionsRule: defRow.exclusions_rule,
+        aggregationRule: defRow.aggregation_rule,
+        comparabilityKey: defRow.comparability_key,
+        createdAt: defRow.created_at,
+      });
+    }
+
+    const rids = [...resourceIds];
+    for (let i = 0; i < rids.length; i += MAX_IN_CLAUSE_ITEMS) {
+      const chunk = rids.slice(i, i + MAX_IN_CLAUSE_ITEMS);
+      const placeholders = chunk.map(() => "?").join(", ");
+      const res = await this.db
+        .prepare(`SELECT resource_id, entity_urn, source_resource_id FROM ms_resources WHERE tenant_id = ? AND resource_id IN (${placeholders})`)
+        .bind(tenantId, ...chunk)
+        .all<any>();
+      for (const row of res.results || []) {
+        resourceMap.set(row.resource_id, row);
+      }
+    }
+
+    const rIds = [...runIds];
+    for (let i = 0; i < rIds.length; i += MAX_IN_CLAUSE_ITEMS) {
+      const chunk = rIds.slice(i, i + MAX_IN_CLAUSE_ITEMS);
+      const placeholders = chunk.map(() => "?").join(", ");
+      const res = await this.db
+        .prepare(`SELECT * FROM ms_runs WHERE run_id IN (${placeholders})`)
+        .bind(...chunk)
+        .all<any>();
+      for (const row of res.results || []) {
+        existingRunByIdMap.set(row.run_id, row);
+      }
+    }
+
+    const rIdems = [...runIdemKeys];
+    for (let i = 0; i < rIdems.length; i += MAX_IN_CLAUSE_ITEMS) {
+      const chunk = rIdems.slice(i, i + MAX_IN_CLAUSE_ITEMS);
+      const placeholders = chunk.map(() => "?").join(", ");
+      const res = await this.db
+        .prepare(`SELECT run_id, idempotency_key, request_digest FROM ms_runs WHERE tenant_id = ? AND idempotency_key IN (${placeholders})`)
+        .bind(tenantId, ...chunk)
+        .all<any>();
+      for (const row of res.results || []) {
+        existingRunByIdemMap.set(row.idempotency_key, row);
+      }
+    }
+
+    const evIds = [...evidenceIds];
+    for (let i = 0; i < evIds.length; i += MAX_IN_CLAUSE_ITEMS) {
+      const chunk = evIds.slice(i, i + MAX_IN_CLAUSE_ITEMS);
+      const placeholders = chunk.map(() => "?").join(", ");
+      const res = await this.db
+        .prepare(`SELECT * FROM ms_evidence WHERE evidence_id IN (${placeholders})`)
+        .bind(...chunk)
+        .all<any>();
+      for (const row of res.results || []) {
+        existingEvMap.set(row.evidence_id, row);
+      }
+    }
+
+    const oKeys = [...obsIdemKeys];
+    for (let i = 0; i < oKeys.length; i += MAX_IN_CLAUSE_ITEMS) {
+      const chunk = oKeys.slice(i, i + MAX_IN_CLAUSE_ITEMS);
+      const placeholders = chunk.map(() => "?").join(", ");
+      const res = await this.db
+        .prepare(`SELECT obs_id, idempotency_key, payload_digest FROM ms_observations WHERE tenant_id = ? AND idempotency_key IN (${placeholders})`)
+        .bind(tenantId, ...chunk)
+        .all<any>();
+      for (const row of res.results || []) {
+        existingObsMap.set(row.idempotency_key, { obs_id: row.obs_id, payload_digest: row.payload_digest });
+      }
+    }
+
+    return {
+      defCache,
+      resourceMap,
+      existingRunByIdMap,
+      existingRunByIdemMap,
+      existingEvMap,
+      existingObsMap,
+      seenBatchKeys: new Map<string, string>(),
+      seenEvidence: new Map(),
+      seenRuns: new Map(),
+      seenRunIdemKeys: new Map(),
+      seenBatchDigests: new Set<string>(),
+      statements: [] as any[],
+    };
+  }
+
   public async ingestBatch(raw: IngestBatchInput, now = Date.now()): Promise<{
     runId: string;
     evidenceId: string;
@@ -669,15 +825,17 @@ export class MeasurementService {
     replayedNoop: number;
     coverageStatus: string | null;
   }> {
-    const shared = {
-      defCache: new Map<string, DefinitionRecord>(),
-      seenBatchKeys: new Map<string, string>(),
-      seenEvidence: new Map<string, { tenantId: string; resourceId: string; sha256: string; uriPointer: string; byteSize: number; mediaType: string }>(),
-      seenRuns: new Map<string, { tenantId: string; resourceId: string; source: string; requestDigest: string | null }>(),
-      seenRunIdemKeys: new Map<string, { runId: string; requestDigest: string }>(),
-      seenBatchDigests: new Set<string>(),
-      statements: [] as any[],
-    };
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      throw new ValidationError("Ingest payload must be a JSON object");
+    }
+    const tenantId = requireNonEmptyString(raw.tenantId, "tenantId", 128);
+    if (!Array.isArray(raw.observations)) {
+      throw new ValidationError("Field 'observations' must be an array");
+    }
+    if (raw.observations.length > MAX_BATCH_OBSERVATIONS) {
+      throw new ValidationError(`Batch exceeds maximum size (${MAX_BATCH_OBSERVATIONS} observations)`);
+    }
+    const shared = await this.prefetchIngestState(tenantId, [raw as any]);
     const res = await this.prepareIngestGroup(
       raw as any,
       { maxObservations: MAX_BATCH_OBSERVATIONS, allowInlineRunCreate: false },
@@ -725,15 +883,7 @@ export class MeasurementService {
       throw new ValidationError(`Atomic batch exceeds maximum size (${MAX_ATOMIC_OBSERVATIONS} observations)`);
     }
 
-    const shared = {
-      defCache: new Map<string, DefinitionRecord>(),
-      seenBatchKeys: new Map<string, string>(),
-      seenEvidence: new Map<string, { tenantId: string; resourceId: string; sha256: string; uriPointer: string; byteSize: number; mediaType: string }>(),
-      seenRuns: new Map<string, { tenantId: string; resourceId: string; source: string; requestDigest: string | null }>(),
-      seenRunIdemKeys: new Map<string, { runId: string; requestDigest: string }>(),
-      seenBatchDigests: new Set<string>(),
-      statements: [] as any[],
-    };
+    const shared = await this.prefetchIngestState(tenantId, raw.groups as any);
 
     const groupResults: Array<{
       runId: string;
@@ -773,9 +923,14 @@ export class MeasurementService {
     opts: { maxObservations: number; allowInlineRunCreate: boolean },
     shared: {
       defCache: Map<string, DefinitionRecord>;
+      resourceMap: Map<string, any>;
+      existingRunByIdMap: Map<string, any>;
+      existingRunByIdemMap: Map<string, any>;
+      existingEvMap: Map<string, any>;
+      existingObsMap: Map<string, { obs_id: string; payload_digest: string }>;
       seenBatchKeys: Map<string, string>;
       seenEvidence: Map<string, { tenantId: string; resourceId: string; sha256: string; uriPointer: string; byteSize: number; mediaType: string }>;
-      seenRuns: Map<string, { tenantId: string; resourceId: string; source: string; requestDigest: string | null }>;
+      seenRuns: Map<string, { tenantId: string; resourceId: string; source: string; idempotencyKey: string; requestDigest: string }>;
       seenRunIdemKeys: Map<string, { runId: string; requestDigest: string }>;
       seenBatchDigests: Set<string>;
       statements: any[];
@@ -824,20 +979,14 @@ export class MeasurementService {
       throw new ValidationError(`Batch exceeds maximum size (${opts.maxObservations} observations)`);
     }
 
-    // Validate resource belongs to tenant
-    const resource = await this.db
-      .prepare("SELECT entity_urn, source_resource_id FROM ms_resources WHERE tenant_id = ? AND resource_id = ?")
-      .bind(tenantId, resourceId)
-      .first<any>();
+    // Validate resource belongs to tenant (using prefetched state)
+    const resource = shared.resourceMap.get(resourceId);
     if (!resource) throw new NotFoundError(`Resource '${resourceId}' not found for tenant '${tenantId}'`);
 
     // Validate or stage run creation atomically inside the same batch transaction
     let needsRunInsert = false;
     let runInsertParams: { sourceResourceId: string; idempotencyKey: string; requestDigest: string } | null = null;
-    const existingRun = await this.db
-      .prepare("SELECT * FROM ms_runs WHERE run_id = ?")
-      .bind(runId)
-      .first<any>();
+    const existingRun = shared.existingRunByIdMap.get(runId);
     if (existingRun) {
       if (existingRun.tenant_id !== tenantId || existingRun.resource_id !== resourceId || existingRun.source !== source) {
         if (!opts.allowInlineRunCreate) {
@@ -867,10 +1016,7 @@ export class MeasurementService {
       const reqDigest = await sha256Hex(
         canonicalJson({ tenantId, resourceId, source, sourceResourceId: srcRid, windowStart, windowEnd, scheduleId: null })
       );
-      const existingByIdem = await this.db
-        .prepare("SELECT run_id, request_digest FROM ms_runs WHERE tenant_id = ? AND idempotency_key = ?")
-        .bind(tenantId, runIdem)
-        .first<any>();
+      const existingByIdem = shared.existingRunByIdemMap.get(runIdem);
       if (existingByIdem) {
         if (existingByIdem.run_id !== runId || existingByIdem.request_digest !== reqDigest) {
           throw new ConflictError(`Run idempotencyKey '${runIdem}' reused with different parameters`);
@@ -882,6 +1028,7 @@ export class MeasurementService {
           stagedRun.tenantId !== tenantId ||
           stagedRun.resourceId !== resourceId ||
           stagedRun.source !== source ||
+          stagedRun.idempotencyKey !== runIdem ||
           stagedRun.requestDigest !== reqDigest
         ) {
           throw new ConflictError(`Run '${runId}' conflicts with another group in the atomic batch`);
@@ -891,7 +1038,7 @@ export class MeasurementService {
         if (stagedIdem && (stagedIdem.runId !== runId || stagedIdem.requestDigest !== reqDigest)) {
           throw new ConflictError(`Run idempotencyKey '${runIdem}' conflicts inside atomic batch`);
         }
-        shared.seenRuns.set(runId, { tenantId, resourceId, source, requestDigest: reqDigest });
+        shared.seenRuns.set(runId, { tenantId, resourceId, source, idempotencyKey: runIdem, requestDigest: reqDigest });
         shared.seenRunIdemKeys.set(runIdem, { runId, requestDigest: reqDigest });
         needsRunInsert = true;
         runInsertParams = { sourceResourceId: srcRid, idempotencyKey: runIdem, requestDigest: reqDigest };
@@ -954,10 +1101,7 @@ export class MeasurementService {
         throw new ConflictError(`Evidence '${evidenceId}' conflicts within atomic batch`);
       }
     }
-    const existingEv = await this.db
-      .prepare("SELECT * FROM ms_evidence WHERE evidence_id = ?")
-      .bind(evidenceId)
-      .first<any>();
+    const existingEv = shared.existingEvMap.get(evidenceId);
     if (existingEv) {
       if (
         existingEv.tenant_id !== tenantId ||
@@ -1226,10 +1370,7 @@ export class MeasurementService {
       }
       seenBatchKeys.set(idempotencyKey, payloadDigest);
 
-      const existingObs = await this.db
-        .prepare("SELECT obs_id, payload_digest FROM ms_observations WHERE tenant_id = ? AND idempotency_key = ?")
-        .bind(tenantId, idempotencyKey)
-        .first<any>();
+      const existingObs = shared.existingObsMap.get(idempotencyKey);
 
       if (existingObs) {
         if (existingObs.payload_digest !== payloadDigest) {

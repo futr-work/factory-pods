@@ -1276,7 +1276,7 @@ describe("Measurement Pod — Typed 4-Family Vertical Slice, Isolation, MCP v2 +
         sha256: sha,
         byteSize: 12,
         mediaType: "application/json",
-        privacyClass: "internal",
+        privacyClass: "internal" as const,
         retentionClass: "90d",
         collectedAt: "2026-11-20T00:00:00Z",
         sourceAsOf: "2026-11-19T00:00:00Z",
@@ -1496,6 +1496,101 @@ describe("Measurement Pod — Typed 4-Family Vertical Slice, Isolation, MCP v2 +
       });
       assert.equal(deniedRes.status, 403);
       assert.equal((await h.call("GET", "/api/measurement/runs/run-narrow-deny?tenantId=tenant-alpha", h.tokenA)).status, 404);
+
+      // 5. Conflicting runIdempotencyKey for the same new runId inside one atomic batch MUST fail with 409
+      const dupRunKeyRes = await h.call("POST", "/api/measurement/ingest-atomic", h.tokenA, {
+        tenantId: "tenant-alpha",
+        groups: [
+          {
+            resourceId: "site-alpha",
+            source: "gsc_export",
+            runId: "run-same-new-id",
+            runIdempotencyKey: "key-A",
+            sourceResourceId: "sc-domain:alpha.test",
+            windowStart: "2026-11-24",
+            windowEnd: "2026-11-24",
+            evidence: mkEv("ev-same-run-1", await sha256Hex("ev-same-run-1")),
+            observations: [{
+              metricId: "gsc.clicks", definitionVersion: "v1",
+              windowStart: "2026-11-24", windowEnd: "2026-11-24", windowTz: "UTC", grain: "daily",
+              dimensions: { page: "/same-run-a" }, valueNum: 1,
+              interpretationVersion: "v1", sourceRevision: 1, sourceAsOf: "2026-11-24T00:00:00Z",
+              idempotencyKey: "obs-same-run-a",
+            }],
+          },
+          {
+            resourceId: "site-alpha",
+            source: "gsc_export",
+            runId: "run-same-new-id",
+            runIdempotencyKey: "key-B",
+            sourceResourceId: "sc-domain:alpha.test",
+            windowStart: "2026-11-24",
+            windowEnd: "2026-11-24",
+            evidence: mkEv("ev-same-run-2", await sha256Hex("ev-same-run-2")),
+            observations: [{
+              metricId: "gsc.clicks", definitionVersion: "v1",
+              windowStart: "2026-11-24", windowEnd: "2026-11-24", windowTz: "UTC", grain: "daily",
+              dimensions: { page: "/same-run-b" }, valueNum: 2,
+              interpretationVersion: "v1", sourceRevision: 1, sourceAsOf: "2026-11-24T00:00:00Z",
+              idempotencyKey: "obs-same-run-b",
+            }],
+          },
+        ],
+      });
+      assert.equal(dupRunKeyRes.status, 409);
+      assert.equal((await h.call("GET", "/api/measurement/runs/run-same-new-id?tenantId=tenant-alpha", h.tokenA)).status, 404);
+
+      // 6. Query budget check: a 1,000-observation atomic batch MUST execute well below D1's 1,000-query/invocation limit
+      let dbQueries = 0;
+      const origPrepare = h.db.prepare.bind(h.db);
+      const origBatch = h.db.batch.bind(h.db);
+      const countedDb = {
+        prepare(sql: string) {
+          const stmt = origPrepare(sql);
+          return {
+            bind(...params: any[]) {
+              const bound = stmt.bind(...params);
+              return {
+                first: (...a: any[]) => { dbQueries += 1; return (bound.first as any)(...a); },
+                all: (...a: any[]) => { dbQueries += 1; return (bound.all as any)(...a); },
+                run: (...a: any[]) => { dbQueries += 1; return (bound.run as any)(...a); },
+                _raw: bound,
+              };
+            },
+            first: (...a: any[]) => { dbQueries += 1; return (stmt.first as any)(...a); },
+            all: (...a: any[]) => { dbQueries += 1; return (stmt.all as any)(...a); },
+            run: (...a: any[]) => { dbQueries += 1; return (stmt.run as any)(...a); },
+          };
+        },
+        batch(stmts: any[]) {
+          dbQueries += 1;
+          return origBatch(stmts.map((s) => s._raw ?? s));
+        },
+      };
+      const countedSvc = new MeasurementService(countedDb as any);
+      const obs1000 = Array.from({ length: 1000 }, (_, i) => ({
+        metricId: "gsc.clicks", definitionVersion: "v1",
+        windowStart: "2026-11-25", windowEnd: "2026-11-25", windowTz: "UTC", grain: "daily",
+        dimensions: { page: `/q1000/${i}` }, valueNum: i,
+        interpretationVersion: "v1", sourceRevision: 1, sourceAsOf: "2026-11-25T00:00:00Z",
+        idempotencyKey: `obs-q1000-${i}`,
+      }));
+      const res1000 = await countedSvc.ingestAtomicBatch({
+        tenantId: "tenant-alpha",
+        groups: [{
+          resourceId: "site-alpha",
+          source: "gsc_export",
+          runId: "run-atomic-1000-qbudget",
+          runIdempotencyKey: "idem-run-atomic-1000-qbudget",
+          sourceResourceId: "sc-domain:alpha.test",
+          windowStart: "2026-11-25",
+          windowEnd: "2026-11-25",
+          evidence: mkEv("ev-atomic-1000-qbudget", await sha256Hex("ev-1000-qb")),
+          observations: obs1000,
+        }],
+      });
+      assert.equal(res1000.inserted, 1000);
+      assert.ok(dbQueries < 30, `Expected < 30 DB queries for 1,000-obs atomic batch, got ${dbQueries}`);
     } finally {
       h.cleanup();
     }
