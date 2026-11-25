@@ -86,6 +86,7 @@ const MAX_ATOMIC_OBSERVATIONS = 1000;
 const MAX_ATOMIC_GROUPS = 1000;
 const MAX_STAGED_IMPORT_OBSERVATIONS = 20000;
 const MAX_STAGED_IMPORT_CHUNKS = 50;
+const MAX_STAGED_CHUNK_BYTES = 1_500_000;
 const MAX_IN_CLAUSE_ITEMS = 90;
 const MAX_LIST_LIMIT = 500;
 
@@ -1035,6 +1036,12 @@ export class MeasurementService {
 
     const groupsJson = canonicalJson(raw.groups);
     const resourceIdsJson = canonicalJson([...resourceIds].sort());
+    const serializedBytes = new TextEncoder().encode(groupsJson).byteLength + new TextEncoder().encode(resourceIdsJson).byteLength;
+    if (serializedBytes > MAX_STAGED_CHUNK_BYTES) {
+      throw new ValidationError(
+        `Staged chunk serialized size (${serializedBytes} bytes) exceeds ${MAX_STAGED_CHUNK_BYTES}-byte limit; split into smaller chunks`
+      );
+    }
 
     // Race-safe idempotent insert: INSERT OR IGNORE avoids unhandled PK 500 under concurrent staging
     const insertRes = await this.db

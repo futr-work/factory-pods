@@ -1899,6 +1899,31 @@ describe("Measurement Pod — Typed 4-Family Vertical Slice, Isolation, MCP v2 +
         (await h.call("POST", "/api/measurement/imports/imp-race/abort", h.tokenA, { tenantId: "tenant-alpha" })).status,
         200
       );
+
+      // 10d. Oversized serialized chunk (> 1,500,000 UTF-8 bytes) MUST fail with actionable 400 (never D1 row-size 500)
+      const pad = "x".repeat(2000);
+      const oversizedObs = Array.from({ length: 800 }, (_, i) => ({
+        metricId: "gsc.clicks", definitionVersion: "v1",
+        windowStart: "2026-12-02", windowEnd: "2026-12-02", windowTz: "UTC", grain: "daily",
+        dimensions: { page: `/big/${i}/${pad}` }, valueNum: i,
+        interpretationVersion: "v1", sourceRevision: 1, sourceAsOf: "2026-12-02T00:00:00Z",
+        idempotencyKey: `obs-big-${i}`,
+      }));
+      const oversizedRes = await h.call("POST", "/api/measurement/imports/stage", h.tokenA, {
+        tenantId: "tenant-alpha",
+        importId: "imp-oversized",
+        chunkIndex: 0,
+        groups: [{
+          resourceId: "site-alpha", source: "gsc_export",
+          runId: "run-oversized", runIdempotencyKey: "idem-oversized",
+          sourceResourceId: "sc-domain:alpha.test",
+          windowStart: "2026-12-02", windowEnd: "2026-12-02",
+          evidence: mkEv("ev-oversized", await sha256Hex("ev-oversized")),
+          observations: oversizedObs,
+        }],
+      });
+      assert.equal(oversizedRes.status, 400);
+      assert.match(((await oversizedRes.json()) as any).error, /split into smaller chunks/);
     } finally {
       h.cleanup();
     }
