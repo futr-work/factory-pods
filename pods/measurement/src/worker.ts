@@ -200,7 +200,7 @@ export default {
           return jsonResponse(result, 200);
         }
 
-        // POST /api/measurement/ingest-atomic (multi-group / up to 1,000 observations in one atomic transaction)
+        // POST /api/measurement/ingest-atomic (multi-group / up to 1,000 observations and 1,000 groups in one atomic transaction)
         if (method === "POST" && url.pathname === "/api/measurement/ingest-atomic") {
           const body = await parseJsonBody(request);
           const tenantId = typeof body.tenantId === "string" ? body.tenantId.trim() : "";
@@ -210,10 +210,10 @@ export default {
           if (!tenantId) {
             return jsonResponse({ error: "Field 'tenantId' must be a non-empty string" }, 400);
           }
-          if (!Array.isArray(body.groups) || body.groups.length === 0 || body.groups.length > 100) {
+          if (!Array.isArray(body.groups) || body.groups.length === 0 || body.groups.length > 1000) {
             const tenantDenied = authorizeScopedCaller(caller, { tenantId, resourceId: "*", action: "write" }, "measurement-pod");
             if (tenantDenied) return tenantDenied;
-            return jsonResponse({ error: "Field 'groups' must contain 1 to 100 items" }, 400);
+            return jsonResponse({ error: "Field 'groups' must contain 1 to 1000 items" }, 400);
           }
           const uniqueResourceIds = new Set<string>();
           for (let i = 0; i < body.groups.length; i++) {
@@ -232,6 +232,117 @@ export default {
             if (denied) return denied;
           }
           const result = await service.ingestAtomicBatch(body as any);
+          return jsonResponse(result, 200);
+        }
+
+        // POST /api/measurement/imports/stage (stage an invisible chunk for all-or-nothing atomic finalization up to 20,000 obs)
+        if (method === "POST" && url.pathname === "/api/measurement/imports/stage") {
+          const body = await parseJsonBody(request);
+          const tenantId = typeof body.tenantId === "string" ? body.tenantId.trim() : "";
+          const configured = parseScopedCallerGrants(env.SCOPED_CALLER_GRANTS);
+          const caller = await resolveScopedCaller(request, configured);
+          if (!caller) return jsonResponse({ error: "unauthorized" }, 401);
+          if (!tenantId) {
+            return jsonResponse({ error: "Field 'tenantId' must be a non-empty string" }, 400);
+          }
+          if (!Array.isArray(body.groups) || body.groups.length === 0 || body.groups.length > 1000) {
+            const tenantDenied = authorizeScopedCaller(caller, { tenantId, resourceId: "*", action: "write" }, "measurement-pod");
+            if (tenantDenied) return tenantDenied;
+            return jsonResponse({ error: "Field 'groups' must contain 1 to 1000 items" }, 400);
+          }
+          const uniqueResourceIds = new Set<string>();
+          for (let i = 0; i < body.groups.length; i++) {
+            const g = body.groups[i];
+            if (!g || typeof g !== "object" || Array.isArray(g)) {
+              return jsonResponse({ error: `groups[${i}] must be a JSON object` }, 400);
+            }
+            const rid = typeof g.resourceId === "string" ? g.resourceId.trim() : "";
+            if (!rid) {
+              return jsonResponse({ error: `groups[${i}].resourceId must be a non-empty string` }, 400);
+            }
+            uniqueResourceIds.add(rid);
+          }
+          for (const rid of uniqueResourceIds) {
+            const denied = authorizeScopedCaller(caller, { tenantId, resourceId: rid, action: "write" }, "measurement-pod");
+            if (denied) return denied;
+          }
+          const result = await service.stageImportChunk(body as any);
+          return jsonResponse(result, result.existing ? 200 : 201);
+        }
+
+        // POST /api/measurement/imports/:importId/commit (atomically finalize all staged chunks in one db.batch())
+        const commitImportMatch = url.pathname.match(/^\/api\/measurement\/imports\/([^/]+)\/commit$/);
+        if (method === "POST" && commitImportMatch) {
+          const importId = decodeURIComponent(commitImportMatch[1]);
+          const body = await parseJsonBody(request);
+          const tenantId = typeof body.tenantId === "string" ? body.tenantId.trim() : "";
+          const configured = parseScopedCallerGrants(env.SCOPED_CALLER_GRANTS);
+          const caller = await resolveScopedCaller(request, configured);
+          if (!caller) return jsonResponse({ error: "unauthorized" }, 401);
+          if (!tenantId) {
+            return jsonResponse({ error: "Field 'tenantId' must be a non-empty string" }, 400);
+          }
+          const stagedRows = await db
+            .prepare("SELECT resource_ids_json FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ?")
+            .bind(tenantId, importId)
+            .all<any>();
+          const rows = stagedRows.results || [];
+          if (rows.length === 0) {
+            const tenantDenied = authorizeScopedCaller(caller, { tenantId, resourceId: "*", action: "write" }, "measurement-pod");
+            if (tenantDenied) return tenantDenied;
+            return jsonResponse({ error: `Staged import '${importId}' not found` }, 404);
+          }
+          const uniqueResourceIds = new Set<string>();
+          for (const row of rows) {
+            for (const rid of JSON.parse(row.resource_ids_json || "[]")) {
+              uniqueResourceIds.add(String(rid));
+            }
+          }
+          for (const rid of uniqueResourceIds) {
+            const denied = authorizeScopedCaller(caller, { tenantId, resourceId: rid, action: "write" }, "measurement-pod");
+            if (denied) return denied;
+          }
+          const result = await service.commitStagedImport({
+            tenantId,
+            importId,
+            expectedChunks: body.expectedChunks,
+          });
+          return jsonResponse(result, 200);
+        }
+
+        // POST /api/measurement/imports/:importId/abort (discard staged invisible chunks)
+        const abortImportMatch = url.pathname.match(/^\/api\/measurement\/imports\/([^/]+)\/abort$/);
+        if (method === "POST" && abortImportMatch) {
+          const importId = decodeURIComponent(abortImportMatch[1]);
+          const body = await parseJsonBody(request);
+          const tenantId = typeof body.tenantId === "string" ? body.tenantId.trim() : "";
+          const configured = parseScopedCallerGrants(env.SCOPED_CALLER_GRANTS);
+          const caller = await resolveScopedCaller(request, configured);
+          if (!caller) return jsonResponse({ error: "unauthorized" }, 401);
+          if (!tenantId) {
+            return jsonResponse({ error: "Field 'tenantId' must be a non-empty string" }, 400);
+          }
+          const stagedRows = await db
+            .prepare("SELECT resource_ids_json FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ?")
+            .bind(tenantId, importId)
+            .all<any>();
+          const rows = stagedRows.results || [];
+          if (rows.length === 0) {
+            const tenantDenied = authorizeScopedCaller(caller, { tenantId, resourceId: "*", action: "write" }, "measurement-pod");
+            if (tenantDenied) return tenantDenied;
+            return jsonResponse({ aborted: true, discardedChunks: 0 }, 200);
+          }
+          const uniqueResourceIds = new Set<string>();
+          for (const row of rows) {
+            for (const rid of JSON.parse(row.resource_ids_json || "[]")) {
+              uniqueResourceIds.add(String(rid));
+            }
+          }
+          for (const rid of uniqueResourceIds) {
+            const denied = authorizeScopedCaller(caller, { tenantId, resourceId: rid, action: "write" }, "measurement-pod");
+            if (denied) return denied;
+          }
+          const result = await service.abortStagedImport(tenantId, importId);
           return jsonResponse(result, 200);
         }
 

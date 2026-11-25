@@ -1636,6 +1636,130 @@ describe("Measurement Pod — Typed 4-Family Vertical Slice, Isolation, MCP v2 +
         }],
       });
       assert.equal(delimRes.status, 400);
+
+      // 8. 150-group atomic batch (>100, <=1000 groups) commits atomically with bounded DB queries (<80)
+      const groups150 = await Promise.all(
+        Array.from({ length: 150 }, async (_, i) => ({
+          resourceId: "site-alpha",
+          source: "gsc_export",
+          runId: `run-g150-${i}`,
+          runIdempotencyKey: `idem-g150-${i}`,
+          sourceResourceId: "sc-domain:alpha.test",
+          windowStart: "2026-11-27",
+          windowEnd: "2026-11-27",
+          evidence: mkEv(`ev-g150-${i}`, await sha256Hex(`ev-g150-${i}`)),
+          observations: [{
+            metricId: "gsc.clicks", definitionVersion: "v1",
+            windowStart: "2026-11-27", windowEnd: "2026-11-27", windowTz: "UTC", grain: "daily",
+            dimensions: { page: `/g150/${i}` }, valueNum: i,
+            interpretationVersion: "v1", sourceRevision: 1, sourceAsOf: "2026-11-27T00:00:00Z",
+            idempotencyKey: `obs-g150-${i}`,
+          }],
+        }))
+      );
+      dbQueries = 0;
+      const res150 = await countedSvc.ingestAtomicBatch({ tenantId: "tenant-alpha", groups: groups150 });
+      assert.equal(res150.inserted, 150);
+      assert.ok(dbQueries < 30, `Expected < 30 DB queries for 150-group atomic batch, got ${dbQueries}`);
+
+      // 9. Staged multi-chunk import (>1,000 observations): invisible until commit, atomic 409 rollback, cross-tenant isolated
+      const mkChunkObs = (prefix: string, start: number, count: number) =>
+        Array.from({ length: count }, (_, idx) => ({
+          metricId: "gsc.clicks", definitionVersion: "v1",
+          windowStart: "2026-11-28", windowEnd: "2026-11-28", windowTz: "UTC", grain: "daily",
+          dimensions: { page: `/${prefix}/${start + idx}` }, valueNum: start + idx,
+          interpretationVersion: "v1", sourceRevision: 1, sourceAsOf: "2026-11-28T00:00:00Z",
+          idempotencyKey: `obs-${prefix}-${start + idx}`,
+        }));
+
+      const stageEvSha = await sha256Hex("ev-staged-1200");
+      const stageEv = mkEv("ev-staged-1200", stageEvSha);
+      const st0 = await h.call("POST", "/api/measurement/imports/stage", h.tokenA, {
+        tenantId: "tenant-alpha",
+        importId: "imp-1200",
+        chunkIndex: 0,
+        groups: [{
+          resourceId: "site-alpha", source: "gsc_export",
+          runId: "run-staged-1200", runIdempotencyKey: "idem-staged-1200",
+          sourceResourceId: "sc-domain:alpha.test",
+          windowStart: "2026-11-28", windowEnd: "2026-11-28",
+          evidence: stageEv, observations: mkChunkObs("st1200", 0, 600),
+        }],
+      });
+      assert.equal(st0.status, 201);
+      // Before commit, ZERO observations from imp-1200 are visible in querySeries!
+      const preCommit = (await (await h.call("GET", "/api/measurement/series?tenantId=tenant-alpha&resourceId=site-alpha&metricId=gsc.clicks&windowStart=2026-11-28&windowEnd=2026-11-28", h.tokenA)).json()) as any;
+      assert.equal(preCommit.total, 0);
+
+      // Cross-tenant commit attempt with tenant-beta token MUST fail closed (403)
+      const crossCommit = await h.call("POST", "/api/measurement/imports/imp-1200/commit", h.tokenB, {
+        tenantId: "tenant-alpha", expectedChunks: 1,
+      });
+      assert.equal(crossCommit.status, 403);
+
+      // Stage chunk 1 with remaining 600 observations, then commit atomically -> all 1,200 visible at once!
+      const st1 = await h.call("POST", "/api/measurement/imports/stage", h.tokenA, {
+        tenantId: "tenant-alpha",
+        importId: "imp-1200",
+        chunkIndex: 1,
+        groups: [{
+          resourceId: "site-alpha", source: "gsc_export",
+          runId: "run-staged-1200", runIdempotencyKey: "idem-staged-1200",
+          sourceResourceId: "sc-domain:alpha.test",
+          windowStart: "2026-11-28", windowEnd: "2026-11-28",
+          evidence: stageEv, observations: mkChunkObs("st1200", 600, 600),
+        }],
+      });
+      assert.equal(st1.status, 201);
+      const commitRes = await h.call("POST", "/api/measurement/imports/imp-1200/commit", h.tokenA, {
+        tenantId: "tenant-alpha", expectedChunks: 2,
+      });
+      assert.equal(commitRes.status, 200);
+      assert.equal(((await commitRes.json()) as any).inserted, 1200);
+      const postCommit = (await (await h.call("GET", "/api/measurement/series?tenantId=tenant-alpha&resourceId=site-alpha&metricId=gsc.clicks&windowStart=2026-11-28&windowEnd=2026-11-28&limit=10", h.tokenA)).json()) as any;
+      assert.equal(postCommit.total, 1200);
+      // Verify monotonic positive recordSeq is returned on every observation point
+      assert.ok(typeof postCommit.points[0].recordSeq === "number" && postCommit.points[0].recordSeq > 0);
+      const seq0 = postCommit.points.find((p: any) => p.dimensions.page === "/st1200/0");
+      const seq1 = postCommit.points.find((p: any) => p.dimensions.page === "/st1200/1");
+      if (seq0 && seq1) assert.ok(seq0.recordSeq < seq1.recordSeq);
+
+      // Staged import with conflict in chunk 1 commits ZERO rows from chunk 0 on commit!
+      const badEv = mkEv("ev-staged-bad", await sha256Hex("ev-staged-bad"));
+      assert.equal((await h.call("POST", "/api/measurement/imports/stage", h.tokenA, {
+        tenantId: "tenant-alpha", importId: "imp-bad", chunkIndex: 0,
+        groups: [{
+          resourceId: "site-alpha", source: "gsc_export",
+          runId: "run-staged-bad", runIdempotencyKey: "idem-staged-bad",
+          sourceResourceId: "sc-domain:alpha.test",
+          windowStart: "2026-11-29", windowEnd: "2026-11-29",
+          evidence: badEv, observations: mkChunkObs("stbad", 0, 5),
+        }],
+      })).status, 201);
+      assert.equal((await h.call("POST", "/api/measurement/imports/stage", h.tokenA, {
+        tenantId: "tenant-alpha", importId: "imp-bad", chunkIndex: 1,
+        groups: [{
+          resourceId: "site-alpha", source: "gsc_export",
+          runId: "run-staged-bad", runIdempotencyKey: "idem-staged-bad",
+          sourceResourceId: "sc-domain:alpha.test",
+          windowStart: "2026-11-29", windowEnd: "2026-11-29",
+          evidence: stageEv,
+          observations: [{
+            metricId: "gsc.clicks", definitionVersion: "v1",
+            windowStart: "2026-11-28", windowEnd: "2026-11-28", windowTz: "UTC", grain: "daily",
+            dimensions: { page: "/st1200/0" }, valueNum: 99999,
+            interpretationVersion: "v1", sourceRevision: 1, sourceAsOf: "2026-11-28T00:00:00Z",
+            idempotencyKey: "obs-st1200-0",
+          }],
+        }],
+      })).status, 201);
+      const badCommit = await h.call("POST", "/api/measurement/imports/imp-bad/commit", h.tokenA, {
+        tenantId: "tenant-alpha", expectedChunks: 2,
+      });
+      assert.equal(badCommit.status, 409);
+      const afterBad = (await (await h.call("GET", "/api/measurement/series?tenantId=tenant-alpha&resourceId=site-alpha&metricId=gsc.clicks&windowStart=2026-11-29&windowEnd=2026-11-29", h.tokenA)).json()) as any;
+      assert.equal(afterBad.total, 0);
+      assert.equal((await h.call("POST", "/api/measurement/imports/imp-bad/abort", h.tokenA, { tenantId: "tenant-alpha" })).status, 200);
     } finally {
       h.cleanup();
     }

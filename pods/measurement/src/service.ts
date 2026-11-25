@@ -3,6 +3,7 @@ import { sha256Hex } from "@futr-work/pod-kernel/auth";
 import type {
   AnnotationInput,
   AttemptInput,
+  CommitStagedImportInput,
   CoverageInput,
   CoverageQueryInput,
   DefinitionInput,
@@ -19,6 +20,7 @@ import type {
   RunInput,
   RunStatus,
   SeriesQueryInput,
+  StageImportChunkInput,
   ValueType,
 } from "./types.js";
 
@@ -73,7 +75,9 @@ const CURRENCY_RE = /^[A-Z]{3}$/;
 const EVIDENCE_URI_RE = /^(?:fixture|r2|s3|gcs|evidence):\/\/[A-Za-z0-9._\-\/:]+$/;
 const MAX_BATCH_OBSERVATIONS = 500;
 const MAX_ATOMIC_OBSERVATIONS = 1000;
-const MAX_ATOMIC_GROUPS = 100;
+const MAX_ATOMIC_GROUPS = 1000;
+const MAX_STAGED_IMPORT_OBSERVATIONS = 20000;
+const MAX_STAGED_IMPORT_CHUNKS = 50;
 const MAX_IN_CLAUSE_ITEMS = 90;
 const MAX_LIST_LIMIT = 500;
 
@@ -818,6 +822,87 @@ export class MeasurementService {
     };
   }
 
+  private async fetchExistingBatches(tenantId: string, batchDigests: string[]): Promise<Map<string, any>> {
+    const out = new Map<string, any>();
+    const unique = [...new Set(batchDigests)];
+    for (let i = 0; i < unique.length; i += MAX_IN_CLAUSE_ITEMS) {
+      const chunk = unique.slice(i, i + MAX_IN_CLAUSE_ITEMS);
+      const placeholders = chunk.map(() => "?").join(", ");
+      const res = await this.db
+        .prepare(`SELECT * FROM ms_ingest_batches WHERE tenant_id = ? AND batch_digest IN (${placeholders})`)
+        .bind(tenantId, ...chunk)
+        .all<any>();
+      for (const row of res.results || []) {
+        out.set(row.batch_digest, row);
+      }
+    }
+    return out;
+  }
+
+  private async commitGroupsAtomically(
+    tenantId: string,
+    groups: Array<Record<string, any>>,
+    opts: { maxObservationsPerGroup: number; allowInlineRunCreate: boolean; extraStatements?: any[] },
+    now: number
+  ): Promise<{
+    inserted: number;
+    replayedNoop: number;
+    groups: Array<{
+      runId: string;
+      evidenceId: string;
+      inserted: number;
+      replayedNoop: number;
+      coverageStatus: string | null;
+    }>;
+  }> {
+    const shared = await this.prefetchIngestState(tenantId, groups);
+    const preparedList: any[] = [];
+    for (const grp of groups) {
+      const prepared = await this.prepareIngestGroup(
+        { ...grp, tenantId } as any,
+        { maxObservations: opts.maxObservationsPerGroup, allowInlineRunCreate: opts.allowInlineRunCreate },
+        shared
+      );
+      preparedList.push(prepared);
+    }
+
+    const existingBatchMap = await this.fetchExistingBatches(
+      tenantId,
+      preparedList.map((p) => p.batchDigest)
+    );
+
+    const groupResults: Array<{
+      runId: string;
+      evidenceId: string;
+      inserted: number;
+      replayedNoop: number;
+      coverageStatus: string | null;
+    }> = [];
+    let totalInserted = 0;
+    let totalReplayedNoop = 0;
+
+    for (const prepared of preparedList) {
+      const res = this.emitPreparedGroupStatements(prepared, existingBatchMap.get(prepared.batchDigest), shared, now);
+      groupResults.push(res);
+      totalInserted += res.inserted;
+      totalReplayedNoop += res.replayedNoop;
+    }
+
+    if (opts.extraStatements && opts.extraStatements.length > 0) {
+      shared.statements.push(...opts.extraStatements);
+    }
+
+    if (shared.statements.length > 0) {
+      await this.db.batch(shared.statements);
+    }
+
+    return {
+      inserted: totalInserted,
+      replayedNoop: totalReplayedNoop,
+      groups: groupResults,
+    };
+  }
+
   public async ingestBatch(raw: IngestBatchInput, now = Date.now()): Promise<{
     runId: string;
     evidenceId: string;
@@ -835,17 +920,13 @@ export class MeasurementService {
     if (raw.observations.length > MAX_BATCH_OBSERVATIONS) {
       throw new ValidationError(`Batch exceeds maximum size (${MAX_BATCH_OBSERVATIONS} observations)`);
     }
-    const shared = await this.prefetchIngestState(tenantId, [raw as any]);
-    const res = await this.prepareIngestGroup(
-      raw as any,
-      { maxObservations: MAX_BATCH_OBSERVATIONS, allowInlineRunCreate: false },
-      shared,
+    const out = await this.commitGroupsAtomically(
+      tenantId,
+      [raw as any],
+      { maxObservationsPerGroup: MAX_BATCH_OBSERVATIONS, allowInlineRunCreate: false },
       now
     );
-    if (shared.statements.length > 0) {
-      await this.db.batch(shared.statements);
-    }
-    return res;
+    return out.groups[0];
   }
 
   public async ingestAtomicBatch(raw: IngestAtomicBatchInput, now = Date.now()): Promise<{
@@ -883,39 +964,164 @@ export class MeasurementService {
       throw new ValidationError(`Atomic batch exceeds maximum size (${MAX_ATOMIC_OBSERVATIONS} observations)`);
     }
 
-    const shared = await this.prefetchIngestState(tenantId, raw.groups as any);
+    return this.commitGroupsAtomically(
+      tenantId,
+      raw.groups as any,
+      { maxObservationsPerGroup: MAX_ATOMIC_OBSERVATIONS, allowInlineRunCreate: true },
+      now
+    );
+  }
 
-    const groupResults: Array<{
+  public async stageImportChunk(
+    raw: StageImportChunkInput,
+    now = Date.now()
+  ): Promise<{ importId: string; chunkIndex: number; observations: number; existing: boolean }> {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      throw new ValidationError("Stage import payload must be a JSON object");
+    }
+    assertAllowedKeys(raw as any, new Set(["tenantId", "importId", "chunkIndex", "groups"]), "stageImport");
+    const tenantId = requireNonEmptyString(raw.tenantId, "tenantId", 128);
+    const importId = requireNonEmptyString(raw.importId, "importId", 128);
+    if (!Number.isInteger(raw.chunkIndex) || raw.chunkIndex < 0 || raw.chunkIndex >= MAX_STAGED_IMPORT_CHUNKS) {
+      throw new ValidationError(`chunkIndex must be an integer in [0, ${MAX_STAGED_IMPORT_CHUNKS - 1}]`);
+    }
+    if (!Array.isArray(raw.groups) || raw.groups.length === 0 || raw.groups.length > MAX_ATOMIC_GROUPS) {
+      throw new ValidationError(`Field 'groups' must contain 1 to ${MAX_ATOMIC_GROUPS} groups`);
+    }
+    let chunkObs = 0;
+    const resourceIds = new Set<string>();
+    for (let i = 0; i < raw.groups.length; i++) {
+      const g = raw.groups[i];
+      if (!g || typeof g !== "object" || Array.isArray(g)) {
+        throw new ValidationError(`groups[${i}] must be a JSON object`);
+      }
+      const rid = requireNonEmptyString(g.resourceId, `groups[${i}].resourceId`, 128);
+      resourceIds.add(rid);
+      if (!Array.isArray(g.observations)) {
+        throw new ValidationError(`groups[${i}].observations must be an array`);
+      }
+      chunkObs += g.observations.length;
+    }
+    if (chunkObs > MAX_ATOMIC_OBSERVATIONS) {
+      throw new ValidationError(`Staged chunk exceeds maximum size (${MAX_ATOMIC_OBSERVATIONS} observations)`);
+    }
+
+    const groupsJson = canonicalJson(raw.groups);
+    const resourceIdsJson = canonicalJson([...resourceIds].sort());
+
+    const existing = await this.db
+      .prepare("SELECT groups_json FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ? AND chunk_index = ?")
+      .bind(tenantId, importId, raw.chunkIndex)
+      .first<any>();
+    if (existing) {
+      if (existing.groups_json !== groupsJson) {
+        throw new ConflictError(`Staged import '${importId}' chunk ${raw.chunkIndex} already exists with different payload`);
+      }
+      return { importId, chunkIndex: raw.chunkIndex, observations: chunkObs, existing: true };
+    }
+
+    await this.db
+      .prepare(
+        `INSERT INTO ms_staged_imports (tenant_id, import_id, chunk_index, resource_ids_json, groups_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      )
+      .bind(tenantId, importId, raw.chunkIndex, resourceIdsJson, groupsJson, now)
+      .run();
+
+    return { importId, chunkIndex: raw.chunkIndex, observations: chunkObs, existing: false };
+  }
+
+  public async commitStagedImport(
+    raw: CommitStagedImportInput,
+    now = Date.now()
+  ): Promise<{
+    importId: string;
+    inserted: number;
+    replayedNoop: number;
+    groups: Array<{
       runId: string;
       evidenceId: string;
       inserted: number;
       replayedNoop: number;
       coverageStatus: string | null;
-    }> = [];
-    let totalInserted = 0;
-    let totalReplayedNoop = 0;
-
-    for (const grp of raw.groups) {
-      const res = await this.prepareIngestGroup(
-        { ...grp, tenantId } as any,
-        { maxObservations: MAX_ATOMIC_OBSERVATIONS, allowInlineRunCreate: true },
-        shared,
-        now
-      );
-      groupResults.push(res);
-      totalInserted += res.inserted;
-      totalReplayedNoop += res.replayedNoop;
+    }>;
+  }> {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      throw new ValidationError("Commit staged import payload must be a JSON object");
+    }
+    assertAllowedKeys(raw as any, new Set(["tenantId", "importId", "expectedChunks"]), "commitStagedImport");
+    const tenantId = requireNonEmptyString(raw.tenantId, "tenantId", 128);
+    const importId = requireNonEmptyString(raw.importId, "importId", 128);
+    if (!Number.isInteger(raw.expectedChunks) || raw.expectedChunks < 1 || raw.expectedChunks > MAX_STAGED_IMPORT_CHUNKS) {
+      throw new ValidationError(`expectedChunks must be an integer in [1, ${MAX_STAGED_IMPORT_CHUNKS}]`);
     }
 
-    if (shared.statements.length > 0) {
-      await this.db.batch(shared.statements);
+    const res = await this.db
+      .prepare("SELECT chunk_index, groups_json FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ? ORDER BY chunk_index ASC")
+      .bind(tenantId, importId)
+      .all<any>();
+    const rows = res.results || [];
+    if (rows.length === 0) {
+      throw new NotFoundError(`Staged import '${importId}' not found`);
     }
+    if (rows.length !== raw.expectedChunks) {
+      throw new ValidationError(`Staged import '${importId}' has ${rows.length} chunks, expected ${raw.expectedChunks}`);
+    }
+
+    const allGroups: Array<Record<string, any>> = [];
+    let totalObservations = 0;
+    for (let idx = 0; idx < rows.length; idx++) {
+      if (Number(rows[idx].chunk_index) !== idx) {
+        throw new ValidationError(`Staged import '${importId}' is missing chunk index ${idx}`);
+      }
+      const parsed = JSON.parse(rows[idx].groups_json);
+      if (!Array.isArray(parsed)) {
+        throw new ValidationError(`Staged import '${importId}' chunk ${idx} is malformed`);
+      }
+      for (const grp of parsed) {
+        if (Array.isArray(grp?.observations)) {
+          totalObservations += grp.observations.length;
+        }
+        allGroups.push(grp);
+      }
+    }
+    if (totalObservations > MAX_STAGED_IMPORT_OBSERVATIONS) {
+      throw new ValidationError(`Staged import exceeds maximum size (${MAX_STAGED_IMPORT_OBSERVATIONS} observations)`);
+    }
+
+    const cleanupStmt = this.db
+      .prepare("DELETE FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ?")
+      .bind(tenantId, importId);
+
+    const out = await this.commitGroupsAtomically(
+      tenantId,
+      allGroups,
+      {
+        maxObservationsPerGroup: MAX_ATOMIC_OBSERVATIONS,
+        allowInlineRunCreate: true,
+        extraStatements: [cleanupStmt],
+      },
+      now
+    );
 
     return {
-      inserted: totalInserted,
-      replayedNoop: totalReplayedNoop,
-      groups: groupResults,
+      importId,
+      ...out,
     };
+  }
+
+  public async abortStagedImport(tenantId: string, importId: string): Promise<{ aborted: true; discardedChunks: number }> {
+    const tid = requireNonEmptyString(tenantId, "tenantId", 128);
+    const iid = requireNonEmptyString(importId, "importId", 128);
+    const countRow = await this.db
+      .prepare("SELECT COUNT(*) as cnt FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ?")
+      .bind(tid, iid)
+      .first<any>();
+    await this.db
+      .prepare("DELETE FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ?")
+      .bind(tid, iid)
+      .run();
+    return { aborted: true, discardedChunks: Number(countRow?.cnt ?? 0) };
   }
 
   private async prepareIngestGroup(
@@ -934,15 +1140,8 @@ export class MeasurementService {
       seenRunIdemKeys: Map<string, { runId: string; requestDigest: string }>;
       seenBatchDigests: Set<string>;
       statements: any[];
-    },
-    now: number
-  ): Promise<{
-    runId: string;
-    evidenceId: string;
-    inserted: number;
-    replayedNoop: number;
-    coverageStatus: string | null;
-  }> {
+    }
+  ): Promise<any> {
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
       throw new ValidationError("Ingest payload must be a JSON object");
     }
@@ -1424,10 +1623,89 @@ export class MeasurementService {
       })
     );
 
-    const existingBatch = await this.db
-      .prepare("SELECT * FROM ms_ingest_batches WHERE tenant_id = ? AND batch_digest = ?")
-      .bind(tenantId, batchDigest)
-      .first<any>();
+    const needsEvInsert = !existingEv && !stagedEv;
+    if (needsEvInsert) {
+      shared.seenEvidence.set(evidenceId, {
+        tenantId,
+        resourceId,
+        sha256,
+        uriPointer,
+        byteSize: ev.byteSize,
+        mediaType,
+      });
+    }
+
+    return {
+      raw,
+      tenantId,
+      resourceId,
+      resource,
+      source,
+      runId,
+      windowStart,
+      windowEnd,
+      needsRunInsert,
+      runInsertParams,
+      needsEvInsert,
+      evidenceId,
+      uriPointer,
+      sha256,
+      byteSize: ev.byteSize,
+      mediaType,
+      privacyClass,
+      retentionClass,
+      collectedAt,
+      sourceAsOf,
+      adapterName,
+      adapterVersion,
+      coverage,
+      preparedObs,
+      batchDigest,
+    };
+  }
+
+  private emitPreparedGroupStatements(
+    p: any,
+    existingBatch: any,
+    shared: {
+      seenBatchDigests: Set<string>;
+      statements: any[];
+    },
+    now: number
+  ): {
+    runId: string;
+    evidenceId: string;
+    inserted: number;
+    replayedNoop: number;
+    coverageStatus: string | null;
+  } {
+    const {
+      raw,
+      tenantId,
+      resourceId,
+      resource,
+      source,
+      runId,
+      windowStart,
+      windowEnd,
+      needsRunInsert,
+      runInsertParams,
+      needsEvInsert,
+      evidenceId,
+      uriPointer,
+      sha256,
+      byteSize,
+      mediaType,
+      privacyClass,
+      retentionClass,
+      collectedAt,
+      sourceAsOf,
+      adapterName,
+      adapterVersion,
+      coverage,
+      preparedObs,
+      batchDigest,
+    } = p;
 
     if (existingBatch || shared.seenBatchDigests.has(batchDigest)) {
       return {
@@ -1499,15 +1777,7 @@ export class MeasurementService {
         .bind(tenantId, batchDigest, runId, evidenceId, preparedObs.length, coverage?.status ?? null, now)
     );
 
-    if (!existingEv && !stagedEv) {
-      shared.seenEvidence.set(evidenceId, {
-        tenantId,
-        resourceId,
-        sha256,
-        uriPointer,
-        byteSize: ev.byteSize,
-        mediaType,
-      });
+    if (needsEvInsert) {
       statements.push(
         this.db
           .prepare(
@@ -1524,7 +1794,7 @@ export class MeasurementService {
             runId,
             uriPointer,
             sha256,
-            ev.byteSize,
+            byteSize,
             mediaType,
             privacyClass,
             retentionClass,
@@ -1746,9 +2016,9 @@ export class MeasurementService {
 
     const rowsRes = await this.db
       .prepare(
-        `SELECT * FROM ms_observations
+        `SELECT rowid AS record_seq, * FROM ms_observations
          WHERE ${where.join(" AND ")}
-         ORDER BY window_start ASC, window_end ASC, dimensions_hash ASC, source_revision DESC, created_at DESC`
+         ORDER BY window_start ASC, window_end ASC, dimensions_hash ASC, source_revision DESC, created_at DESC, rowid DESC`
       )
       .bind(...binds)
       .all<any>();
@@ -2075,6 +2345,7 @@ export class MeasurementService {
       sourceRevision: r.source_revision,
       sourceAsOf: r.source_as_of,
       correctionLineage: lineage,
+      recordSeq: Number(r.record_seq ?? 0),
       createdAt: r.created_at,
     };
   }

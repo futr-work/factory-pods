@@ -230,6 +230,19 @@ export interface IngestAtomicBatchInput {
   groups: AtomicIngestGroupInput[];
 }
 
+export interface StageImportChunkInput {
+  tenantId: string;
+  importId: string;
+  chunkIndex: number;
+  groups: AtomicIngestGroupInput[];
+}
+
+export interface CommitStagedImportInput {
+  tenantId: string;
+  importId: string;
+  expectedChunks: number;
+}
+
 export interface AnnotationInput {
   annotationId?: string;
   tenantId: string;

@@ -264,6 +264,17 @@ CREATE TABLE IF NOT EXISTS ms_events (
   created_at INTEGER NOT NULL
 );
 
+-- 9. Invisible Staged Multi-Chunk Imports (committed all-or-nothing in one atomic transaction)
+CREATE TABLE IF NOT EXISTS ms_staged_imports (
+  tenant_id TEXT NOT NULL,
+  import_id TEXT NOT NULL,
+  chunk_index INTEGER NOT NULL,
+  resource_ids_json TEXT NOT NULL,
+  groups_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (tenant_id, import_id, chunk_index)
+);
+
 -- Indexes for bounded paginated queries & capacity floor
 CREATE INDEX IF NOT EXISTS idx_tasks_task_id ON tasks(task_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
