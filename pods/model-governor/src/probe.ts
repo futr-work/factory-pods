@@ -68,15 +68,16 @@ export interface ProbeResult {
 
 function endpoint(provider: string, env: ProbeEnv): { url: string; key?: string } {
   if (provider === "orcarouter") return { url: `${env.ORCAROUTER_BASE_URL || "https://api.orcarouter.ai/v1"}/chat/completions`, key: env.ORCAROUTER_API_KEY };
+  if (provider === "google") return { url: `${env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com/v1beta/openai"}/chat/completions`, key: env.GEMINI_API_KEY };
   return { url: "https://openrouter.ai/api/v1/chat/completions", key: env.OPENROUTER_API_KEY };
 }
 
-export interface ProbeEnv { PROBE_REQUESTS_DAILY?: string; OPENROUTER_API_KEY?: string; ORCAROUTER_API_KEY?: string; ORCAROUTER_BASE_URL?: string }
+export interface ProbeEnv { PROBE_REQUESTS_DAILY?: string; OPENROUTER_API_KEY?: string; ORCAROUTER_API_KEY?: string; ORCAROUTER_BASE_URL?: string; GEMINI_API_KEY?: string; GEMINI_BASE_URL?: string }
 
 export async function probeModel(db: PodStorage, target: ProbeTarget, env: ProbeEnv, fetcher: Fetcher = (i, init) => fetch(i, init)): Promise<ProbeResult> {
   const { url, key } = endpoint(target.provider, env);
   const result: ProbeResult = { modelId: target.id, passed: 0, total: SUITE.length, latencyMs: null, tokensPerSec: null, promptTokens: 0, completionTokens: 0, costUsd: 0 };
-  if (!["openrouter","orcarouter"].includes(target.provider)) return { ...result, error: "no probe adapter for " + target.provider, providerError:true };
+  if (!["openrouter","orcarouter","google"].includes(target.provider)) return { ...result, error: "no probe adapter for " + target.provider, providerError:true };
   if (!key) return { ...result, error: `no API key for ${target.provider}`, providerError: true };
   let totalMs = 0;
   for (const item of SUITE) {
