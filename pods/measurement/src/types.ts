@@ -220,6 +220,16 @@ export interface IngestBatchInput {
   coverage?: CoverageInput;
 }
 
+export interface AtomicIngestGroupInput extends Omit<IngestBatchInput, "tenantId"> {
+  runIdempotencyKey?: string;
+  sourceResourceId?: string;
+}
+
+export interface IngestAtomicBatchInput {
+  tenantId: string;
+  groups: AtomicIngestGroupInput[];
+}
+
 export interface AnnotationInput {
   annotationId?: string;
   tenantId: string;

@@ -1242,4 +1242,262 @@ describe("Measurement Pod — Typed 4-Family Vertical Slice, Isolation, MCP v2 +
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  test("POST /api/measurement/ingest-atomic commits multi-group and 501..1000 batches atomically and rolls back all-or-nothing on conflict or auth denial", async () => {
+    const h = await createTestHarness();
+    try {
+      // Register two resources and two metric definitions
+      for (const r of [
+        { tenantId: "tenant-alpha", resourceId: "site-alpha", resourceType: "site", sourceResourceId: "sc-domain:alpha.test", activeFrom: "2026-01-01" },
+        { tenantId: "tenant-alpha", resourceId: "site-beta", resourceType: "site", sourceResourceId: "sc-domain:beta.test", activeFrom: "2026-01-01" },
+      ]) {
+        assert.equal((await h.call("POST", "/api/measurement/resources", h.tokenA, r)).status, 201);
+      }
+      for (const d of [
+        {
+          tenantId: "tenant-alpha", metricId: "gsc.clicks", version: "v1", family: "seo",
+          unit: "count", valueType: "integer", grain: "daily", windowTz: "UTC",
+          dimensionsSchema: { page: { type: "string", required: true } }, aggregationRule: "sum",
+        },
+        {
+          tenantId: "tenant-alpha", metricId: "signup.rate", version: "v1", family: "analytics",
+          unit: "ratio", valueType: "decimal_string", grain: "daily", windowTz: "UTC",
+          dimensionsSchema: { cta: { type: "string", required: true } }, aggregationRule: "ratio",
+        },
+      ]) {
+        assert.equal((await h.call("POST", "/api/measurement/definitions", h.tokenA, d)).status, 201);
+      }
+
+      const sha1 = await sha256Hex("ev-1");
+      const sha2 = await sha256Hex("ev-2");
+      const mkEv = (id: string, sha: string) => ({
+        evidenceId: id,
+        uriPointer: `evidence://orrery/${sha}`,
+        sha256: sha,
+        byteSize: 12,
+        mediaType: "application/json",
+        privacyClass: "internal",
+        retentionClass: "90d",
+        collectedAt: "2026-11-20T00:00:00Z",
+        sourceAsOf: "2026-11-19T00:00:00Z",
+        adapterName: "orrery",
+        adapterVersion: "1.0.0",
+      });
+
+      // 1. Atomic multi-group commit (2 resources, 2 source families, 2 evidence handles, inline run creation)
+      const atomicPayload = {
+        tenantId: "tenant-alpha",
+        groups: [
+          {
+            resourceId: "site-alpha",
+            source: "gsc_export",
+            runId: "run-atomic-g1",
+            runIdempotencyKey: "idem-run-atomic-g1",
+            sourceResourceId: "sc-domain:alpha.test",
+            windowStart: "2026-11-19",
+            windowEnd: "2026-11-19",
+            runStatus: "succeeded",
+            evidence: mkEv("ev-atomic-1", sha1),
+            observations: [
+              {
+                metricId: "gsc.clicks", definitionVersion: "v1",
+                windowStart: "2026-11-19", windowEnd: "2026-11-19", windowTz: "UTC", grain: "daily",
+                dimensions: { page: "/home" }, valueNum: 42,
+                interpretationVersion: "v1", sourceRevision: 1, sourceAsOf: "2026-11-19T00:00:00Z",
+                idempotencyKey: "obs-atomic-g1-1",
+              },
+            ],
+            coverage: { status: "successful", reconciliationStatus: "matched" },
+          },
+          {
+            resourceId: "site-beta",
+            source: "analytics",
+            runId: "run-atomic-g2",
+            runIdempotencyKey: "idem-run-atomic-g2",
+            sourceResourceId: "sc-domain:beta.test",
+            windowStart: "2026-11-19",
+            windowEnd: "2026-11-19",
+            runStatus: "succeeded",
+            evidence: mkEv("ev-atomic-2", sha2),
+            observations: [
+              {
+                metricId: "signup.rate", definitionVersion: "v1",
+                windowStart: "2026-11-19", windowEnd: "2026-11-19", windowTz: "UTC", grain: "daily",
+                dimensions: { cta: "hero" }, valueText: "0.25", numerator: 1, denominator: 4,
+                interpretationVersion: "v1", sourceRevision: 1, sourceAsOf: "2026-11-19T00:00:00Z",
+                idempotencyKey: "obs-atomic-g2-1",
+              },
+            ],
+            coverage: { status: "successful", reconciliationStatus: "matched" },
+          },
+        ],
+      };
+
+      const res1 = await h.call("POST", "/api/measurement/ingest-atomic", h.tokenA, atomicPayload);
+      assert.equal(res1.status, 200);
+      const body1 = (await res1.json()) as any;
+      assert.equal(body1.inserted, 2);
+      assert.equal(body1.replayedNoop, 0);
+
+      // Replay is idempotent no-op
+      const replayRes = await h.call("POST", "/api/measurement/ingest-atomic", h.tokenA, atomicPayload);
+      assert.equal(replayRes.status, 200);
+      const replayBody = (await replayRes.json()) as any;
+      assert.equal(replayBody.inserted, 0);
+      assert.equal(replayBody.replayedNoop, 2);
+
+      // 2. All-or-nothing rollback: group 1 is brand-new, group 2 conflicts with existing obs-atomic-g2-1 -> 409 and ZERO rows from group 1!
+      const conflictRes = await h.call("POST", "/api/measurement/ingest-atomic", h.tokenA, {
+        tenantId: "tenant-alpha",
+        groups: [
+          {
+            resourceId: "site-alpha",
+            source: "gsc_export",
+            runId: "run-should-rollback",
+            runIdempotencyKey: "idem-run-should-rollback",
+            sourceResourceId: "sc-domain:alpha.test",
+            windowStart: "2026-11-20",
+            windowEnd: "2026-11-20",
+            evidence: mkEv("ev-should-rollback", await sha256Hex("ev-rb")),
+            observations: [
+              {
+                metricId: "gsc.clicks", definitionVersion: "v1",
+                windowStart: "2026-11-20", windowEnd: "2026-11-20", windowTz: "UTC", grain: "daily",
+                dimensions: { page: "/rollback" }, valueNum: 99,
+                interpretationVersion: "v1", sourceRevision: 1, sourceAsOf: "2026-11-20T00:00:00Z",
+                idempotencyKey: "obs-should-rollback",
+              },
+            ],
+          },
+          {
+            resourceId: "site-beta",
+            source: "analytics",
+            runId: "run-atomic-g2",
+            runIdempotencyKey: "idem-run-atomic-g2",
+            sourceResourceId: "sc-domain:beta.test",
+            windowStart: "2026-11-19",
+            windowEnd: "2026-11-19",
+            evidence: mkEv("ev-atomic-2", sha2),
+            observations: [
+              {
+                metricId: "signup.rate", definitionVersion: "v1",
+                windowStart: "2026-11-19", windowEnd: "2026-11-19", windowTz: "UTC", grain: "daily",
+                dimensions: { cta: "hero" }, valueText: "0.5", numerator: 2, denominator: 4,
+                interpretationVersion: "v1", sourceRevision: 1, sourceAsOf: "2026-11-19T00:00:00Z",
+                idempotencyKey: "obs-atomic-g2-1",
+              },
+            ],
+          },
+        ],
+      });
+      assert.equal(conflictRes.status, 409);
+      const runCheck = await h.call("GET", "/api/measurement/runs/run-should-rollback?tenantId=tenant-alpha", h.tokenA);
+      assert.equal(runCheck.status, 404);
+      const evCheck = await h.call("GET", "/api/measurement/evidence/ev-should-rollback?tenantId=tenant-alpha", h.tokenA);
+      assert.equal(evCheck.status, 404);
+
+      // 3. 600-observation single-group atomic batch (>500, <=1000) succeeds; 1001 rejected with 400
+      const obs600 = Array.from({ length: 600 }, (_, i) => ({
+        metricId: "gsc.clicks", definitionVersion: "v1",
+        windowStart: "2026-11-21", windowEnd: "2026-11-21", windowTz: "UTC", grain: "daily",
+        dimensions: { page: `/p/${i}` }, valueNum: i,
+        interpretationVersion: "v1", sourceRevision: 1, sourceAsOf: "2026-11-21T00:00:00Z",
+        idempotencyKey: `obs-600-${i}`,
+      }));
+      const res600 = await h.call("POST", "/api/measurement/ingest-atomic", h.tokenA, {
+        tenantId: "tenant-alpha",
+        groups: [{
+          resourceId: "site-alpha",
+          source: "gsc_export",
+          runId: "run-atomic-600",
+          runIdempotencyKey: "idem-run-atomic-600",
+          sourceResourceId: "sc-domain:alpha.test",
+          windowStart: "2026-11-21",
+          windowEnd: "2026-11-21",
+          evidence: mkEv("ev-atomic-600", await sha256Hex("ev-600")),
+          observations: obs600,
+        }],
+      });
+      assert.equal(res600.status, 200);
+      assert.equal(((await res600.json()) as any).inserted, 600);
+
+      const obs1001 = Array.from({ length: 1001 }, (_, i) => ({
+        metricId: "gsc.clicks", definitionVersion: "v1",
+        windowStart: "2026-11-22", windowEnd: "2026-11-22", windowTz: "UTC", grain: "daily",
+        dimensions: { page: `/over/${i}` }, valueNum: i,
+        interpretationVersion: "v1", sourceRevision: 1, sourceAsOf: "2026-11-22T00:00:00Z",
+        idempotencyKey: `obs-over-${i}`,
+      }));
+      const res1001 = await h.call("POST", "/api/measurement/ingest-atomic", h.tokenA, {
+        tenantId: "tenant-alpha",
+        groups: [{
+          resourceId: "site-alpha",
+          source: "gsc_export",
+          runId: "run-atomic-1001",
+          runIdempotencyKey: "idem-run-atomic-1001",
+          sourceResourceId: "sc-domain:alpha.test",
+          windowStart: "2026-11-22",
+          windowEnd: "2026-11-22",
+          evidence: mkEv("ev-atomic-1001", await sha256Hex("ev-1001")),
+          observations: obs1001,
+        }],
+      });
+      assert.equal(res1001.status, 400);
+
+      // 4. Resource-scoped auth fail-closed: token granted only site-alpha MUST get 403 when group 2 targets site-beta
+      const narrowToken = "narrow-site-alpha-only-token";
+      const narrowGrants = [
+        ...JSON.parse(h.env.SCOPED_CALLER_GRANTS!),
+        {
+          callerId: "narrow-alpha",
+          tokenSha256: await sha256Hex(narrowToken),
+          grants: [{ tenantId: "tenant-alpha", resourceIds: ["site-alpha"], actions: ["read", "write"] }],
+        },
+      ];
+      h.env.SCOPED_CALLER_GRANTS = JSON.stringify(narrowGrants);
+      const deniedRes = await h.call("POST", "/api/measurement/ingest-atomic", narrowToken, {
+        tenantId: "tenant-alpha",
+        groups: [
+          {
+            resourceId: "site-alpha",
+            source: "gsc_export",
+            runId: "run-narrow-deny",
+            runIdempotencyKey: "idem-narrow-deny",
+            sourceResourceId: "sc-domain:alpha.test",
+            windowStart: "2026-11-23",
+            windowEnd: "2026-11-23",
+            evidence: mkEv("ev-narrow-deny", await sha256Hex("ev-narrow")),
+            observations: [{
+              metricId: "gsc.clicks", definitionVersion: "v1",
+              windowStart: "2026-11-23", windowEnd: "2026-11-23", windowTz: "UTC", grain: "daily",
+              dimensions: { page: "/narrow" }, valueNum: 1,
+              interpretationVersion: "v1", sourceRevision: 1, sourceAsOf: "2026-11-23T00:00:00Z",
+              idempotencyKey: "obs-narrow-deny",
+            }],
+          },
+          {
+            resourceId: "site-beta",
+            source: "gsc_export",
+            runId: "run-narrow-deny-2",
+            runIdempotencyKey: "idem-narrow-deny-2",
+            sourceResourceId: "sc-domain:beta.test",
+            windowStart: "2026-11-23",
+            windowEnd: "2026-11-23",
+            evidence: mkEv("ev-narrow-deny-2", await sha256Hex("ev-narrow-2")),
+            observations: [{
+              metricId: "gsc.clicks", definitionVersion: "v1",
+              windowStart: "2026-11-23", windowEnd: "2026-11-23", windowTz: "UTC", grain: "daily",
+              dimensions: { page: "/narrow-beta" }, valueNum: 1,
+              interpretationVersion: "v1", sourceRevision: 1, sourceAsOf: "2026-11-23T00:00:00Z",
+              idempotencyKey: "obs-narrow-deny-2",
+            }],
+          },
+        ],
+      });
+      assert.equal(deniedRes.status, 403);
+      assert.equal((await h.call("GET", "/api/measurement/runs/run-narrow-deny?tenantId=tenant-alpha", h.tokenA)).status, 404);
+    } finally {
+      h.cleanup();
+    }
+  });
 });
