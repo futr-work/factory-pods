@@ -3,6 +3,9 @@ import type { PodStorage } from "@futr-work/pod-kernel/storage";
 // Live model discovery. Pulls real catalogs; never invents numbers.
 // Sources: OpenRouter GET /api/v1/models (public: ids, real prices, context, created date),
 //          OrcaRouter GET /v1/models (when ORCAROUTER_API_KEY is set: ids only; prices unknown -> NULL).
+//          Google Gemini GET /v1beta/openai/models (when GEMINI_API_KEY is set: ids only). Google publishes no
+//          prices through the API, so Gemini rows are FREE_TIER at zero cost only when GEMINI_FREE_TIER=1 says the
+//          key is on Google's free tier; otherwise they are PAID with unknown prices and stay unprobed until priced.
 // New ids become lifecycle 'candidate' with first_seen_at. Ids missing from their source for 7 days are retired.
 
 export type Fetcher = (input: string, init?: RequestInit) => Promise<Response>;
@@ -96,6 +99,47 @@ export async function fetchOrcaRouter(fetcher: Fetcher, key: string, baseUrl = "
     }));
 }
 
+const GOOGLE_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai";
+/** Gemini ids that are not text chat: speech, live/realtime, transcription, image, embeddings, robotics. */
+const GOOGLE_NON_CHAT = /(tts|live|transcribe|image|embed|audio|robotics|computer-use|aqa)/i;
+
+/** Maps one Gemini OpenAI-compatible model record (`models/<name>`); returns null for non-chat or non-Gemini ids. */
+export function fromGoogle(m: any, freeTier: boolean): DiscoveredModel | null {
+  const raw = typeof m?.id === "string" ? m.id : "";
+  const name = raw.replace(/^models\//, "");
+  if (!/^gemini-/.test(name) || GOOGLE_NON_CHAT.test(name)) return null;
+  return {
+    id: `google:${name}`,
+    provider: "google",
+    modelName: name,
+    family: "google",
+    category: categorize(name),
+    tier: freeTier ? "FREE_TIER" : "PAID",
+    inputCostPer1M: freeTier ? 0 : null,
+    outputCostPer1M: freeTier ? 0 : null,
+    contextWindow: null,
+    createdAt: null,
+    // Gemini chat models take OpenAI-style tools on this endpoint; a failed tool call demotes the row at inference.
+    supportsTools: true,
+  };
+}
+
+export async function fetchGoogle(fetcher: Fetcher, key: string, baseUrl = GOOGLE_BASE_URL, freeTier = false): Promise<DiscoveredModel[]> {
+  const res = await fetcher(`${baseUrl}/models`, { headers: { Authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(30_000) });
+  if (!res.ok) throw new Error(`google models HTTP ${res.status}`);
+  const data = (await res.json()) as any;
+  return (data?.data ?? []).map((m: any) => fromGoogle(m, freeTier)).filter((m: DiscoveredModel | null): m is DiscoveredModel => m !== null);
+}
+
+export interface DiscoveryEnv {
+  ORCAROUTER_API_KEY?: string;
+  ORCAROUTER_BASE_URL?: string;
+  GEMINI_API_KEY?: string;
+  GEMINI_BASE_URL?: string;
+  /** "1" while the Gemini key is on Google's free tier (zero cost, quota-limited). */
+  GEMINI_FREE_TIER?: string;
+}
+
 export interface DiscoveryReport {
   source: string;
   seen: number;
@@ -154,7 +198,7 @@ export async function retireSupersededSeeds(db: PodStorage): Promise<number> {
 
 export async function runDiscovery(
   db: PodStorage,
-  env: { ORCAROUTER_API_KEY?: string; ORCAROUTER_BASE_URL?: string },
+  env: DiscoveryEnv,
   fetcher: Fetcher = (i, init) => fetch(i, init),
   now = Date.now(),
 ): Promise<DiscoveryReport[]> {
@@ -169,6 +213,14 @@ export async function runDiscovery(
       reports.push(await upsertDiscovered(db, "orcarouter", await fetchOrcaRouter(fetcher, env.ORCAROUTER_API_KEY, env.ORCAROUTER_BASE_URL), now));
     } catch (e: any) {
       reports.push({ source: "orcarouter", seen: 0, newIds: [], retired: 0, error: String(e?.message ?? e) });
+    }
+  }
+  if (env.GEMINI_API_KEY) {
+    try {
+      const models = await fetchGoogle(fetcher, env.GEMINI_API_KEY, env.GEMINI_BASE_URL || GOOGLE_BASE_URL, env.GEMINI_FREE_TIER === "1");
+      reports.push(await upsertDiscovered(db, "google", models, now));
+    } catch (e: any) {
+      reports.push({ source: "google", seen: 0, newIds: [], retired: 0, error: String(e?.message ?? e) });
     }
   }
   if (reports.some((r) => r.seen > 0)) await retireSupersededSeeds(db);
@@ -190,7 +242,7 @@ interface DiscoveryState {
  */
 export async function runScheduledDiscovery(
   db: PodStorage,
-  env: { ORCAROUTER_API_KEY?: string; ORCAROUTER_BASE_URL?: string },
+  env: DiscoveryEnv,
   now = Date.now(),
   fetcher?: Fetcher,
 ): Promise<DiscoveryReport[] | null> {

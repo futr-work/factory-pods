@@ -71,6 +71,13 @@ The **Model Governor Pod** provides intelligent, low-latency LLM routing across 
 
 ---
 
+6. **Google Gemini (direct)**:
+   - With `GEMINI_API_KEY` set, discovery lists Gemini chat models from Google's OpenAI-compatible endpoint
+     (`generativelanguage.googleapis.com/v1beta/openai`), and probes and inference call that endpoint directly.
+   - Google publishes no prices through the API. Set `GEMINI_FREE_TIER=1` while the key is on Google's free tier:
+     rows are then free (zero cost, quota-limited, 429s fall back down the chain). Without it, rows are paid with
+     unknown prices and stay unprobed until priced. Override the endpoint with `GEMINI_BASE_URL`.
+
 ## 🚀 Quickstart
 
 ### 1. Local Development
@@ -229,7 +236,7 @@ A wrong or missing token is `401 {"error":"unauthorized"}`. That is also the ans
 | `X-Governor-Category` | Ranking category (`general_reasoning`, `coding`, `deep_audit`, `fast_classification`). Also accepted as the body field `category` or as `model: "auto:<category>"`. |
 
 **Routing policy.** Only qualified models are candidates: measured by probes, approved by an admin if paid, and
-on a pay-per-use API provider (OpenRouter, OrcaRouter, Fireworks, Cerebras, OpenScale). OAuth and
+on an API-key provider (OpenRouter, OrcaRouter, Fireworks, Cerebras, OpenScale, Google Gemini). OAuth and
 consumer-subscription logins are never called. Each model's tier comes from its catalog price:
 
 | Tier | Models |

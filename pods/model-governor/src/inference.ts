@@ -4,7 +4,7 @@
 // falls back down the chain on 429/402/5xx, records the usage, and returns the provider's response as-is.
 // Callers therefore hold no provider keys at all.
 //
-// API keys only. OAuth/consumer-subscription backends (Claude Pro/Max, ChatGPT, Gemini/Antigravity logins) are
+// API keys only (Google Gemini included, via its OpenAI-compatible endpoint). OAuth/consumer-subscription backends (Claude Pro/Max, ChatGPT, Gemini/Antigravity logins) are
 // never called from here: CALLABLE_PROVIDERS is the allowlist and every entry is a pay-per-use API.
 
 import { dailyPoolDenial, freePoolReset, markFreePoolExhausted } from "./probe-limits.js";
@@ -25,6 +25,8 @@ export interface InferenceEnv extends RoutingEnv {
   CEREBRAS_BASE_URL?: string;
   OPENSCALE_API_KEY?: string;
   OPENSCALE_BASE_URL?: string;
+  GEMINI_API_KEY?: string;
+  GEMINI_BASE_URL?: string;
 }
 
 type Fetcher = (input: string, init?: RequestInit) => Promise<Response>;
@@ -39,7 +41,7 @@ const MAX_ATTEMPTS = 6;
  * Providers with a pay-per-use HTTP chat endpoint. OAuth subscription models (tier OAUTH) are driven by a local CLI
  * on the operator's machine, not by an HTTP request, so they are never routed here.
  */
-export const CALLABLE_PROVIDERS = new Set(["openrouter", "orcarouter", "fireworks", "cerebras", "openscale"]);
+export const CALLABLE_PROVIDERS = new Set(["openrouter", "orcarouter", "fireworks", "cerebras", "openscale", "google"]);
 
 function endpoint(provider: string, env: InferenceEnv): { url: string; key?: string } {
   if (provider === "orcarouter") {
@@ -50,6 +52,9 @@ function endpoint(provider: string, env: InferenceEnv): { url: string; key?: str
   }
   if (provider === "cerebras") {
     return { url: `${env.CEREBRAS_BASE_URL || "https://api.cerebras.ai/v1"}/chat/completions`, key: env.CEREBRAS_API_KEY };
+  }
+  if (provider === "google") {
+    return { url: `${env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com/v1beta/openai"}/chat/completions`, key: env.GEMINI_API_KEY };
   }
   if (provider === "openscale") {
     return { url: `${env.OPENSCALE_BASE_URL || "https://api.openscale.so/v1"}/chat/completions`, key: env.OPENSCALE_API_KEY };

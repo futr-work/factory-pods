@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { SqliteFileStorage } from "@futr-work/pod-kernel/storage/sqlite";
-import { familyOf, fromOpenRouter, runDiscovery, runScheduledDiscovery } from "../src/discovery.js";
+import { familyOf, fromGoogle, fromOpenRouter, runDiscovery, runScheduledDiscovery } from "../src/discovery.js";
 import { clean, estimateSuiteCost, gradeZipRegex, probeModel, recordProbe, runProbeCycle, SUITE } from "../src/probe.js";
 import { recordUsage, resolveOptimalModel, getModelCatalog, getSubscriptionAdvisor } from "../src/governor.js";
 import { analyzeUsage, getUsageReport, percentile, runDailyUsageAnalysis, utcDate } from "../src/analyzer.js";
@@ -330,6 +330,75 @@ async function insertModel(db: any, m: { id: string; provider?: string; category
     .bind(m.id, m.provider ?? "openrouter", m.id.includes(":") ? m.id.slice(m.id.indexOf(":") + 1) : m.id, m.category ?? "coding", m.tier ?? "PAID", m.latency ?? 400, m.quality ?? 90, m.lifecycle ?? "qualified", m.runs ?? 3, m.firstSeen ?? null)
     .run();
 }
+
+describe("google gemini provider", () => {
+  const googleModels = {
+    data: [
+      { id: "models/gemini-3.5-flash", object: "model", owned_by: "google" },
+      { id: "models/gemini-4-argon", object: "model", owned_by: "google" },
+      { id: "models/gemini-3.8-flash-tts", object: "model", owned_by: "google" },
+      { id: "models/gemini-3.8-live", object: "model", owned_by: "google" },
+      { id: "models/text-embedding-004", object: "model", owned_by: "google" },
+    ],
+  };
+  const GOOGLE = "https://generativelanguage.googleapis.com/v1beta/openai";
+  const routed = (async (url: string) =>
+    url.startsWith(GOOGLE) ? new Response(JSON.stringify(googleModels), { status: 200 }) : fetchCatalog()) as any;
+
+  test("maps chat Gemini ids; free tier is explicit, otherwise paid with unknown prices", () => {
+    const free = fromGoogle(googleModels.data[0], true)!;
+    assert.equal(free.id, "google:gemini-3.5-flash");
+    assert.equal(free.modelName, "gemini-3.5-flash", "the upstream name has no models/ prefix");
+    assert.equal(free.provider, "google");
+    assert.equal(free.tier, "FREE_TIER");
+    assert.equal(free.outputCostPer1M, 0);
+    assert.equal(free.supportsTools, true);
+    const paid = fromGoogle(googleModels.data[1], false)!;
+    assert.equal(paid.tier, "PAID");
+    assert.equal(paid.outputCostPer1M, null, "Google publishes no prices: never invented");
+    for (const i of [2, 3, 4]) assert.equal(fromGoogle(googleModels.data[i], true), null, "speech, live and embeddings are not chat");
+  });
+
+  test("discovery adds Gemini only when a key is configured", async () => {
+    const { db, sqlite } = freshDb();
+    const without = await runDiscovery(db, {}, routed, 1_800_000_000_000);
+    assert.equal(without.some((r) => r.source === "google"), false);
+    const reports = await runDiscovery(db, { GEMINI_API_KEY: "g", GEMINI_FREE_TIER: "1" }, routed, 1_800_000_000_000);
+    const g = reports.find((r) => r.source === "google")!;
+    assert.equal(g.seen, 2);
+    const row = sqlite.prepare("SELECT tier, lifecycle, supports_tools FROM model_catalog WHERE id = 'google:gemini-4-argon'").get() as any;
+    assert.deepEqual({ ...row }, { tier: "FREE_TIER", lifecycle: "candidate", supports_tools: 1 });
+  });
+
+  test("probes Gemini on Google's OpenAI-compatible endpoint with the Gemini key", async () => {
+    const { db } = freshDb();
+    let seen = { url: "", auth: "" };
+    const answer = answering(true);
+    const fetcher = (async (url: string, init?: RequestInit) => {
+      seen = { url, auth: String((init?.headers as any)?.Authorization) };
+      return answer(url, init);
+    }) as any;
+    const target = { id: "google:gemini-3.5-flash", provider: "google", modelName: "gemini-3.5-flash", tier: "FREE_TIER", inputCostPer1M: 0, outputCostPer1M: 0 };
+    const r = await probeModel(db, target, { GEMINI_API_KEY: "gkey" }, fetcher);
+    assert.equal(r.error, undefined);
+    assert.equal(r.passed, SUITE.length);
+    assert.equal(seen.url, `${GOOGLE}/chat/completions`);
+    assert.equal(seen.auth, "Bearer gkey");
+  });
+
+  test("inference routes a Gemini model to Google with the governor's key", async () => {
+    const { db } = freshDb();
+    await insertModel(db, { id: "google:gemini-3.5-flash", provider: "google", tier: "FREE_TIER", quality: 95 });
+    let called = "";
+    const fetcher = (async (url: string, init?: RequestInit) => {
+      called = url;
+      return new Response(JSON.stringify({ model: JSON.parse(String(init?.body)).model, choices: [{ message: { content: "OK" } }], usage: { prompt_tokens: 3, completion_tokens: 1 } }), { status: 200 });
+    }) as unknown as typeof fetch;
+    const result = await runInference(db, { GEMINI_API_KEY: "g" } as any, { podId: "omp", model: "google:gemini-3.5-flash", messages: [{ role: "user", content: "ping" }] }, fetcher);
+    assert.equal(result.ok, true);
+    assert.equal(called, `${GOOGLE}/chat/completions`);
+  });
+});
 
 describe("usage analyzer", () => {
   test("nearest-rank percentile", () => {

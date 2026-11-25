@@ -36,6 +36,9 @@ interface Env {
   CEREBRAS_BASE_URL?: string;
   OPENSCALE_API_KEY?: string;
   OPENSCALE_BASE_URL?: string;
+  GEMINI_API_KEY?: string;
+  GEMINI_BASE_URL?: string;
+  GEMINI_FREE_TIER?: string;
   GOVERNOR_CLIENT_TOKEN?: string;
   TIER1_MAX_OUTPUT_COST_PER_1M?: string;
   DEFAULT_CALLER_TIER?: string;
