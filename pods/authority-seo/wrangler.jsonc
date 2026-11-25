@@ -17,13 +17,20 @@
     "binding": "AI"
   },
   // Optional: bind a hub worker as FACTORY_HUB and an Orrery worker as ORRERY via "services",
-  // and set INDEXNOW_KEY / ORRERY_URL in "vars". The pod runs without them.
+  // and set INDEXNOW_KEY / FACTORY_HUB_URL / ORRERY_URL in "vars". The pod runs without them.
+  // Keep deployment-specific ids and URLs out of this public template.
   "vars": {
-    "FACTORY_HUB_URL": ""
+    "POD_ID": "authority-seo-pod",
+    "POD_NAME": "Authority Seo Pod",
+    "POD_ROLE": "seo",
+    "POD_LOB": "authority-network",
+    "FACTORY_HUB_URL": "",
+    "ORRERY_URL": ""
   },
   "triggers": {
     "crons": [
-      "*/5 * * * *"
+      "*/5 * * * *",
+      "0 */4 * * *"
     ]
   },
   "observability": {

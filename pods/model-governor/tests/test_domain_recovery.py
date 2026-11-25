@@ -5,6 +5,8 @@ import json
 import tempfile
 import urllib.error
 import unittest
+from datetime import datetime, timezone
+from unittest.mock import patch
 from pathlib import Path
 
 
@@ -117,6 +119,41 @@ class RecoveryTests(unittest.TestCase):
                            "prompt_tokens": usage.get("prompt_tokens", 0), "completion_tokens": usage.get("completion_tokens", 0),
                            "total_tokens": usage.get("total_tokens", usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0))}
         return gov
+
+    def test_quota_defer_resume_uses_original_12k_job_only_once(self):
+        from datetime import timedelta
+        reset = datetime.now(timezone.utc) + timedelta(hours=2)
+        self.args.oauth_not_before = reset.isoformat()
+        self.args.oauth_on_timeout = True
+        gov = self.timeout_governor(pre_headers=True)
+        deferred = worker.run(self.args, gov, self.native)
+        self.assertEqual(deferred["recoveryStatus"], "deferred_quota")
+        self.assertEqual(deferred["nativeGenerationInvocations"], 0)
+        self.assertEqual(worker.resume(self.args.out, self.native), deferred)
+        self.assertEqual(self.native_calls, 0)
+        self.assertFalse((self.args.out / "attempt-2").exists())
+        # Resume reads the run's frozen sources, even when the original inputs change.
+        self.args.park.write_text("source moved")
+        class AfterReset(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return reset + timedelta(seconds=1)
+        with patch.object(worker, "datetime", AfterReset):
+            result = worker.resume(self.args.out, self.native)
+            self.assertTrue(result["accepted"])
+            self.assertEqual(result["runId"], deferred["runId"])
+            self.assertEqual(result["steps"][0], deferred["steps"][0])
+            self.assertEqual((len(gov.posts), gov.posts[0]["max_tokens"], self.native_calls), (1, 12000, 1))
+            with self.assertRaisesRegex(ValueError, "unclaimed"):
+                worker.resume(self.args.out, self.native)
+            self.assertEqual(self.native_calls, 1)
+
+    def test_naive_quota_timestamp_rejected_before_primary(self):
+        self.args.oauth_not_before = "2026-11-19T08:10:00"
+        gov = Governor([])
+        with self.assertRaisesRegex(ValueError, "UTC offset"):
+            worker.run(self.args, gov, self.native)
+        self.assertFalse(gov.posts)
 
     def test_verified_preheader_timeout_with_unknown_usage_retains_one_oauth_attempt(self):
         self.args.oauth_on_timeout = True
