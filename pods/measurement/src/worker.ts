@@ -200,6 +200,41 @@ export default {
           return jsonResponse(result, 200);
         }
 
+        // POST /api/measurement/ingest-atomic (multi-group / up to 1,000 observations in one atomic transaction)
+        if (method === "POST" && url.pathname === "/api/measurement/ingest-atomic") {
+          const body = await parseJsonBody(request);
+          const tenantId = typeof body.tenantId === "string" ? body.tenantId.trim() : "";
+          const configured = parseScopedCallerGrants(env.SCOPED_CALLER_GRANTS);
+          const caller = await resolveScopedCaller(request, configured);
+          if (!caller) return jsonResponse({ error: "unauthorized" }, 401);
+          if (!tenantId) {
+            return jsonResponse({ error: "Field 'tenantId' must be a non-empty string" }, 400);
+          }
+          if (!Array.isArray(body.groups) || body.groups.length === 0 || body.groups.length > 100) {
+            const tenantDenied = authorizeScopedCaller(caller, { tenantId, resourceId: "*", action: "write" }, "measurement-pod");
+            if (tenantDenied) return tenantDenied;
+            return jsonResponse({ error: "Field 'groups' must contain 1 to 100 items" }, 400);
+          }
+          const uniqueResourceIds = new Set<string>();
+          for (let i = 0; i < body.groups.length; i++) {
+            const g = body.groups[i];
+            if (!g || typeof g !== "object" || Array.isArray(g)) {
+              return jsonResponse({ error: `groups[${i}] must be a JSON object` }, 400);
+            }
+            const rid = typeof g.resourceId === "string" ? g.resourceId.trim() : "";
+            if (!rid) {
+              return jsonResponse({ error: `groups[${i}].resourceId must be a non-empty string` }, 400);
+            }
+            uniqueResourceIds.add(rid);
+          }
+          for (const rid of uniqueResourceIds) {
+            const denied = authorizeScopedCaller(caller, { tenantId, resourceId: rid, action: "write" }, "measurement-pod");
+            if (denied) return denied;
+          }
+          const result = await service.ingestAtomicBatch(body as any);
+          return jsonResponse(result, 200);
+        }
+
         // POST /api/measurement/annotations
         if (method === "POST" && url.pathname === "/api/measurement/annotations") {
           const body = await parseJsonBody(request);
