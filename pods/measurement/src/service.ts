@@ -3,6 +3,7 @@ import { sha256Hex } from "@futr-work/pod-kernel/auth";
 import type {
   AnnotationInput,
   AttemptInput,
+  CommitStagedImportInput,
   CoverageInput,
   CoverageQueryInput,
   DefinitionInput,
@@ -19,6 +20,7 @@ import type {
   RunInput,
   RunStatus,
   SeriesQueryInput,
+  StageImportChunkInput,
   ValueType,
 } from "./types.js";
 
@@ -43,6 +45,14 @@ export class NotFoundError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "NotFoundError";
+  }
+}
+
+export class ForbiddenError extends Error {
+  public readonly status = 403;
+  constructor(message: string) {
+    super(message);
+    this.name = "ForbiddenError";
   }
 }
 
@@ -73,9 +83,263 @@ const CURRENCY_RE = /^[A-Z]{3}$/;
 const EVIDENCE_URI_RE = /^(?:fixture|r2|s3|gcs|evidence):\/\/[A-Za-z0-9._\-\/:]+$/;
 const MAX_BATCH_OBSERVATIONS = 500;
 const MAX_ATOMIC_OBSERVATIONS = 1000;
-const MAX_ATOMIC_GROUPS = 100;
+const MAX_ATOMIC_GROUPS = 1000;
+const MAX_STAGED_IMPORT_OBSERVATIONS = 20000;
+const MAX_STAGED_IMPORT_CHUNKS = 50;
+const MAX_STAGED_CHUNK_BYTES = 1_500_000;
+const MAX_COMMIT_PAYLOAD_PAGE_CHUNKS = 16;
+const MAX_RECEIPT_PART_BYTES = 500_000;
+const MAX_RECEIPT_READ_PAGE_PARTS = 20;
+const MAX_FENCE_CHUNKS_PER_STMT = 30;
+const MAX_DOMAIN_CONTENTION_ATTEMPTS = 4;
 const MAX_IN_CLAUSE_ITEMS = 90;
 const MAX_LIST_LIMIT = 500;
+
+const MS_OBSERVATIONS_DATA_COLUMNS = [
+  "obs_id",
+  "tenant_id",
+  "resource_id",
+  "source",
+  "run_id",
+  "evidence_id",
+  "metric_id",
+  "definition_version",
+  "comparability_key",
+  "window_start",
+  "window_end",
+  "window_tz",
+  "grain",
+  "dimensions_json",
+  "dimensions_hash",
+  "value_type",
+  "value_num",
+  "value_text",
+  "currency",
+  "billing_date",
+  "gross_or_net",
+  "refund_text",
+  "credit_text",
+  "tax_text",
+  "collection_request_budget",
+  "numerator",
+  "denominator",
+  "exclusions_json",
+  "sample_time",
+  "gauge_reducer",
+  "counter_start",
+  "counter_end",
+  "counter_reset",
+  "interpretation_version",
+  "source_revision",
+  "source_as_of",
+  "idempotency_key",
+  "payload_digest",
+  "created_at",
+].join(", ");
+
+/**
+ * Idempotent, data-preserving schema upgrade for existing measurement-pod databases
+ * created before `record_seq` AUTOINCREMENT or staged-import generation/session tables.
+ * Preserves every existing observation row and its original insertion order (`rowid` -> `record_seq`)
+ * while durably initializing SQLite's `sqlite_sequence` so future inserts never reuse deleted sequences.
+ */
+export async function ensureMeasurementSchemaUpgraded(
+  db: PodStorage
+): Promise<{ migratedObservations: boolean; migratedStagedImports: boolean }> {
+  await db.batch([
+    db.prepare(`CREATE TABLE IF NOT EXISTS ms_schema_migrations (
+      migration_id TEXT PRIMARY KEY,
+      applied_at INTEGER NOT NULL
+    )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS ms_staged_import_sessions (
+      tenant_id TEXT NOT NULL,
+      import_id TEXT NOT NULL,
+      owner_caller_id TEXT NOT NULL,
+      session_token TEXT NOT NULL,
+      resource_ids_json TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (tenant_id, import_id)
+    )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS ms_staged_imports (
+      tenant_id TEXT NOT NULL,
+      import_id TEXT NOT NULL,
+      chunk_index INTEGER NOT NULL,
+      generation_id TEXT NOT NULL,
+      resource_ids_json TEXT NOT NULL,
+      groups_json TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (tenant_id, import_id, chunk_index)
+    )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS ms_staged_import_receipts (
+      tenant_id TEXT NOT NULL,
+      import_id TEXT NOT NULL,
+      payload_digest TEXT NOT NULL,
+      expected_chunks INTEGER NOT NULL,
+      resource_ids_json TEXT NOT NULL,
+      result_json TEXT NOT NULL,
+      committed_at INTEGER NOT NULL,
+      PRIMARY KEY (tenant_id, import_id)
+    )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS ms_staged_import_receipt_chunks (
+      tenant_id TEXT NOT NULL,
+      import_id TEXT NOT NULL,
+      part_index INTEGER NOT NULL,
+      resource_ids_json TEXT NOT NULL,
+      groups_json TEXT NOT NULL,
+      PRIMARY KEY (tenant_id, import_id, part_index)
+    )`),
+  ]);
+
+  let migratedObservations = false;
+  let migratedStagedImports = false;
+  const now = Date.now();
+
+  const obsColsRes = await db.prepare("PRAGMA table_info(ms_observations)").all<any>();
+  const obsCols = obsColsRes.results || [];
+  if (obsCols.length > 0 && !obsCols.some((col: any) => String(col.name) === "record_seq")) {
+    try {
+      await db.batch([
+        db
+          .prepare("INSERT INTO ms_schema_migrations (migration_id, applied_at) VALUES (?, ?)")
+          .bind("v2_obs_record_seq", now),
+        db.prepare("DROP TABLE IF EXISTS ms_observations__migrating"),
+        db.prepare(`CREATE TABLE ms_observations__migrating (
+          record_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+          obs_id TEXT NOT NULL UNIQUE,
+          tenant_id TEXT NOT NULL,
+          resource_id TEXT NOT NULL,
+          source TEXT NOT NULL,
+          run_id TEXT NOT NULL,
+          evidence_id TEXT NOT NULL,
+          metric_id TEXT NOT NULL,
+          definition_version TEXT NOT NULL,
+          comparability_key TEXT NOT NULL,
+          window_start TEXT NOT NULL,
+          window_end TEXT NOT NULL,
+          window_tz TEXT NOT NULL,
+          grain TEXT NOT NULL,
+          dimensions_json TEXT NOT NULL,
+          dimensions_hash TEXT NOT NULL,
+          value_type TEXT NOT NULL CHECK (value_type IN ('integer', 'decimal_string', 'gauge', 'counter')),
+          value_num REAL,
+          value_text TEXT,
+          currency TEXT,
+          billing_date TEXT,
+          gross_or_net TEXT CHECK (gross_or_net IS NULL OR gross_or_net IN ('gross', 'net')),
+          refund_text TEXT,
+          credit_text TEXT,
+          tax_text TEXT,
+          collection_request_budget INTEGER,
+          numerator REAL,
+          denominator REAL,
+          exclusions_json TEXT,
+          sample_time TEXT,
+          gauge_reducer TEXT CHECK (gauge_reducer IS NULL OR gauge_reducer IN ('last', 'min', 'max', 'mean')),
+          counter_start REAL,
+          counter_end REAL,
+          counter_reset INTEGER NOT NULL DEFAULT 0 CHECK (counter_reset IN (0, 1)),
+          interpretation_version TEXT NOT NULL,
+          source_revision INTEGER NOT NULL DEFAULT 1,
+          source_as_of TEXT NOT NULL,
+          idempotency_key TEXT NOT NULL,
+          payload_digest TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          UNIQUE (tenant_id, idempotency_key),
+          FOREIGN KEY (tenant_id, resource_id) REFERENCES ms_resources(tenant_id, resource_id) ON DELETE CASCADE,
+          FOREIGN KEY (tenant_id, metric_id, definition_version) REFERENCES ms_definitions(tenant_id, metric_id, version),
+          FOREIGN KEY (run_id) REFERENCES ms_runs(run_id) ON DELETE CASCADE,
+          FOREIGN KEY (evidence_id) REFERENCES ms_evidence(evidence_id) ON DELETE CASCADE
+        )`),
+        db.prepare(
+          `INSERT INTO ms_observations__migrating (record_seq, ${MS_OBSERVATIONS_DATA_COLUMNS})
+           SELECT rowid, ${MS_OBSERVATIONS_DATA_COLUMNS} FROM ms_observations ORDER BY rowid ASC`
+        ),
+        db.prepare("DROP TABLE ms_observations"),
+        db.prepare("ALTER TABLE ms_observations__migrating RENAME TO ms_observations"),
+        db.prepare(
+          "CREATE INDEX IF NOT EXISTS idx_ms_obs_query ON ms_observations(tenant_id, resource_id, metric_id, window_start, window_end, source_revision DESC)"
+        ),
+        db.prepare(
+          "CREATE INDEX IF NOT EXISTS idx_ms_obs_compat ON ms_observations(tenant_id, resource_id, metric_id, comparability_key, dimensions_hash, source_revision DESC)"
+        ),
+      ]);
+      migratedObservations = true;
+    } catch (err) {
+      const recheck = await db.prepare("PRAGMA table_info(ms_observations)").all<any>();
+      if (!(recheck.results || []).some((col: any) => String(col.name) === "record_seq")) {
+        throw err;
+      }
+    }
+  }
+
+  const stagedColsRes = await db.prepare("PRAGMA table_info(ms_staged_imports)").all<any>();
+  const stagedCols = stagedColsRes.results || [];
+  if (stagedCols.length > 0 && !stagedCols.some((col: any) => String(col.name) === "generation_id")) {
+    try {
+      await db.batch([
+        db
+          .prepare("INSERT INTO ms_schema_migrations (migration_id, applied_at) VALUES (?, ?)")
+          .bind("v2_staged_generation_id", now),
+        db.prepare("ALTER TABLE ms_staged_imports ADD COLUMN generation_id TEXT NOT NULL DEFAULT 'legacy-pre-generation'"),
+      ]);
+      migratedStagedImports = true;
+    } catch (err) {
+      const recheck = await db.prepare("PRAGMA table_info(ms_staged_imports)").all<any>();
+      if (!(recheck.results || []).some((col: any) => String(col.name) === "generation_id")) {
+        throw err;
+      }
+      await db
+        .prepare("INSERT OR IGNORE INTO ms_schema_migrations (migration_id, applied_at) VALUES (?, ?)")
+        .bind("v2_staged_generation_id", now)
+        .run();
+    }
+  }
+
+  // Quarantine any pre-session staged imports so no caller can retroactively claim ownership or append to them.
+  await db
+    .prepare(
+      `INSERT OR IGNORE INTO ms_staged_import_sessions (
+         tenant_id, import_id, owner_caller_id, session_token, resource_ids_json, created_at
+       )
+       SELECT
+         s.tenant_id,
+         s.import_id,
+         '__legacy_unowned__',
+         'legacy-quarantined',
+         '["*"]',
+         MIN(s.created_at)
+       FROM ms_staged_imports s
+       WHERE NOT EXISTS (
+         SELECT 1 FROM ms_staged_import_sessions sess
+         WHERE sess.tenant_id = s.tenant_id AND sess.import_id = s.import_id
+       )
+       GROUP BY s.tenant_id, s.import_id`
+    )
+    .run();
+
+  return { migratedObservations, migratedStagedImports };
+}
+
+function errorText(err: unknown): string {
+  if (err instanceof Error) {
+    const cause = (err as any).cause;
+    return cause ? `${err.message} ${String(cause)}` : err.message;
+  }
+  return String(err ?? "");
+}
+
+function isUniqueConstraintError(err: unknown): boolean {
+  const msg = errorText(err);
+  return msg.includes("UNIQUE constraint failed") || msg.includes("PRIMARY KEY constraint failed");
+}
+
+function isNotNullConstraintError(err: unknown): boolean {
+  return errorText(err).includes("NOT NULL constraint failed");
+}
+
+function isReceiptUniqueError(err: unknown): boolean {
+  return isUniqueConstraintError(err) && errorText(err).includes("ms_staged_import_receipts");
+}
 
 function validateEvidencePointer(val: unknown): string {
   const uri = requireNonEmptyString(val, "evidence.uriPointer", 512);
@@ -712,93 +976,106 @@ export class MeasurementService {
       }
     }
 
-    const defRows = await this.db
-      .prepare("SELECT * FROM ms_definitions WHERE tenant_id = ?")
-      .bind(tenantId)
-      .all<any>();
-    for (const defRow of defRows.results || []) {
-      const defKey = JSON.stringify([tenantId, defRow.metric_id, defRow.version]);
-      defCache.set(defKey, {
-        tenantId: defRow.tenant_id,
-        metricId: defRow.metric_id,
-        version: defRow.version,
-        family: defRow.family,
-        unit: defRow.unit,
-        valueType: defRow.value_type,
-        grain: defRow.grain,
-        windowTz: defRow.window_tz,
-        dimensionsSchema: JSON.parse(defRow.dimensions_schema_json),
-        numeratorRule: defRow.numerator_rule,
-        denominatorRule: defRow.denominator_rule,
-        exclusionsRule: defRow.exclusions_rule,
-        aggregationRule: defRow.aggregation_rule,
-        comparabilityKey: defRow.comparability_key,
-        createdAt: defRow.created_at,
-      });
-    }
+    // Batch ALL bounded prefetch reads into ONE db.batch() invocation (counts as 1 D1 query even for 20,000 groups!)
+    const readStmts: any[] = [];
+    const readKinds: Array<"def" | "res" | "runId" | "runIdem" | "ev" | "obs"> = [];
+
+    readStmts.push(this.db.prepare("SELECT * FROM ms_definitions WHERE tenant_id = ?").bind(tenantId));
+    readKinds.push("def");
 
     const rids = [...resourceIds];
     for (let i = 0; i < rids.length; i += MAX_IN_CLAUSE_ITEMS) {
       const chunk = rids.slice(i, i + MAX_IN_CLAUSE_ITEMS);
       const placeholders = chunk.map(() => "?").join(", ");
-      const res = await this.db
-        .prepare(`SELECT resource_id, entity_urn, source_resource_id FROM ms_resources WHERE tenant_id = ? AND resource_id IN (${placeholders})`)
-        .bind(tenantId, ...chunk)
-        .all<any>();
-      for (const row of res.results || []) {
-        resourceMap.set(row.resource_id, row);
-      }
+      readStmts.push(
+        this.db
+          .prepare(`SELECT resource_id, entity_urn, source_resource_id FROM ms_resources WHERE tenant_id = ? AND resource_id IN (${placeholders})`)
+          .bind(tenantId, ...chunk)
+      );
+      readKinds.push("res");
     }
 
     const rIds = [...runIds];
     for (let i = 0; i < rIds.length; i += MAX_IN_CLAUSE_ITEMS) {
       const chunk = rIds.slice(i, i + MAX_IN_CLAUSE_ITEMS);
       const placeholders = chunk.map(() => "?").join(", ");
-      const res = await this.db
-        .prepare(`SELECT * FROM ms_runs WHERE run_id IN (${placeholders})`)
-        .bind(...chunk)
-        .all<any>();
-      for (const row of res.results || []) {
-        existingRunByIdMap.set(row.run_id, row);
-      }
+      readStmts.push(
+        this.db.prepare(`SELECT * FROM ms_runs WHERE run_id IN (${placeholders})`).bind(...chunk)
+      );
+      readKinds.push("runId");
     }
 
     const rIdems = [...runIdemKeys];
     for (let i = 0; i < rIdems.length; i += MAX_IN_CLAUSE_ITEMS) {
       const chunk = rIdems.slice(i, i + MAX_IN_CLAUSE_ITEMS);
       const placeholders = chunk.map(() => "?").join(", ");
-      const res = await this.db
-        .prepare(`SELECT run_id, idempotency_key, request_digest FROM ms_runs WHERE tenant_id = ? AND idempotency_key IN (${placeholders})`)
-        .bind(tenantId, ...chunk)
-        .all<any>();
-      for (const row of res.results || []) {
-        existingRunByIdemMap.set(row.idempotency_key, row);
-      }
+      readStmts.push(
+        this.db
+          .prepare(`SELECT run_id, idempotency_key, request_digest FROM ms_runs WHERE tenant_id = ? AND idempotency_key IN (${placeholders})`)
+          .bind(tenantId, ...chunk)
+      );
+      readKinds.push("runIdem");
     }
 
     const evIds = [...evidenceIds];
     for (let i = 0; i < evIds.length; i += MAX_IN_CLAUSE_ITEMS) {
       const chunk = evIds.slice(i, i + MAX_IN_CLAUSE_ITEMS);
       const placeholders = chunk.map(() => "?").join(", ");
-      const res = await this.db
-        .prepare(`SELECT * FROM ms_evidence WHERE evidence_id IN (${placeholders})`)
-        .bind(...chunk)
-        .all<any>();
-      for (const row of res.results || []) {
-        existingEvMap.set(row.evidence_id, row);
-      }
+      readStmts.push(
+        this.db.prepare(`SELECT * FROM ms_evidence WHERE evidence_id IN (${placeholders})`).bind(...chunk)
+      );
+      readKinds.push("ev");
     }
 
     const oKeys = [...obsIdemKeys];
     for (let i = 0; i < oKeys.length; i += MAX_IN_CLAUSE_ITEMS) {
       const chunk = oKeys.slice(i, i + MAX_IN_CLAUSE_ITEMS);
       const placeholders = chunk.map(() => "?").join(", ");
-      const res = await this.db
-        .prepare(`SELECT obs_id, idempotency_key, payload_digest FROM ms_observations WHERE tenant_id = ? AND idempotency_key IN (${placeholders})`)
-        .bind(tenantId, ...chunk)
-        .all<any>();
-      for (const row of res.results || []) {
-        existingObsMap.set(row.idempotency_key, { obs_id: row.obs_id, payload_digest: row.payload_digest });
+      readStmts.push(
+        this.db
+          .prepare(`SELECT obs_id, idempotency_key, payload_digest FROM ms_observations WHERE tenant_id = ? AND idempotency_key IN (${placeholders})`)
+          .bind(tenantId, ...chunk)
+      );
+      readKinds.push("obs");
+    }
+
+    const batchResults = await this.db.batch<any>(readStmts);
+    for (let idx = 0; idx < batchResults.length; idx++) {
+      const kind = readKinds[idx];
+      const rows = batchResults[idx]?.results || [];
+      if (kind === "def") {
+        for (const defRow of rows) {
+          const defKey = JSON.stringify([tenantId, defRow.metric_id, defRow.version]);
+          defCache.set(defKey, {
+            tenantId: defRow.tenant_id,
+            metricId: defRow.metric_id,
+            version: defRow.version,
+            family: defRow.family,
+            unit: defRow.unit,
+            valueType: defRow.value_type,
+            grain: defRow.grain,
+            windowTz: defRow.window_tz,
+            dimensionsSchema: JSON.parse(defRow.dimensions_schema_json),
+            numeratorRule: defRow.numerator_rule,
+            denominatorRule: defRow.denominator_rule,
+            exclusionsRule: defRow.exclusions_rule,
+            aggregationRule: defRow.aggregation_rule,
+            comparabilityKey: defRow.comparability_key,
+            createdAt: defRow.created_at,
+          });
+        }
+      } else if (kind === "res") {
+        for (const row of rows) resourceMap.set(row.resource_id, row);
+      } else if (kind === "runId") {
+        for (const row of rows) existingRunByIdMap.set(row.run_id, row);
+      } else if (kind === "runIdem") {
+        for (const row of rows) existingRunByIdemMap.set(row.idempotency_key, row);
+      } else if (kind === "ev") {
+        for (const row of rows) existingEvMap.set(row.evidence_id, row);
+      } else if (kind === "obs") {
+        for (const row of rows) {
+          existingObsMap.set(row.idempotency_key, { obs_id: row.obs_id, payload_digest: row.payload_digest });
+        }
       }
     }
 
@@ -818,6 +1095,133 @@ export class MeasurementService {
     };
   }
 
+  private async fetchExistingBatches(tenantId: string, batchDigests: string[]): Promise<Map<string, any>> {
+    const out = new Map<string, any>();
+    const unique = [...new Set(batchDigests)];
+    if (unique.length === 0) return out;
+    const stmts: any[] = [];
+    for (let i = 0; i < unique.length; i += MAX_IN_CLAUSE_ITEMS) {
+      const chunk = unique.slice(i, i + MAX_IN_CLAUSE_ITEMS);
+      const placeholders = chunk.map(() => "?").join(", ");
+      stmts.push(
+        this.db
+          .prepare(`SELECT * FROM ms_ingest_batches WHERE tenant_id = ? AND batch_digest IN (${placeholders})`)
+          .bind(tenantId, ...chunk)
+      );
+    }
+    const results = await this.db.batch<any>(stmts);
+    for (const res of results) {
+      for (const row of res?.results || []) {
+        out.set(row.batch_digest, row);
+      }
+    }
+    return out;
+  }
+
+  private async commitGroupsAtomically(
+    tenantId: string,
+    groups: Array<Record<string, any>>,
+    opts: {
+      maxObservationsPerGroup: number;
+      allowInlineRunCreate: boolean;
+      buildPreStatements?: (summary: {
+        inserted: number;
+        replayedNoop: number;
+        groups: Array<{
+          runId: string;
+          evidenceId: string;
+          inserted: number;
+          replayedNoop: number;
+          coverageStatus: string | null;
+        }>;
+      }) => any[];
+      buildPostStatements?: (summary: {
+        inserted: number;
+        replayedNoop: number;
+        groups: Array<{
+          runId: string;
+          evidenceId: string;
+          inserted: number;
+          replayedNoop: number;
+          coverageStatus: string | null;
+        }>;
+      }) => any[];
+    },
+    now: number
+  ): Promise<{
+    inserted: number;
+    replayedNoop: number;
+    groups: Array<{
+      runId: string;
+      evidenceId: string;
+      inserted: number;
+      replayedNoop: number;
+      coverageStatus: string | null;
+    }>;
+  }> {
+    for (let attempt = 0; attempt < MAX_DOMAIN_CONTENTION_ATTEMPTS; attempt++) {
+      const shared = await this.prefetchIngestState(tenantId, groups);
+      const preparedList: any[] = [];
+      for (const grp of groups) {
+        const prepared = await this.prepareIngestGroup(
+          { ...grp, tenantId } as any,
+          { maxObservations: opts.maxObservationsPerGroup, allowInlineRunCreate: opts.allowInlineRunCreate },
+          shared
+        );
+        preparedList.push(prepared);
+      }
+
+      const existingBatchMap = await this.fetchExistingBatches(
+        tenantId,
+        preparedList.map((p) => p.batchDigest)
+      );
+
+      const groupResults: Array<{
+        runId: string;
+        evidenceId: string;
+        inserted: number;
+        replayedNoop: number;
+        coverageStatus: string | null;
+      }> = [];
+      let totalInserted = 0;
+      let totalReplayedNoop = 0;
+
+      for (const prepared of preparedList) {
+        const res = this.emitPreparedGroupStatements(prepared, existingBatchMap.get(prepared.batchDigest), shared, now);
+        groupResults.push(res);
+        totalInserted += res.inserted;
+        totalReplayedNoop += res.replayedNoop;
+      }
+
+      const summary = {
+        inserted: totalInserted,
+        replayedNoop: totalReplayedNoop,
+        groups: groupResults,
+      };
+      const preStatements = opts.buildPreStatements ? opts.buildPreStatements(summary) : [];
+      const postStatements = opts.buildPostStatements ? opts.buildPostStatements(summary) : [];
+      const allStatements = [...preStatements, ...shared.statements, ...postStatements];
+
+      if (allStatements.length > 0) {
+        try {
+          await this.db.batch(allStatements);
+        } catch (err) {
+          if (isUniqueConstraintError(err) && !isReceiptUniqueError(err)) {
+            if (attempt + 1 < MAX_DOMAIN_CONTENTION_ATTEMPTS) {
+              continue;
+            }
+            throw new ConflictError("Concurrent ingest contention; retry request");
+          }
+          throw err;
+        }
+      }
+
+      return summary;
+    }
+
+    throw new ConflictError("Concurrent ingest contention; retry request");
+  }
+
   public async ingestBatch(raw: IngestBatchInput, now = Date.now()): Promise<{
     runId: string;
     evidenceId: string;
@@ -835,17 +1239,13 @@ export class MeasurementService {
     if (raw.observations.length > MAX_BATCH_OBSERVATIONS) {
       throw new ValidationError(`Batch exceeds maximum size (${MAX_BATCH_OBSERVATIONS} observations)`);
     }
-    const shared = await this.prefetchIngestState(tenantId, [raw as any]);
-    const res = await this.prepareIngestGroup(
-      raw as any,
-      { maxObservations: MAX_BATCH_OBSERVATIONS, allowInlineRunCreate: false },
-      shared,
+    const out = await this.commitGroupsAtomically(
+      tenantId,
+      [raw as any],
+      { maxObservationsPerGroup: MAX_BATCH_OBSERVATIONS, allowInlineRunCreate: false },
       now
     );
-    if (shared.statements.length > 0) {
-      await this.db.batch(shared.statements);
-    }
-    return res;
+    return out.groups[0];
   }
 
   public async ingestAtomicBatch(raw: IngestAtomicBatchInput, now = Date.now()): Promise<{
@@ -883,39 +1283,845 @@ export class MeasurementService {
       throw new ValidationError(`Atomic batch exceeds maximum size (${MAX_ATOMIC_OBSERVATIONS} observations)`);
     }
 
-    const shared = await this.prefetchIngestState(tenantId, raw.groups as any);
+    return this.commitGroupsAtomically(
+      tenantId,
+      raw.groups as any,
+      { maxObservationsPerGroup: MAX_ATOMIC_OBSERVATIONS, allowInlineRunCreate: true },
+      now
+    );
+  }
 
-    const groupResults: Array<{
+  public async stageImportChunk(
+    raw: StageImportChunkInput,
+    now = Date.now(),
+    auth?: { callerId?: string; authorizeResourceWrite?: (resourceId: string) => void }
+  ): Promise<{ importId: string; chunkIndex: number; observations: number; existing: boolean }> {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      throw new ValidationError("Stage import payload must be a JSON object");
+    }
+    assertAllowedKeys(raw as any, new Set(["tenantId", "importId", "chunkIndex", "groups"]), "stageImport");
+    const tenantId = requireNonEmptyString(raw.tenantId, "tenantId", 128);
+    const importId = requireNonEmptyString(raw.importId, "importId", 128);
+    if (!Number.isInteger(raw.chunkIndex) || raw.chunkIndex < 0 || raw.chunkIndex >= MAX_STAGED_IMPORT_CHUNKS) {
+      throw new ValidationError(`chunkIndex must be an integer in [0, ${MAX_STAGED_IMPORT_CHUNKS - 1}]`);
+    }
+    if (!Array.isArray(raw.groups) || raw.groups.length === 0 || raw.groups.length > MAX_ATOMIC_GROUPS) {
+      throw new ValidationError(`Field 'groups' must contain 1 to ${MAX_ATOMIC_GROUPS} groups`);
+    }
+    let chunkObs = 0;
+    const resourceIds = new Set<string>();
+    for (let i = 0; i < raw.groups.length; i++) {
+      const g = raw.groups[i];
+      if (!g || typeof g !== "object" || Array.isArray(g)) {
+        throw new ValidationError(`groups[${i}] must be a JSON object`);
+      }
+      const rid = requireNonEmptyString(g.resourceId, `groups[${i}].resourceId`, 128);
+      resourceIds.add(rid);
+      if (!Array.isArray(g.observations)) {
+        throw new ValidationError(`groups[${i}].observations must be an array`);
+      }
+      chunkObs += g.observations.length;
+    }
+    if (chunkObs > MAX_ATOMIC_OBSERVATIONS) {
+      throw new ValidationError(`Staged chunk exceeds maximum size (${MAX_ATOMIC_OBSERVATIONS} observations)`);
+    }
+
+    const groupsJson = canonicalJson(raw.groups);
+    const resourceIdsJson = canonicalJson([...resourceIds].sort());
+    const serializedBytes = new TextEncoder().encode(groupsJson).byteLength + new TextEncoder().encode(resourceIdsJson).byteLength;
+    if (serializedBytes > MAX_STAGED_CHUNK_BYTES) {
+      throw new ValidationError(
+        `Staged chunk serialized size (${serializedBytes} bytes) exceeds ${MAX_STAGED_CHUNK_BYTES}-byte limit; split into smaller chunks`
+      );
+    }
+
+    const ownerCallerId = auth?.callerId?.trim() || "__service__";
+    const collectResourceIds = (rawJson: unknown, target: Set<string>) => {
+      try {
+        const parsed = JSON.parse(String(rawJson || "[]"));
+        if (Array.isArray(parsed)) {
+          for (const rid of parsed) {
+            const s = String(rid).trim();
+            if (s) target.add(s);
+          }
+        }
+      } catch {
+        // Non-array digest token or malformed JSON handled separately
+      }
+    };
+
+    const MAX_STAGE_CAS_ATTEMPTS = 4;
+    for (let attempt = 0; attempt < MAX_STAGE_CAS_ATTEMPTS; attempt++) {
+      // 1. Authoritative snapshot read: bounded to at most 1 chunk's groups_json (<= 1.5 MB)
+      const [receiptRes, sessionRes, chunksRes] = await this.db.batch<any>([
+        this.db
+          .prepare("SELECT resource_ids_json, result_json FROM ms_staged_import_receipts WHERE tenant_id = ? AND import_id = ?")
+          .bind(tenantId, importId),
+        this.db
+          .prepare(
+            "SELECT owner_caller_id, session_token, resource_ids_json FROM ms_staged_import_sessions WHERE tenant_id = ? AND import_id = ?"
+          )
+          .bind(tenantId, importId),
+        this.db
+          .prepare(
+            `SELECT chunk_index, resource_ids_json,
+                    CASE WHEN chunk_index = ? THEN groups_json ELSE NULL END AS groups_json
+             FROM ms_staged_imports
+             WHERE tenant_id = ? AND import_id = ?`
+          )
+          .bind(raw.chunkIndex, tenantId, importId),
+      ]);
+      const receipt = (receiptRes?.results || [])[0] ?? null;
+      const session = (sessionRes?.results || [])[0] ?? null;
+      const existingChunks = chunksRes?.results || [];
+
+      // 2. Authorize EVERY existing resource in receipt (+ sharded receipt parts), session, AND chunks BEFORE appending or exposing state!
+      const existingResourceIds = new Set<string>();
+      if (receipt) {
+        collectResourceIds(receipt.resource_ids_json, existingResourceIds);
+        const receiptParts = await this.readStagedImportReceiptChunks(tenantId, importId, receipt.result_json);
+        for (const part of receiptParts) {
+          collectResourceIds(part.resource_ids_json, existingResourceIds);
+        }
+      }
+      if (session) collectResourceIds(session.resource_ids_json, existingResourceIds);
+      for (const row of existingChunks) {
+        collectResourceIds(row.resource_ids_json, existingResourceIds);
+      }
+      if (existingResourceIds.size > 0) {
+        for (const rid of existingResourceIds) {
+          auth?.authorizeResourceWrite?.(rid);
+        }
+      } else if (receipt || session || existingChunks.length > 0) {
+        auth?.authorizeResourceWrite?.("*");
+      }
+
+      // 3. Enforce terminal receipt, quarantine, ownership, and existing chunk replay/conflict rules
+      if (receipt) {
+        throw new ConflictError(`Staged import '${importId}' has already been committed`);
+      }
+      if (!session && existingChunks.length > 0) {
+        throw new ForbiddenError("forbidden");
+      }
+      if (session && String(session.owner_caller_id) !== ownerCallerId) {
+        throw new ForbiddenError("forbidden");
+      }
+
+      const existing = existingChunks.find((row: any) => Number(row.chunk_index) === raw.chunkIndex);
+      if (existing) {
+        if (existing.groups_json !== groupsJson) {
+          throw new ConflictError(`Staged import '${importId}' chunk ${raw.chunkIndex} already exists with different payload`);
+        }
+        return { importId, chunkIndex: raw.chunkIndex, observations: chunkObs, existing: true };
+      }
+
+      // 4. Transactional write fenced against concurrent session, resource-set digest, orphan-chunk, or receipt changes!
+      const nextSessionToken = crypto.randomUUID();
+      const generationId = crypto.randomUUID();
+      let insertChanges = 0;
+
+      if (!session) {
+        const seedDigest = await sha256Hex(resourceIdsJson);
+        const [, insertRes] = await this.db.batch<any>([
+          this.db
+            .prepare(
+              `INSERT OR IGNORE INTO ms_staged_import_sessions (
+                 tenant_id, import_id, owner_caller_id, session_token, resource_ids_json, created_at
+               )
+               SELECT ?, ?, ?, ?, ?, ?
+               WHERE NOT EXISTS (SELECT 1 FROM ms_staged_import_receipts WHERE tenant_id = ? AND import_id = ?)
+                 AND NOT EXISTS (SELECT 1 FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ?)`
+            )
+            .bind(
+              tenantId,
+              importId,
+              ownerCallerId,
+              nextSessionToken,
+              seedDigest,
+              now,
+              tenantId,
+              importId,
+              tenantId,
+              importId
+            ),
+          this.db
+            .prepare(
+              `INSERT OR IGNORE INTO ms_staged_imports (
+                 tenant_id, import_id, chunk_index, generation_id, resource_ids_json, groups_json, created_at
+               )
+               SELECT ?, ?, ?, ?, ?, ?, ?
+               WHERE EXISTS (
+                 SELECT 1 FROM ms_staged_import_sessions
+                 WHERE tenant_id = ? AND import_id = ? AND owner_caller_id = ? AND session_token = ?
+               )
+               AND NOT EXISTS (SELECT 1 FROM ms_staged_import_receipts WHERE tenant_id = ? AND import_id = ?)`
+            )
+            .bind(
+              tenantId,
+              importId,
+              raw.chunkIndex,
+              generationId,
+              resourceIdsJson,
+              groupsJson,
+              now,
+              tenantId,
+              importId,
+              ownerCallerId,
+              nextSessionToken,
+              tenantId,
+              importId
+            ),
+        ]);
+        insertChanges = Number(insertRes?.meta?.changes ?? 0);
+      } else {
+        const mergedDigest = await sha256Hex(canonicalJson([...new Set([...existingResourceIds, ...resourceIds])].sort()));
+        const [, insertRes] = await this.db.batch<any>([
+          this.db
+            .prepare(
+              `UPDATE ms_staged_import_sessions
+               SET session_token = ?, resource_ids_json = ?
+               WHERE tenant_id = ? AND import_id = ?
+                 AND owner_caller_id = ?
+                 AND session_token = ?
+                 AND resource_ids_json = ?
+                 AND NOT EXISTS (SELECT 1 FROM ms_staged_import_receipts WHERE tenant_id = ? AND import_id = ?)`
+            )
+            .bind(
+              nextSessionToken,
+              mergedDigest,
+              tenantId,
+              importId,
+              ownerCallerId,
+              String(session.session_token),
+              String(session.resource_ids_json),
+              tenantId,
+              importId
+            ),
+          this.db
+            .prepare(
+              `INSERT OR IGNORE INTO ms_staged_imports (
+                 tenant_id, import_id, chunk_index, generation_id, resource_ids_json, groups_json, created_at
+               )
+               SELECT ?, ?, ?, ?, ?, ?, ?
+               WHERE EXISTS (
+                 SELECT 1 FROM ms_staged_import_sessions
+                 WHERE tenant_id = ? AND import_id = ? AND owner_caller_id = ? AND session_token = ?
+               )
+               AND NOT EXISTS (SELECT 1 FROM ms_staged_import_receipts WHERE tenant_id = ? AND import_id = ?)`
+            )
+            .bind(
+              tenantId,
+              importId,
+              raw.chunkIndex,
+              generationId,
+              resourceIdsJson,
+              groupsJson,
+              now,
+              tenantId,
+              importId,
+              ownerCallerId,
+              nextSessionToken,
+              tenantId,
+              importId
+            ),
+        ]);
+        insertChanges = Number(insertRes?.meta?.changes ?? 0);
+      }
+
+      if (insertChanges > 0) {
+        return { importId, chunkIndex: raw.chunkIndex, observations: chunkObs, existing: false };
+      }
+
+      // 5. Write lost a concurrent race! Inspect whether authorization state disappeared (e.g., concurrent abort):
+      //    fail closed with uniform 403 for any caller lacking tenant-wide authority so sibling callers never get 409!
+      const [postReceiptRes, postSessionRes, postChunksRes] = await this.db.batch<any>([
+        this.db
+          .prepare("SELECT import_id FROM ms_staged_import_receipts WHERE tenant_id = ? AND import_id = ?")
+          .bind(tenantId, importId),
+        this.db
+          .prepare("SELECT owner_caller_id FROM ms_staged_import_sessions WHERE tenant_id = ? AND import_id = ?")
+          .bind(tenantId, importId),
+        this.db
+          .prepare("SELECT chunk_index FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ?")
+          .bind(tenantId, importId),
+      ]);
+      const hasPostState =
+        (postReceiptRes?.results || []).length > 0 ||
+        (postSessionRes?.results || []).length > 0 ||
+        (postChunksRes?.results || []).length > 0;
+      if (!hasPostState) {
+        auth?.authorizeResourceWrite?.("*");
+        throw new ConflictError(`Staged import '${importId}' chunk ${raw.chunkIndex} changed concurrently`);
+      }
+    }
+
+    auth?.authorizeResourceWrite?.("*");
+    throw new ConflictError(`Staged import '${importId}' chunk ${raw.chunkIndex} changed concurrently`);
+  }
+
+  private partitionReceiptParts(
+    resourceIds: string[],
+    groups: Array<{ runId: string; evidenceId: string; totalObservations: number; coverageStatus: string | null }>
+  ): Array<{ resourceIdsJson: string; groupsJson: string }> {
+    const encoder = new TextEncoder();
+    // Reserve 1,024 bytes for paired empty-array JSON ("[]") plus primary-key/row metadata overhead
+    // so every persisted receipt detail row (keys + both JSON fields) stays strictly <= MAX_RECEIPT_PART_BYTES.
+    const maxPayloadBytes = MAX_RECEIPT_PART_BYTES - 1024;
+    const parts: Array<{ resourceIdsJson: string; groupsJson: string }> = [];
+
+    // Partition resourceIds into <= maxPayloadBytes - 2 slices (leaving room for paired "[]")
+    const maxSingleFieldBytes = maxPayloadBytes - 2;
+    const ridSlices: string[][] = [];
+    let curRids: string[] = [];
+    let curRidBytes = 2; // "[]"
+    for (const rid of resourceIds) {
+      const itemBytes = encoder.encode(JSON.stringify(rid)).byteLength + (curRids.length > 0 ? 1 : 0);
+      if (curRids.length > 0 && curRidBytes + itemBytes > maxSingleFieldBytes) {
+        ridSlices.push(curRids);
+        curRids = [rid];
+        curRidBytes = 2 + encoder.encode(JSON.stringify(rid)).byteLength;
+      } else {
+        curRids.push(rid);
+        curRidBytes += itemBytes;
+      }
+    }
+    if (curRids.length > 0) ridSlices.push(curRids);
+
+    // Partition groups into <= maxSingleFieldBytes slices (leaving room for paired "[]")
+    const groupSlices: Array<Array<{ runId: string; evidenceId: string; totalObservations: number; coverageStatus: string | null }>> = [];
+    let curGroups: Array<{ runId: string; evidenceId: string; totalObservations: number; coverageStatus: string | null }> = [];
+    let curGroupBytes = 2; // "[]"
+    for (const grp of groups) {
+      const itemBytes = encoder.encode(canonicalJson(grp)).byteLength + (curGroups.length > 0 ? 1 : 0);
+      if (curGroups.length > 0 && curGroupBytes + itemBytes > maxSingleFieldBytes) {
+        groupSlices.push(curGroups);
+        curGroups = [grp];
+        curGroupBytes = 2 + encoder.encode(canonicalJson(grp)).byteLength;
+      } else {
+        curGroups.push(grp);
+        curGroupBytes += itemBytes;
+      }
+    }
+    if (curGroups.length > 0) groupSlices.push(curGroups);
+
+    // Pack resourceId slices and group slices while ensuring combined JSON payload <= maxPayloadBytes
+    const total = Math.max(ridSlices.length, groupSlices.length, 1);
+    for (let i = 0; i < total; i++) {
+      const rJson = canonicalJson(ridSlices[i] || []);
+      const gJson = canonicalJson(groupSlices[i] || []);
+      if (encoder.encode(rJson).byteLength + encoder.encode(gJson).byteLength <= maxPayloadBytes) {
+        parts.push({ resourceIdsJson: rJson, groupsJson: gJson });
+      } else {
+        if ((ridSlices[i] || []).length > 0) {
+          parts.push({ resourceIdsJson: rJson, groupsJson: "[]" });
+        }
+        if ((groupSlices[i] || []).length > 0) {
+          parts.push({ resourceIdsJson: "[]", groupsJson: gJson });
+        }
+      }
+    }
+    return parts;
+  }
+
+  private async readStagedImportReceiptChunks(
+    tenantId: string,
+    importId: string,
+    resultJsonRaw: unknown
+  ): Promise<Array<{ part_index: number; resource_ids_json: string; groups_json: string }>> {
+    let detailChunks = 0;
+    try {
+      const parsed = JSON.parse(String(resultJsonRaw || "{}"));
+      detailChunks = Number(parsed?.detailChunks ?? 0);
+    } catch {
+      detailChunks = 0;
+    }
+    if (!Number.isInteger(detailChunks) || detailChunks <= 0) {
+      return [];
+    }
+    const allParts: Array<{ part_index: number; resource_ids_json: string; groups_json: string }> = [];
+    for (let start = 0; start < detailChunks; start += MAX_RECEIPT_READ_PAGE_PARTS) {
+      const end = start + MAX_RECEIPT_READ_PAGE_PARTS;
+      const pageRes = await this.db
+        .prepare(
+          `SELECT part_index, resource_ids_json, groups_json
+           FROM ms_staged_import_receipt_chunks
+           WHERE tenant_id = ? AND import_id = ? AND part_index >= ? AND part_index < ?
+           ORDER BY part_index ASC`
+        )
+        .bind(tenantId, importId, start, end)
+        .all<any>();
+      for (const row of pageRes.results || []) {
+        allParts.push({
+          part_index: Number(row.part_index),
+          resource_ids_json: String(row.resource_ids_json || "[]"),
+          groups_json: String(row.groups_json || "[]"),
+        });
+      }
+    }
+    return allParts;
+  }
+
+  private async resolveStagedImportReceiptReplay(
+    tenantId: string,
+    importId: string,
+    receipt: any,
+    expectedChunks: number,
+    payloadDigest: string | null,
+    auth?: { authorizeResourceWrite?: (resourceId: string) => void }
+  ): Promise<{
+    importId: string;
+    inserted: number;
+    replayedNoop: number;
+    groups: Array<{
+      runId: string;
+      evidenceId: string;
+      inserted: number;
+      replayedNoop: number;
+      coverageStatus: string | null;
+    }>;
+  }> {
+    const parts = await this.readStagedImportReceiptChunks(tenantId, importId, receipt.result_json);
+    const receiptResourceIds = new Set<string>();
+    const collectRids = (rawJson: unknown) => {
+      try {
+        const parsed = JSON.parse(String(rawJson || "[]"));
+        if (Array.isArray(parsed)) {
+          for (const rid of parsed) {
+            const s = String(rid).trim();
+            if (s) receiptResourceIds.add(s);
+          }
+        }
+      } catch {
+        // fail closed if empty
+      }
+    };
+    collectRids(receipt.resource_ids_json);
+    for (const part of parts) {
+      collectRids(part.resource_ids_json);
+    }
+
+    if (receiptResourceIds.size === 0) {
+      auth?.authorizeResourceWrite?.("*");
+    } else {
+      for (const rid of receiptResourceIds) {
+        auth?.authorizeResourceWrite?.(rid);
+      }
+    }
+    if (Number(receipt.expected_chunks) !== expectedChunks) {
+      throw new ConflictError(`Staged import '${importId}' was already committed with different chunk count`);
+    }
+    if (payloadDigest !== null && String(receipt.payload_digest) !== payloadDigest) {
+      throw new ConflictError(`Staged import '${importId}' was already committed with different payload`);
+    }
+
+    const stored = JSON.parse(receipt.result_json || "{}");
+    const groups: Array<{
       runId: string;
       evidenceId: string;
       inserted: number;
       replayedNoop: number;
       coverageStatus: string | null;
     }> = [];
-    let totalInserted = 0;
-    let totalReplayedNoop = 0;
+    if (parts.length > 0) {
+      for (const part of parts) {
+        const parsedGroups = JSON.parse(part.groups_json || "[]");
+        if (Array.isArray(parsedGroups)) {
+          for (const g of parsedGroups) {
+            groups.push({
+              runId: String(g.runId),
+              evidenceId: String(g.evidenceId),
+              inserted: 0,
+              replayedNoop: Number(g.totalObservations ?? 0),
+              coverageStatus: g.coverageStatus ?? null,
+            });
+          }
+        }
+      }
+    } else if (Array.isArray(stored.groups)) {
+      for (const g of stored.groups) {
+        groups.push({
+          runId: String(g.runId),
+          evidenceId: String(g.evidenceId),
+          inserted: 0,
+          replayedNoop: Number(g.totalObservations ?? 0),
+          coverageStatus: g.coverageStatus ?? null,
+        });
+      }
+    }
+    return {
+      importId,
+      inserted: 0,
+      replayedNoop: Number(stored.totalObservations ?? 0),
+      groups,
+    };
+  }
 
-    for (const grp of raw.groups) {
-      const res = await this.prepareIngestGroup(
-        { ...grp, tenantId } as any,
-        { maxObservations: MAX_ATOMIC_OBSERVATIONS, allowInlineRunCreate: true },
-        shared,
+  public async commitStagedImport(
+    raw: CommitStagedImportInput,
+    now = Date.now(),
+    auth?: { authorizeResourceWrite?: (resourceId: string) => void }
+  ): Promise<{
+    importId: string;
+    inserted: number;
+    replayedNoop: number;
+    groups: Array<{
+      runId: string;
+      evidenceId: string;
+      inserted: number;
+      replayedNoop: number;
+      coverageStatus: string | null;
+    }>;
+  }> {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      throw new ValidationError("Commit staged import payload must be a JSON object");
+    }
+    assertAllowedKeys(raw as any, new Set(["tenantId", "importId", "expectedChunks"]), "commitStagedImport");
+    const tenantId = requireNonEmptyString(raw.tenantId, "tenantId", 128);
+    const importId = requireNonEmptyString(raw.importId, "importId", 128);
+    if (!Number.isInteger(raw.expectedChunks) || raw.expectedChunks < 1 || raw.expectedChunks > MAX_STAGED_IMPORT_CHUNKS) {
+      throw new ValidationError(`expectedChunks must be an integer in [1, ${MAX_STAGED_IMPORT_CHUNKS}]`);
+    }
+
+    // Bounded initial read (at most MAX_COMMIT_PAYLOAD_PAGE_CHUNKS = 16 chunks of groups_json -> <= 24 MB, well below D1's 50 MB query limit)
+    const [chunksRes, receiptRes] = await this.db.batch<any>([
+      this.db
+        .prepare(
+          `SELECT chunk_index, generation_id, resource_ids_json,
+                  CASE WHEN chunk_index < ? THEN groups_json ELSE NULL END AS groups_json
+           FROM ms_staged_imports
+           WHERE tenant_id = ? AND import_id = ?
+           ORDER BY chunk_index ASC`
+        )
+        .bind(MAX_COMMIT_PAYLOAD_PAGE_CHUNKS, tenantId, importId),
+      this.db
+        .prepare(
+          "SELECT payload_digest, expected_chunks, resource_ids_json, result_json FROM ms_staged_import_receipts WHERE tenant_id = ? AND import_id = ?"
+        )
+        .bind(tenantId, importId),
+    ]);
+    const rows = (chunksRes?.results || []).map((row: any) => ({ ...row }));
+    const existingReceipt = (receiptRes?.results || [])[0] ?? null;
+
+    if (existingReceipt) {
+      return this.resolveStagedImportReceiptReplay(tenantId, importId, existingReceipt, raw.expectedChunks, null, auth);
+    }
+
+    if (rows.length === 0) {
+      auth?.authorizeResourceWrite?.("*");
+      throw new NotFoundError(`Staged import '${importId}' not found`);
+    }
+
+    // Authorize all resource IDs from metadata snapshot BEFORE fetching additional payload pages or validating counts!
+    const seenResourceIds = new Set<string>();
+    for (const row of rows) {
+      try {
+        const rids = JSON.parse(row.resource_ids_json || "[]");
+        if (Array.isArray(rids)) {
+          for (const rid of rids) {
+            const s = String(rid).trim();
+            if (s) seenResourceIds.add(s);
+          }
+        }
+      } catch {
+        // validated below
+      }
+    }
+    if (seenResourceIds.size === 0) {
+      auth?.authorizeResourceWrite?.("*");
+    } else {
+      for (const rid of seenResourceIds) {
+        auth?.authorizeResourceWrite?.(rid);
+      }
+    }
+
+    if (rows.length !== raw.expectedChunks) {
+      throw new ValidationError(`Staged import '${importId}' has ${rows.length} chunks, expected ${raw.expectedChunks}`);
+    }
+    for (let idx = 0; idx < rows.length; idx++) {
+      if (Number(rows[idx].chunk_index) !== idx) {
+        throw new ValidationError(`Staged import '${importId}' is missing chunk index ${idx}`);
+      }
+    }
+
+    // Snapshot generation digest binds paged reads and concurrent receipt reconciliation to the exact staged generations!
+    const snapshotGenerationDigest = await sha256Hex(
+      canonicalJson(rows.map((row) => [Number(row.chunk_index), String(row.generation_id)]))
+    );
+
+    // Fetch any remaining chunks (>= MAX_COMMIT_PAYLOAD_PAGE_CHUNKS) in bounded pages of 16 (<= 24 MB/query)
+    // pinned to the exact generation_id snapshot from the initial read; reconcile against receipt if a concurrent commit won!
+    for (let start = MAX_COMMIT_PAYLOAD_PAGE_CHUNKS; start < rows.length; start += MAX_COMMIT_PAYLOAD_PAGE_CHUNKS) {
+      const end = Math.min(start + MAX_COMMIT_PAYLOAD_PAGE_CHUNKS, rows.length);
+      const pageRes = await this.db
+        .prepare(
+          `SELECT chunk_index, generation_id, groups_json
+           FROM ms_staged_imports
+           WHERE tenant_id = ? AND import_id = ? AND chunk_index >= ? AND chunk_index < ?
+           ORDER BY chunk_index ASC`
+        )
+        .bind(tenantId, importId, start, end)
+        .all<any>();
+      const pageByIndex = new Map<number, any>();
+      for (const p of pageRes.results || []) {
+        pageByIndex.set(Number(p.chunk_index), p);
+      }
+      for (let idx = start; idx < end; idx++) {
+        const fetched = pageByIndex.get(idx);
+        if (!fetched || String(fetched.generation_id) !== String(rows[idx].generation_id)) {
+          const concurrentReceipt = await this.db
+            .prepare(
+              "SELECT payload_digest, expected_chunks, resource_ids_json, result_json FROM ms_staged_import_receipts WHERE tenant_id = ? AND import_id = ?"
+            )
+            .bind(tenantId, importId)
+            .first<any>();
+          if (concurrentReceipt) {
+            let committedGenDigest = "";
+            try {
+              committedGenDigest = String(JSON.parse(String(concurrentReceipt.result_json || "{}")).generationDigest || "");
+            } catch {
+              committedGenDigest = "";
+            }
+            if (committedGenDigest === snapshotGenerationDigest) {
+              return this.resolveStagedImportReceiptReplay(
+                tenantId,
+                importId,
+                concurrentReceipt,
+                raw.expectedChunks,
+                null,
+                auth
+              );
+            }
+            // Different generation committed concurrently: authorize receipt resources first, then reject with 409!
+            await this.resolveStagedImportReceiptReplay(
+              tenantId,
+              importId,
+              concurrentReceipt,
+              raw.expectedChunks,
+              `mismatch:${snapshotGenerationDigest}`,
+              auth
+            );
+          }
+          throw new ConflictError(`Staged import '${importId}' was aborted or modified concurrently`);
+        }
+        rows[idx].groups_json = fetched.groups_json;
+      }
+    }
+
+    const allGroups: Array<Record<string, any>> = [];
+    let totalObservations = 0;
+    for (let idx = 0; idx < rows.length; idx++) {
+      const parsed = JSON.parse(rows[idx].groups_json);
+      if (!Array.isArray(parsed)) {
+        throw new ValidationError(`Staged import '${importId}' chunk ${idx} is malformed`);
+      }
+      for (const grp of parsed) {
+        if (typeof grp?.resourceId === "string" && grp.resourceId.trim()) {
+          const rid = grp.resourceId.trim();
+          if (!seenResourceIds.has(rid)) {
+            seenResourceIds.add(rid);
+            auth?.authorizeResourceWrite?.(rid);
+          }
+        }
+        if (Array.isArray(grp?.observations)) {
+          totalObservations += grp.observations.length;
+        }
+        allGroups.push(grp);
+      }
+    }
+    if (seenResourceIds.size === 0) {
+      auth?.authorizeResourceWrite?.("*");
+    }
+    if (totalObservations > MAX_STAGED_IMPORT_OBSERVATIONS) {
+      throw new ValidationError(`Staged import exceeds maximum size (${MAX_STAGED_IMPORT_OBSERVATIONS} observations)`);
+    }
+
+    const payloadDigest = await sha256Hex(
+      canonicalJson({
+        expectedChunks: raw.expectedChunks,
+        chunks: rows.map((row) => [Number(row.chunk_index), String(row.groups_json)]),
+      })
+    );
+    const sortedResourceIds = [...seenResourceIds].sort();
+
+    // Transactional lifecycle fence + bounded sharded completion receipt + exact-generation cleanup in ONE atomic db.batch:
+    // 1. INSERT into ms_staged_import_receipts (compact < 200B header row) arbitrates concurrent commits.
+    // 2. INSERT into ms_staged_import_receipt_chunks stores bounded <= 500 KB detail parts (well below D1's 2 MB row limit).
+    // 3. UPDATE ms_staged_import_receipts asserts EVERY staged (chunk_index, generation_id) from our snapshot is STILL present.
+    // 4. Domain writes execute.
+    // 5. DELETE removes ONLY the exact fenced (chunk_index, generation_id) rows + session row.
+    const buildPreStatements = (summary: {
+      inserted: number;
+      replayedNoop: number;
+      groups: Array<{
+        runId: string;
+        evidenceId: string;
+        inserted: number;
+        replayedNoop: number;
+        coverageStatus: string | null;
+      }>;
+    }) => {
+      const receiptGroups = summary.groups.map((g) => ({
+        runId: g.runId,
+        evidenceId: g.evidenceId,
+        totalObservations: g.inserted + g.replayedNoop,
+        coverageStatus: g.coverageStatus,
+      }));
+      const receiptParts = this.partitionReceiptParts(sortedResourceIds, receiptGroups);
+      const receiptHeader = canonicalJson({
+        totalObservations: summary.inserted + summary.replayedNoop,
+        detailChunks: receiptParts.length,
+        generationDigest: snapshotGenerationDigest,
+      });
+      const stmts: any[] = [
+        this.db
+          .prepare(
+            `INSERT INTO ms_staged_import_receipts (
+               tenant_id, import_id, payload_digest, expected_chunks, resource_ids_json, result_json, committed_at
+             ) VALUES (?, ?, ?, ?, '[]', ?, ?)`
+          )
+          .bind(tenantId, importId, payloadDigest, raw.expectedChunks, receiptHeader, now),
+        ...receiptParts.map((part, partIndex) =>
+          this.db
+            .prepare(
+              `INSERT INTO ms_staged_import_receipt_chunks (
+                 tenant_id, import_id, part_index, resource_ids_json, groups_json
+               ) VALUES (?, ?, ?, ?, ?)`
+            )
+            .bind(tenantId, importId, partIndex, part.resourceIdsJson, part.groupsJson)
+        ),
+      ];
+      for (let i = 0; i < rows.length; i += MAX_FENCE_CHUNKS_PER_STMT) {
+        const slice = rows.slice(i, i + MAX_FENCE_CHUNKS_PER_STMT);
+        const clauses = slice.map(() => "(chunk_index = ? AND generation_id = ?)").join(" OR ");
+        const binds: unknown[] = [tenantId, importId];
+        for (const row of slice) {
+          binds.push(Number(row.chunk_index), String(row.generation_id));
+        }
+        binds.push(slice.length, tenantId, importId);
+        stmts.push(
+          this.db
+            .prepare(
+              `UPDATE ms_staged_import_receipts
+               SET payload_digest = CASE
+                 WHEN (
+                   SELECT COUNT(*) FROM ms_staged_imports
+                   WHERE tenant_id = ? AND import_id = ? AND (${clauses})
+                 ) = ?
+                 THEN payload_digest
+                 ELSE NULL
+               END
+               WHERE tenant_id = ? AND import_id = ?`
+            )
+            .bind(...binds)
+        );
+      }
+      return stmts;
+    };
+
+    const buildPostStatements = () => [
+      ...rows.map((row) =>
+        this.db
+          .prepare(
+            "DELETE FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ? AND chunk_index = ? AND generation_id = ?"
+          )
+          .bind(tenantId, importId, Number(row.chunk_index), String(row.generation_id))
+      ),
+      this.db
+        .prepare("DELETE FROM ms_staged_import_sessions WHERE tenant_id = ? AND import_id = ?")
+        .bind(tenantId, importId),
+    ];
+
+    try {
+      const out = await this.commitGroupsAtomically(
+        tenantId,
+        allGroups,
+        {
+          maxObservationsPerGroup: MAX_ATOMIC_OBSERVATIONS,
+          allowInlineRunCreate: true,
+          buildPreStatements,
+          buildPostStatements,
+        },
         now
       );
-      groupResults.push(res);
-      totalInserted += res.inserted;
-      totalReplayedNoop += res.replayedNoop;
-    }
 
-    if (shared.statements.length > 0) {
-      await this.db.batch(shared.statements);
+      return {
+        importId,
+        ...out,
+      };
+    } catch (err) {
+      if (isUniqueConstraintError(err) || isNotNullConstraintError(err) || err instanceof ConflictError) {
+        const concurrentReceipt = await this.db
+          .prepare(
+            "SELECT payload_digest, expected_chunks, resource_ids_json, result_json FROM ms_staged_import_receipts WHERE tenant_id = ? AND import_id = ?"
+          )
+          .bind(tenantId, importId)
+          .first<any>();
+        if (concurrentReceipt) {
+          return this.resolveStagedImportReceiptReplay(
+            tenantId,
+            importId,
+            concurrentReceipt,
+            raw.expectedChunks,
+            payloadDigest,
+            auth
+          );
+        }
+        if (isNotNullConstraintError(err)) {
+          throw new ConflictError(`Staged import '${importId}' was aborted or modified concurrently`);
+        }
+      }
+      throw err;
     }
+  }
 
-    return {
-      inserted: totalInserted,
-      replayedNoop: totalReplayedNoop,
-      groups: groupResults,
-    };
+  public async abortStagedImport(
+    tenantId: string,
+    importId: string,
+    auth?: { authorizeResourceWrite?: (resourceId: string) => void }
+  ): Promise<{ aborted: true; discardedChunks: number }> {
+    const tid = requireNonEmptyString(tenantId, "tenantId", 128);
+    const iid = requireNonEmptyString(importId, "importId", 128);
+    // Bounded metadata-only read (never selects groups_json so even 50 x 1.5 MB = 75 MB imports stay well under D1's 50 MB limit!)
+    const res = await this.db
+      .prepare("SELECT chunk_index, generation_id, resource_ids_json FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ?")
+      .bind(tid, iid)
+      .all<any>();
+    const rows = res.results || [];
+    if (rows.length === 0) {
+      auth?.authorizeResourceWrite?.("*");
+      return { aborted: true, discardedChunks: 0 };
+    }
+    const seenResourceIds = new Set<string>();
+    for (const row of rows) {
+      for (const rid of JSON.parse(row.resource_ids_json || "[]")) {
+        const s = String(rid).trim();
+        if (s) seenResourceIds.add(s);
+      }
+    }
+    if (seenResourceIds.size === 0) {
+      auth?.authorizeResourceWrite?.("*");
+    } else {
+      for (const rid of seenResourceIds) {
+        auth?.authorizeResourceWrite?.(rid);
+      }
+    }
+    const delStmts = rows.map((row) =>
+      this.db
+        .prepare("DELETE FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ? AND chunk_index = ? AND generation_id = ?")
+        .bind(tid, iid, Number(row.chunk_index), String(row.generation_id))
+    );
+    const sessionCleanupStmt = this.db
+      .prepare(
+        `DELETE FROM ms_staged_import_sessions
+         WHERE tenant_id = ? AND import_id = ?
+           AND NOT EXISTS (
+             SELECT 1 FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ?
+           )`
+      )
+      .bind(tid, iid, tid, iid);
+    const delRes = await this.db.batch([...delStmts, sessionCleanupStmt]);
+    const discarded = delRes.slice(0, delStmts.length).reduce((sum, r) => sum + Number(r.meta?.changes ?? 0), 0);
+    return { aborted: true, discardedChunks: discarded };
   }
 
   private async prepareIngestGroup(
@@ -934,15 +2140,8 @@ export class MeasurementService {
       seenRunIdemKeys: Map<string, { runId: string; requestDigest: string }>;
       seenBatchDigests: Set<string>;
       statements: any[];
-    },
-    now: number
-  ): Promise<{
-    runId: string;
-    evidenceId: string;
-    inserted: number;
-    replayedNoop: number;
-    coverageStatus: string | null;
-  }> {
+    }
+  ): Promise<any> {
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
       throw new ValidationError("Ingest payload must be a JSON object");
     }
@@ -1424,10 +2623,89 @@ export class MeasurementService {
       })
     );
 
-    const existingBatch = await this.db
-      .prepare("SELECT * FROM ms_ingest_batches WHERE tenant_id = ? AND batch_digest = ?")
-      .bind(tenantId, batchDigest)
-      .first<any>();
+    const needsEvInsert = !existingEv && !stagedEv;
+    if (needsEvInsert) {
+      shared.seenEvidence.set(evidenceId, {
+        tenantId,
+        resourceId,
+        sha256,
+        uriPointer,
+        byteSize: ev.byteSize,
+        mediaType,
+      });
+    }
+
+    return {
+      raw,
+      tenantId,
+      resourceId,
+      resource,
+      source,
+      runId,
+      windowStart,
+      windowEnd,
+      needsRunInsert,
+      runInsertParams,
+      needsEvInsert,
+      evidenceId,
+      uriPointer,
+      sha256,
+      byteSize: ev.byteSize,
+      mediaType,
+      privacyClass,
+      retentionClass,
+      collectedAt,
+      sourceAsOf,
+      adapterName,
+      adapterVersion,
+      coverage,
+      preparedObs,
+      batchDigest,
+    };
+  }
+
+  private emitPreparedGroupStatements(
+    p: any,
+    existingBatch: any,
+    shared: {
+      seenBatchDigests: Set<string>;
+      statements: any[];
+    },
+    now: number
+  ): {
+    runId: string;
+    evidenceId: string;
+    inserted: number;
+    replayedNoop: number;
+    coverageStatus: string | null;
+  } {
+    const {
+      raw,
+      tenantId,
+      resourceId,
+      resource,
+      source,
+      runId,
+      windowStart,
+      windowEnd,
+      needsRunInsert,
+      runInsertParams,
+      needsEvInsert,
+      evidenceId,
+      uriPointer,
+      sha256,
+      byteSize,
+      mediaType,
+      privacyClass,
+      retentionClass,
+      collectedAt,
+      sourceAsOf,
+      adapterName,
+      adapterVersion,
+      coverage,
+      preparedObs,
+      batchDigest,
+    } = p;
 
     if (existingBatch || shared.seenBatchDigests.has(batchDigest)) {
       return {
@@ -1499,15 +2777,7 @@ export class MeasurementService {
         .bind(tenantId, batchDigest, runId, evidenceId, preparedObs.length, coverage?.status ?? null, now)
     );
 
-    if (!existingEv && !stagedEv) {
-      shared.seenEvidence.set(evidenceId, {
-        tenantId,
-        resourceId,
-        sha256,
-        uriPointer,
-        byteSize: ev.byteSize,
-        mediaType,
-      });
+    if (needsEvInsert) {
       statements.push(
         this.db
           .prepare(
@@ -1524,7 +2794,7 @@ export class MeasurementService {
             runId,
             uriPointer,
             sha256,
-            ev.byteSize,
+            byteSize,
             mediaType,
             privacyClass,
             retentionClass,
@@ -1748,7 +3018,7 @@ export class MeasurementService {
       .prepare(
         `SELECT * FROM ms_observations
          WHERE ${where.join(" AND ")}
-         ORDER BY window_start ASC, window_end ASC, dimensions_hash ASC, source_revision DESC, created_at DESC`
+         ORDER BY window_start ASC, window_end ASC, dimensions_hash ASC, source_revision DESC, created_at DESC, record_seq DESC`
       )
       .bind(...binds)
       .all<any>();
@@ -2075,6 +3345,7 @@ export class MeasurementService {
       sourceRevision: r.source_revision,
       sourceAsOf: r.source_as_of,
       correctionLineage: lineage,
+      recordSeq: Number(r.record_seq ?? 0),
       createdAt: r.created_at,
     };
   }

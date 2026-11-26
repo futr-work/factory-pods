@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { SqliteFileStorage } from "@futr-work/pod-kernel/storage/sqlite";
 import { sha256Hex } from "@futr-work/pod-kernel/auth";
 import worker, { type Env } from "../src/worker.js";
-import { MeasurementService } from "../src/service.js";
+import { ensureMeasurementSchemaUpgraded, MeasurementService } from "../src/service.js";
 import { startLocalMeasurementPod } from "../src/main.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -1636,6 +1636,1307 @@ describe("Measurement Pod — Typed 4-Family Vertical Slice, Isolation, MCP v2 +
         }],
       });
       assert.equal(delimRes.status, 400);
+
+      // 8. 150-group atomic batch (>100, <=1000 groups) commits atomically with bounded DB queries (<80)
+      const groups150 = await Promise.all(
+        Array.from({ length: 150 }, async (_, i) => ({
+          resourceId: "site-alpha",
+          source: "gsc_export",
+          runId: `run-g150-${i}`,
+          runIdempotencyKey: `idem-g150-${i}`,
+          sourceResourceId: "sc-domain:alpha.test",
+          windowStart: "2026-11-27",
+          windowEnd: "2026-11-27",
+          evidence: mkEv(`ev-g150-${i}`, await sha256Hex(`ev-g150-${i}`)),
+          observations: [{
+            metricId: "gsc.clicks", definitionVersion: "v1",
+            windowStart: "2026-11-27", windowEnd: "2026-11-27", windowTz: "UTC", grain: "daily",
+            dimensions: { page: `/g150/${i}` }, valueNum: i,
+            interpretationVersion: "v1", sourceRevision: 1, sourceAsOf: "2026-11-27T00:00:00Z",
+            idempotencyKey: `obs-g150-${i}`,
+          }],
+        }))
+      );
+      dbQueries = 0;
+      const res150 = await countedSvc.ingestAtomicBatch({ tenantId: "tenant-alpha", groups: groups150 });
+      assert.equal(res150.inserted, 150);
+      assert.ok(dbQueries < 30, `Expected < 30 DB queries for 150-group atomic batch, got ${dbQueries}`);
+
+      // 9. Staged multi-chunk import (>1,000 observations): invisible until commit, atomic 409 rollback, cross-tenant isolated
+      const mkChunkObs = (prefix: string, start: number, count: number) =>
+        Array.from({ length: count }, (_, idx) => ({
+          metricId: "gsc.clicks", definitionVersion: "v1",
+          windowStart: "2026-11-28", windowEnd: "2026-11-28", windowTz: "UTC", grain: "daily",
+          dimensions: { page: `/${prefix}/${start + idx}` }, valueNum: start + idx,
+          interpretationVersion: "v1", sourceRevision: 1, sourceAsOf: "2026-11-28T00:00:00Z",
+          idempotencyKey: `obs-${prefix}-${start + idx}`,
+        }));
+
+      const stageEvSha = await sha256Hex("ev-staged-1200");
+      const stageEv = mkEv("ev-staged-1200", stageEvSha);
+      const st0 = await h.call("POST", "/api/measurement/imports/stage", h.tokenA, {
+        tenantId: "tenant-alpha",
+        importId: "imp-1200",
+        chunkIndex: 0,
+        groups: [{
+          resourceId: "site-alpha", source: "gsc_export",
+          runId: "run-staged-1200", runIdempotencyKey: "idem-staged-1200",
+          sourceResourceId: "sc-domain:alpha.test",
+          windowStart: "2026-11-28", windowEnd: "2026-11-28",
+          evidence: stageEv, observations: mkChunkObs("st1200", 0, 600),
+        }],
+      });
+      assert.equal(st0.status, 201);
+      // Before commit, ZERO observations from imp-1200 are visible in querySeries!
+      const preCommit = (await (await h.call("GET", "/api/measurement/series?tenantId=tenant-alpha&resourceId=site-alpha&metricId=gsc.clicks&windowStart=2026-11-28&windowEnd=2026-11-28", h.tokenA)).json()) as any;
+      assert.equal(preCommit.total, 0);
+
+      // Cross-tenant commit and abort attempts with tenant-beta token MUST fail closed with uniform 403 (zero resource ID or existence disclosure)
+      const crossCommitExisting = await h.call("POST", "/api/measurement/imports/imp-1200/commit", h.tokenB, {
+        tenantId: "tenant-alpha", expectedChunks: 1,
+      });
+      const crossCommitMissing = await h.call("POST", "/api/measurement/imports/imp-does-not-exist/commit", h.tokenB, {
+        tenantId: "tenant-alpha", expectedChunks: 1,
+      });
+      const crossAbortExisting = await h.call("POST", "/api/measurement/imports/imp-1200/abort", h.tokenB, {
+        tenantId: "tenant-alpha",
+      });
+      const crossAbortMissing = await h.call("POST", "/api/measurement/imports/imp-does-not-exist/abort", h.tokenB, {
+        tenantId: "tenant-alpha",
+      });
+      assert.equal(crossCommitExisting.status, 403);
+      assert.equal(crossCommitMissing.status, 403);
+      assert.equal(crossAbortExisting.status, 403);
+      assert.equal(crossAbortMissing.status, 403);
+      const crossCommitExistingBody = await crossCommitExisting.text();
+      assert.equal(crossCommitExistingBody, JSON.stringify({ error: "forbidden" }));
+      assert.equal(await crossCommitMissing.text(), crossCommitExistingBody);
+      assert.equal(await crossAbortExisting.text(), crossCommitExistingBody);
+      assert.equal(await crossAbortMissing.text(), crossCommitExistingBody);
+      assert.doesNotMatch(crossCommitExistingBody, /site-alpha/);
+
+      // Stage chunk 1 with remaining 600 observations, then commit atomically -> all 1,200 visible at once!
+      const st1 = await h.call("POST", "/api/measurement/imports/stage", h.tokenA, {
+        tenantId: "tenant-alpha",
+        importId: "imp-1200",
+        chunkIndex: 1,
+        groups: [{
+          resourceId: "site-alpha", source: "gsc_export",
+          runId: "run-staged-1200", runIdempotencyKey: "idem-staged-1200",
+          sourceResourceId: "sc-domain:alpha.test",
+          windowStart: "2026-11-28", windowEnd: "2026-11-28",
+          evidence: stageEv, observations: mkChunkObs("st1200", 600, 600),
+        }],
+      });
+      assert.equal(st1.status, 201);
+      const commitRes = await h.call("POST", "/api/measurement/imports/imp-1200/commit", h.tokenA, {
+        tenantId: "tenant-alpha", expectedChunks: 2,
+      });
+      assert.equal(commitRes.status, 200);
+      assert.equal(((await commitRes.json()) as any).inserted, 1200);
+      const postCommit = (await (await h.call("GET", "/api/measurement/series?tenantId=tenant-alpha&resourceId=site-alpha&metricId=gsc.clicks&windowStart=2026-11-28&windowEnd=2026-11-28&limit=500", h.tokenA)).json()) as any;
+      assert.equal(postCommit.total, 1200);
+      // Verify monotonic positive recordSeq unconditionally on known points
+      const pt0 = (await (await h.call(
+        "GET",
+        `/api/measurement/series?tenantId=tenant-alpha&resourceId=site-alpha&metricId=gsc.clicks&windowStart=2026-11-28&windowEnd=2026-11-28&dimensions=${encodeURIComponent(JSON.stringify({ page: "/st1200/0" }))}`,
+        h.tokenA
+      )).json()) as any;
+      const pt1 = (await (await h.call(
+        "GET",
+        `/api/measurement/series?tenantId=tenant-alpha&resourceId=site-alpha&metricId=gsc.clicks&windowStart=2026-11-28&windowEnd=2026-11-28&dimensions=${encodeURIComponent(JSON.stringify({ page: "/st1200/1" }))}`,
+        h.tokenA
+      )).json()) as any;
+      assert.equal(pt0.points.length, 1);
+      assert.equal(pt1.points.length, 1);
+      assert.ok(typeof pt0.points[0].recordSeq === "number" && pt0.points[0].recordSeq > 0);
+      assert.ok(pt0.points[0].recordSeq < pt1.points[0].recordSeq);
+
+      // Durable completion receipt: sequential retry after commit succeeds idempotently (200, not 404); mismatched expectedChunks fails with 409; re-staging fails with 409
+      const commitRetryRes = await h.call("POST", "/api/measurement/imports/imp-1200/commit", h.tokenA, {
+        tenantId: "tenant-alpha", expectedChunks: 2,
+      });
+      assert.equal(commitRetryRes.status, 200);
+      const commitRetryBody = (await commitRetryRes.json()) as any;
+      assert.equal(commitRetryBody.inserted, 0);
+      assert.equal(commitRetryBody.replayedNoop, 1200);
+      const commitMismatchRes = await h.call("POST", "/api/measurement/imports/imp-1200/commit", h.tokenA, {
+        tenantId: "tenant-alpha", expectedChunks: 1,
+      });
+      assert.equal(commitMismatchRes.status, 409);
+      const restageAfterCommit = await h.call("POST", "/api/measurement/imports/stage", h.tokenA, {
+        tenantId: "tenant-alpha",
+        importId: "imp-1200",
+        chunkIndex: 0,
+        groups: [{
+          resourceId: "site-alpha", source: "gsc_export",
+          runId: "run-staged-1200", runIdempotencyKey: "idem-staged-1200",
+          sourceResourceId: "sc-domain:alpha.test",
+          windowStart: "2026-11-28", windowEnd: "2026-11-28",
+          evidence: stageEv, observations: mkChunkObs("st1200", 0, 1),
+        }],
+      });
+      assert.equal(restageAfterCommit.status, 409);
+
+      // Staged import with conflict in chunk 1 commits ZERO rows from chunk 0 on commit!
+      const badEv = mkEv("ev-staged-bad", await sha256Hex("ev-staged-bad"));
+      assert.equal((await h.call("POST", "/api/measurement/imports/stage", h.tokenA, {
+        tenantId: "tenant-alpha", importId: "imp-bad", chunkIndex: 0,
+        groups: [{
+          resourceId: "site-alpha", source: "gsc_export",
+          runId: "run-staged-bad", runIdempotencyKey: "idem-staged-bad",
+          sourceResourceId: "sc-domain:alpha.test",
+          windowStart: "2026-11-29", windowEnd: "2026-11-29",
+          evidence: badEv, observations: mkChunkObs("stbad", 0, 5),
+        }],
+      })).status, 201);
+      assert.equal((await h.call("POST", "/api/measurement/imports/stage", h.tokenA, {
+        tenantId: "tenant-alpha", importId: "imp-bad", chunkIndex: 1,
+        groups: [{
+          resourceId: "site-alpha", source: "gsc_export",
+          runId: "run-staged-bad", runIdempotencyKey: "idem-staged-bad",
+          sourceResourceId: "sc-domain:alpha.test",
+          windowStart: "2026-11-29", windowEnd: "2026-11-29",
+          evidence: stageEv,
+          observations: [{
+            metricId: "gsc.clicks", definitionVersion: "v1",
+            windowStart: "2026-11-28", windowEnd: "2026-11-28", windowTz: "UTC", grain: "daily",
+            dimensions: { page: "/st1200/0" }, valueNum: 99999,
+            interpretationVersion: "v1", sourceRevision: 1, sourceAsOf: "2026-11-28T00:00:00Z",
+            idempotencyKey: "obs-st1200-0",
+          }],
+        }],
+      })).status, 201);
+      const badCommit = await h.call("POST", "/api/measurement/imports/imp-bad/commit", h.tokenA, {
+        tenantId: "tenant-alpha", expectedChunks: 2,
+      });
+      assert.equal(badCommit.status, 409);
+      const afterBad = (await (await h.call("GET", "/api/measurement/series?tenantId=tenant-alpha&resourceId=site-alpha&metricId=gsc.clicks&windowStart=2026-11-29&windowEnd=2026-11-29", h.tokenA)).json()) as any;
+      assert.equal(afterBad.total, 0);
+      assert.equal((await h.call("POST", "/api/measurement/imports/imp-bad/abort", h.tokenA, { tenantId: "tenant-alpha" })).status, 200);
+
+      // 10. Regression checks for staged-import races, TOCTOU isolation, and batched read query budget:
+      // 10a. Batched prefetch reads keep a multi-chunk staged import with 1,200 single-observation groups to <= 4 DB calls!
+      const singleObsGroups = await Promise.all(
+        Array.from({ length: 1200 }, async (_, i) => ({
+          resourceId: "site-alpha",
+          source: "gsc_export",
+          runId: `run-q4-${i}`,
+          runIdempotencyKey: `idem-q4-${i}`,
+          sourceResourceId: "sc-domain:alpha.test",
+          windowStart: "2026-11-30",
+          windowEnd: "2026-11-30",
+          evidence: mkEv(`ev-q4-${i}`, await sha256Hex(`ev-q4-${i}`)),
+          observations: [{
+            metricId: "gsc.clicks", definitionVersion: "v1",
+            windowStart: "2026-11-30", windowEnd: "2026-11-30", windowTz: "UTC", grain: "daily",
+            dimensions: { page: `/q4/${i}` }, valueNum: i,
+            interpretationVersion: "v1", sourceRevision: 1, sourceAsOf: "2026-11-30T00:00:00Z",
+            idempotencyKey: `obs-q4-${i}`,
+          }],
+        }))
+      );
+      await countedSvc.stageImportChunk({ tenantId: "tenant-alpha", importId: "imp-q4", chunkIndex: 0, groups: singleObsGroups.slice(0, 600) });
+      await countedSvc.stageImportChunk({ tenantId: "tenant-alpha", importId: "imp-q4", chunkIndex: 1, groups: singleObsGroups.slice(600, 1200) });
+      dbQueries = 0;
+      const q4Commit = await countedSvc.commitStagedImport({ tenantId: "tenant-alpha", importId: "imp-q4", expectedChunks: 2 });
+      assert.equal(q4Commit.inserted, 1200);
+      assert.ok(dbQueries <= 4, `Expected <= 4 DB invocation calls (batched reads + write) for 1,200-group staged commit, got ${dbQueries}`);
+
+      // 10b. Concurrent/duplicate staging returns 200 (identical) or 409 (conflicting), never 500
+      const raceGroup = [{
+        resourceId: "site-alpha", source: "gsc_export",
+        runId: "run-race-stage", runIdempotencyKey: "idem-race-stage",
+        sourceResourceId: "sc-domain:alpha.test",
+        windowStart: "2026-12-01", windowEnd: "2026-12-01",
+        evidence: mkEv("ev-race-stage", await sha256Hex("ev-race-stage")),
+        observations: [{
+          metricId: "gsc.clicks", definitionVersion: "v1",
+          windowStart: "2026-12-01", windowEnd: "2026-12-01", windowTz: "UTC", grain: "daily",
+          dimensions: { page: "/race-stage" }, valueNum: 1,
+          interpretationVersion: "v1", sourceRevision: 1, sourceAsOf: "2026-12-01T00:00:00Z",
+          idempotencyKey: "obs-race-stage",
+        }],
+      }];
+      const [rStage1, rStage2] = await Promise.all([
+        h.call("POST", "/api/measurement/imports/stage", h.tokenA, { tenantId: "tenant-alpha", importId: "imp-race", chunkIndex: 0, groups: raceGroup }),
+        h.call("POST", "/api/measurement/imports/stage", h.tokenA, { tenantId: "tenant-alpha", importId: "imp-race", chunkIndex: 0, groups: raceGroup }),
+      ]);
+      assert.deepEqual([rStage1.status, rStage2.status].sort(), [200, 201]);
+      const diffStage = await h.call("POST", "/api/measurement/imports/stage", h.tokenA, {
+        tenantId: "tenant-alpha", importId: "imp-race", chunkIndex: 0,
+        groups: [{ ...raceGroup[0], observations: [{ ...raceGroup[0].observations[0], valueNum: 2 }] }],
+      });
+      assert.equal(diffStage.status, 409);
+
+      // 10c. Concurrent unseen chunk arriving AFTER commit/abort snapshot read is NEVER committed without auth and NEVER deleted!
+      let injectedAfterRead = false;
+      const interceptDb = {
+        prepare(sql: string) {
+          const stmt = origPrepare(sql);
+          return {
+            bind(...params: any[]) {
+              const bound = stmt.bind(...params);
+              return {
+                first: (...a: any[]) => (bound.first as any)(...a),
+                all: (...a: any[]) => (bound.all as any)(...a),
+                run: (...a: any[]) => (bound.run as any)(...a),
+                _raw: bound,
+                _sql: sql,
+              };
+            },
+            first: (...a: any[]) => (stmt.first as any)(...a),
+            all: (...a: any[]) => (stmt.all as any)(...a),
+            run: (...a: any[]) => (stmt.run as any)(...a),
+          };
+        },
+        async batch(stmts: any[]) {
+          const res = await origBatch(stmts.map((s) => s._raw ?? s));
+          if (
+            !injectedAfterRead &&
+            stmts.some((s) => typeof s._sql === "string" && s._sql.includes("FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ?"))
+          ) {
+            injectedAfterRead = true;
+            // Simulate chunk 1 for site-beta arriving right after snapshot read!
+            await origPrepare(
+              "INSERT INTO ms_staged_imports (tenant_id, import_id, chunk_index, generation_id, resource_ids_json, groups_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+            )
+              .bind(
+                "tenant-alpha",
+                "imp-race",
+                1,
+                "gen-beta-unseen-1",
+                JSON.stringify(["site-beta"]),
+                JSON.stringify([{
+                  resourceId: "site-beta", source: "gsc_export",
+                  runId: "run-beta-unseen", runIdempotencyKey: "idem-beta-unseen",
+                  sourceResourceId: "sc-domain:beta.test",
+                  windowStart: "2026-12-01", windowEnd: "2026-12-01",
+                  evidence: mkEv("ev-beta-unseen", await sha256Hex("ev-beta-unseen")),
+                  observations: [{
+                    metricId: "gsc.clicks", definitionVersion: "v1",
+                    windowStart: "2026-12-01", windowEnd: "2026-12-01", windowTz: "UTC", grain: "daily",
+                    dimensions: { page: "/beta-unseen" }, valueNum: 77,
+                    interpretationVersion: "v1", sourceRevision: 1, sourceAsOf: "2026-12-01T00:00:00Z",
+                    idempotencyKey: "obs-beta-unseen",
+                  }],
+                }]),
+                Date.now()
+              )
+              .run();
+          }
+          return res;
+        },
+      };
+      const interceptSvc = new MeasurementService(interceptDb as any);
+      const narrowCommit = await interceptSvc.commitStagedImport(
+        { tenantId: "tenant-alpha", importId: "imp-race", expectedChunks: 1 },
+        Date.now(),
+        {
+          authorizeResourceWrite: (rid: string) => {
+            if (rid !== "site-alpha") throw new Error("forbidden");
+          },
+        }
+      );
+      assert.equal(narrowCommit.inserted, 1);
+      // Chunk 1 (site-beta) MUST still remain intact in ms_staged_imports (NOT deleted!) and NOT committed!
+      const remainingStaged = await h.db
+        .prepare("SELECT chunk_index FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ?")
+        .bind("tenant-alpha", "imp-race")
+        .all<any>();
+      assert.deepEqual((remainingStaged.results || []).map((r: any) => Number(r.chunk_index)), [1]);
+      assert.equal((await h.call("GET", "/api/measurement/runs/run-beta-unseen?tenantId=tenant-alpha", h.tokenA)).status, 404);
+      // Narrow caller attempting to abort now sees site-beta chunk 1 and MUST receive uniform 403 (zero resource ID leak)!
+      const narrowAbortDenied = await h.call("POST", "/api/measurement/imports/imp-race/abort", narrowToken, { tenantId: "tenant-alpha" });
+      assert.equal(narrowAbortDenied.status, 403);
+      assert.equal(await narrowAbortDenied.text(), JSON.stringify({ error: "forbidden" }));
+      // Authorized full caller can abort cleanly
+      assert.equal(
+        (await h.call("POST", "/api/measurement/imports/imp-race/abort", h.tokenA, { tenantId: "tenant-alpha" })).status,
+        200
+      );
+
+      // 10d. Oversized serialized chunk (> 1,500,000 UTF-8 bytes) MUST fail with actionable 400 (never D1 row-size 500)
+      const pad = "x".repeat(2000);
+      const oversizedObs = Array.from({ length: 800 }, (_, i) => ({
+        metricId: "gsc.clicks", definitionVersion: "v1",
+        windowStart: "2026-12-02", windowEnd: "2026-12-02", windowTz: "UTC", grain: "daily",
+        dimensions: { page: `/big/${i}/${pad}` }, valueNum: i,
+        interpretationVersion: "v1", sourceRevision: 1, sourceAsOf: "2026-12-02T00:00:00Z",
+        idempotencyKey: `obs-big-${i}`,
+      }));
+      const oversizedRes = await h.call("POST", "/api/measurement/imports/stage", h.tokenA, {
+        tenantId: "tenant-alpha",
+        importId: "imp-oversized",
+        chunkIndex: 0,
+        groups: [{
+          resourceId: "site-alpha", source: "gsc_export",
+          runId: "run-oversized", runIdempotencyKey: "idem-oversized",
+          sourceResourceId: "sc-domain:alpha.test",
+          windowStart: "2026-12-02", windowEnd: "2026-12-02",
+          evidence: mkEv("ev-oversized", await sha256Hex("ev-oversized")),
+          observations: oversizedObs,
+        }],
+      });
+      assert.equal(oversizedRes.status, 400);
+      assert.match(((await oversizedRes.json()) as any).error, /split into smaller chunks/);
+
+      // 10e. Lifecycle fencing: commit suspended across abort MUST fail with ConflictError (409) and publish ZERO rows!
+      const fenceGroup = [{
+        resourceId: "site-alpha", source: "gsc_export",
+        runId: "run-fence-abort", runIdempotencyKey: "idem-fence-abort",
+        sourceResourceId: "sc-domain:alpha.test",
+        windowStart: "2026-12-03", windowEnd: "2026-12-03",
+        evidence: mkEv("ev-fence-abort", await sha256Hex("ev-fence-abort")),
+        observations: [{
+          metricId: "gsc.clicks", definitionVersion: "v1",
+          windowStart: "2026-12-03", windowEnd: "2026-12-03", windowTz: "UTC", grain: "daily",
+          dimensions: { page: "/fence-abort" }, valueNum: 11,
+          interpretationVersion: "v1", sourceRevision: 1, sourceAsOf: "2026-12-03T00:00:00Z",
+          idempotencyKey: "obs-fence-abort",
+        }],
+      }];
+      assert.equal(
+        (await h.call("POST", "/api/measurement/imports/stage", h.tokenA, {
+          tenantId: "tenant-alpha", importId: "imp-fence-abort", chunkIndex: 0, groups: fenceGroup,
+        })).status,
+        201
+      );
+      let abortBeforeCommitBatch = false;
+      const makePausedBatchDb = (onBeforeWriteBatch: () => Promise<void>) => ({
+        prepare(sql: string) {
+          const stmt = origPrepare(sql);
+          return {
+            bind(...params: any[]) {
+              const bound = stmt.bind(...params);
+              return {
+                first: (...a: any[]) => (bound.first as any)(...a),
+                all: (...a: any[]) => (bound.all as any)(...a),
+                run: (...a: any[]) => (bound.run as any)(...a),
+                _raw: bound,
+                _sql: sql,
+              };
+            },
+            first: (...a: any[]) => (stmt.first as any)(...a),
+            all: (...a: any[]) => (stmt.all as any)(...a),
+            run: (...a: any[]) => (stmt.run as any)(...a),
+          };
+        },
+        async batch(stmts: any[]) {
+          if (stmts.some((s) => typeof s._sql === "string" && s._sql.includes("INSERT INTO ms_staged_import_receipts"))) {
+            await onBeforeWriteBatch();
+          }
+          return origBatch(stmts.map((s) => s._raw ?? s));
+        },
+      });
+      const abortRaceSvc = new MeasurementService(
+        makePausedBatchDb(async () => {
+          if (!abortBeforeCommitBatch) {
+            abortBeforeCommitBatch = true;
+            const ab = await new MeasurementService(h.db).abortStagedImport("tenant-alpha", "imp-fence-abort");
+            assert.equal(ab.discardedChunks, 1);
+          }
+        }) as any
+      );
+      await assert.rejects(
+        () => abortRaceSvc.commitStagedImport({ tenantId: "tenant-alpha", importId: "imp-fence-abort", expectedChunks: 1 }),
+        (err: any) => err?.status === 409
+      );
+      assert.equal((await h.call("GET", "/api/measurement/runs/run-fence-abort?tenantId=tenant-alpha", h.tokenA)).status, 404);
+
+      // 10f. ABA replacement race: abort and commit with stale generation_id MUST NOT delete or consume replacement chunk!
+      const abaGroup = [{
+        resourceId: "site-alpha", source: "gsc_export",
+        runId: "run-aba", runIdempotencyKey: "idem-aba",
+        sourceResourceId: "sc-domain:alpha.test",
+        windowStart: "2026-12-04", windowEnd: "2026-12-04",
+        evidence: mkEv("ev-aba", await sha256Hex("ev-aba")),
+        observations: [{
+          metricId: "gsc.clicks", definitionVersion: "v1",
+          windowStart: "2026-12-04", windowEnd: "2026-12-04", windowTz: "UTC", grain: "daily",
+          dimensions: { page: "/aba" }, valueNum: 22,
+          interpretationVersion: "v1", sourceRevision: 1, sourceAsOf: "2026-12-04T00:00:00Z",
+          idempotencyKey: "obs-aba",
+        }],
+      }];
+      const baseSvc = new MeasurementService(h.db);
+      await baseSvc.stageImportChunk({ tenantId: "tenant-alpha", importId: "imp-aba", chunkIndex: 0, groups: abaGroup });
+      let abaReplacedForAbort = false;
+      const abaAbortDb = {
+        prepare(sql: string) {
+          const stmt = origPrepare(sql);
+          return {
+            bind(...params: any[]) {
+              const bound = stmt.bind(...params);
+              return {
+                first: (...a: any[]) => (bound.first as any)(...a),
+                all: async (...a: any[]) => {
+                  const res = await (bound.all as any)(...a);
+                  if (!abaReplacedForAbort && sql.includes("FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ?")) {
+                    abaReplacedForAbort = true;
+                    // Delete original generation and re-stage identical groups_json with a brand-new generation_id!
+                    await baseSvc.abortStagedImport("tenant-alpha", "imp-aba");
+                    await baseSvc.stageImportChunk({ tenantId: "tenant-alpha", importId: "imp-aba", chunkIndex: 0, groups: abaGroup });
+                  }
+                  return res;
+                },
+                run: (...a: any[]) => (bound.run as any)(...a),
+                _raw: bound,
+                _sql: sql,
+              };
+            },
+            first: (...a: any[]) => (stmt.first as any)(...a),
+            all: (...a: any[]) => (stmt.all as any)(...a),
+            run: (...a: any[]) => (stmt.run as any)(...a),
+          };
+        },
+        batch(stmts: any[]) {
+          return origBatch(stmts.map((s) => s._raw ?? s));
+        },
+      };
+      const staleAbortRes = await new MeasurementService(abaAbortDb as any).abortStagedImport("tenant-alpha", "imp-aba");
+      assert.equal(staleAbortRes.discardedChunks, 0);
+      const abaRemaining = await h.db
+        .prepare("SELECT generation_id FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ?")
+        .bind("tenant-alpha", "imp-aba")
+        .all<any>();
+      assert.equal((abaRemaining.results || []).length, 1);
+
+      let abaReplacedForCommit = false;
+      const abaCommitSvc = new MeasurementService(
+        makePausedBatchDb(async () => {
+          if (!abaReplacedForCommit) {
+            abaReplacedForCommit = true;
+            await baseSvc.abortStagedImport("tenant-alpha", "imp-aba");
+            await baseSvc.stageImportChunk({ tenantId: "tenant-alpha", importId: "imp-aba", chunkIndex: 0, groups: abaGroup });
+          }
+        }) as any
+      );
+      await assert.rejects(
+        () => abaCommitSvc.commitStagedImport({ tenantId: "tenant-alpha", importId: "imp-aba", expectedChunks: 1 }),
+        (err: any) => err?.status === 409
+      );
+      assert.equal((await h.call("GET", "/api/measurement/runs/run-aba?tenantId=tenant-alpha", h.tokenA)).status, 404);
+      // Fresh commit of replacement generation succeeds cleanly
+      const abaFreshCommit = await baseSvc.commitStagedImport({ tenantId: "tenant-alpha", importId: "imp-aba", expectedChunks: 1 });
+      assert.equal(abaFreshCommit.inserted, 1);
+
+      // 10g. Concurrent identical commits both succeed (200 insert + 200 idempotent replay, NEVER 500 UNIQUE constraint failed!)
+      const raceCommitGroup = [{
+        resourceId: "site-alpha", source: "gsc_export",
+        runId: "run-concurrent-commit", runIdempotencyKey: "idem-concurrent-commit",
+        sourceResourceId: "sc-domain:alpha.test",
+        windowStart: "2026-12-05", windowEnd: "2026-12-05",
+        evidence: mkEv("ev-concurrent-commit", await sha256Hex("ev-concurrent-commit")),
+        observations: [{
+          metricId: "gsc.clicks", definitionVersion: "v1",
+          windowStart: "2026-12-05", windowEnd: "2026-12-05", windowTz: "UTC", grain: "daily",
+          dimensions: { page: "/concurrent-commit" }, valueNum: 33,
+          interpretationVersion: "v1", sourceRevision: 1, sourceAsOf: "2026-12-05T00:00:00Z",
+          idempotencyKey: "obs-concurrent-commit",
+        }],
+      }];
+      await baseSvc.stageImportChunk({ tenantId: "tenant-alpha", importId: "imp-conc", chunkIndex: 0, groups: raceCommitGroup });
+      let releaseBarrier!: () => void;
+      const barrier = new Promise<void>((resolve) => { releaseBarrier = resolve; });
+      let arrived = 0;
+      const barrierSvc = new MeasurementService(
+        makePausedBatchDb(async () => {
+          arrived += 1;
+          if (arrived === 2) releaseBarrier();
+          await barrier;
+        }) as any
+      );
+      const [concA, concB] = await Promise.all([
+        barrierSvc.commitStagedImport({ tenantId: "tenant-alpha", importId: "imp-conc", expectedChunks: 1 }),
+        barrierSvc.commitStagedImport({ tenantId: "tenant-alpha", importId: "imp-conc", expectedChunks: 1 }),
+      ]);
+      assert.deepEqual([concA.inserted, concB.inserted].sort(), [0, 1]);
+      assert.deepEqual([concA.replayedNoop, concB.replayedNoop].sort(), [0, 1]);
+      // Unauthorized caller retrying committed receipt receives uniform 403 (zero disclosure)
+      const unauthReceiptRetry = await h.call("POST", "/api/measurement/imports/imp-conc/commit", h.tokenB, {
+        tenantId: "tenant-alpha", expectedChunks: 1,
+      });
+      assert.equal(unauthReceiptRetry.status, 403);
+      assert.equal(await unauthReceiptRetry.text(), JSON.stringify({ error: "forbidden" }));
+
+      // 10h. Durable monotonic recordSeq NEVER reuses deleted sequence numbers after cascading deletion!
+      const beforeDelSeries = (await (await h.call(
+        "GET",
+        `/api/measurement/series?tenantId=tenant-alpha&resourceId=site-alpha&metricId=gsc.clicks&windowStart=2026-12-05&windowEnd=2026-12-05`,
+        h.tokenA
+      )).json()) as any;
+      assert.equal(beforeDelSeries.points.length, 1);
+      const maxSeqBeforeDelete = beforeDelSeries.points[0].recordSeq;
+      assert.ok(maxSeqBeforeDelete > 0);
+      await h.db.prepare("DELETE FROM ms_runs WHERE run_id = ?").bind("run-concurrent-commit").run();
+      const postDelRes = await h.call("POST", "/api/measurement/ingest-atomic", h.tokenA, {
+        tenantId: "tenant-alpha",
+        groups: [{
+          resourceId: "site-alpha", source: "gsc_export",
+          runId: "run-after-cascade-del", runIdempotencyKey: "idem-after-cascade-del",
+          sourceResourceId: "sc-domain:alpha.test",
+          windowStart: "2026-12-06", windowEnd: "2026-12-06",
+          evidence: mkEv("ev-after-cascade-del", await sha256Hex("ev-after-cascade-del")),
+          observations: [{
+            metricId: "gsc.clicks", definitionVersion: "v1",
+            windowStart: "2026-12-06", windowEnd: "2026-12-06", windowTz: "UTC", grain: "daily",
+            dimensions: { page: "/after-cascade-del" }, valueNum: 44,
+            interpretationVersion: "v1", sourceRevision: 1, sourceAsOf: "2026-12-06T00:00:00Z",
+            idempotencyKey: "obs-after-cascade-del",
+          }],
+        }],
+      });
+      assert.equal(postDelRes.status, 200);
+      const afterDelSeries = (await (await h.call(
+        "GET",
+        `/api/measurement/series?tenantId=tenant-alpha&resourceId=site-alpha&metricId=gsc.clicks&windowStart=2026-12-06&windowEnd=2026-12-06`,
+        h.tokenA
+      )).json()) as any;
+      assert.equal(afterDelSeries.points.length, 1);
+      assert.ok(
+        afterDelSeries.points[0].recordSeq > maxSeqBeforeDelete,
+        `Expected strictly monotonic recordSeq > ${maxSeqBeforeDelete}, got ${afterDelSeries.points[0].recordSeq}`
+      );
+
+      // 10i. Data-preserving legacy database upgrade: base schema without record_seq upgrades cleanly on local runtime startup!
+      const legacyDir = mkdtempSync(join(tmpdir(), "ms-pod-legacy-upgrade-"));
+      const legacyDbPath = join(legacyDir, "legacy.sqlite");
+      const legacySchemaSql = schemaSql
+        .replace(
+          "  record_seq INTEGER PRIMARY KEY AUTOINCREMENT,\n  obs_id TEXT NOT NULL UNIQUE,",
+          "  obs_id TEXT PRIMARY KEY,"
+        )
+        .replace(/-- 9\. Invisible Staged Multi-Chunk Imports[\s\S]*?-- Indexes for bounded paginated queries/, "-- Indexes for bounded paginated queries");
+      const legacyInitDb = new SqliteFileStorage(legacyDbPath);
+      try {
+        legacyInitDb.exec(legacySchemaSql);
+        // Seed legacy resource, definition, run, evidence, and 3 observations (no record_seq column yet)
+        await legacyInitDb.batch([
+          legacyInitDb
+            .prepare(
+              `INSERT INTO ms_resources (tenant_id, resource_id, entity_urn, resource_type, source_resource_id, active_from, created_at, updated_at)
+               VALUES ('t-leg', 'site-leg', 'site:t-leg:site-leg', 'site', 'sc-domain:leg.test', '2026-01-01', 1000, 1000)`
+            ),
+          legacyInitDb
+            .prepare(
+              `INSERT INTO ms_definitions (tenant_id, metric_id, version, family, unit, value_type, grain, window_tz, dimensions_schema_json, aggregation_rule, comparability_key, created_at)
+               VALUES ('t-leg', 'gsc.clicks', 'v1', 'seo', 'count', 'integer', 'daily', 'UTC', '{"page":{"type":"string","required":true}}', 'sum', 'gsc.clicks@v1', 1000)`
+            ),
+          legacyInitDb
+            .prepare(
+              `INSERT INTO ms_runs (run_id, tenant_id, resource_id, source, source_resource_id, idempotency_key, request_digest, window_start, window_end, status, created_at, updated_at)
+               VALUES ('run-leg-1', 't-leg', 'site-leg', 'gsc_export', 'sc-domain:leg.test', 'idem-leg-1', 'd1', '2026-11-01', '2026-11-03', 'succeeded', 1000, 1000)`
+            ),
+          legacyInitDb
+            .prepare(
+              `INSERT INTO ms_evidence (evidence_id, tenant_id, resource_id, run_id, uri_pointer, sha256, byte_size, media_type, privacy_class, retention_class, collected_at, source_as_of, adapter_name, adapter_version, created_at)
+               VALUES ('ev-leg-1', 't-leg', 'site-leg', 'run-leg-1', 'fixture://leg/1', '${await sha256Hex("leg-1")}', 10, 'application/json', 'internal', '90d', '2026-11-03T00:00:00Z', '2026-11-03T00:00:00Z', 'leg', '1.0.0', 1000)`
+            ),
+          ...([1, 2, 3] as const).map((n) =>
+            legacyInitDb
+              .prepare(
+                `INSERT INTO ms_observations (
+                   obs_id, tenant_id, resource_id, source, run_id, evidence_id,
+                   metric_id, definition_version, comparability_key,
+                   window_start, window_end, window_tz, grain,
+                   dimensions_json, dimensions_hash, value_type, value_num,
+                   interpretation_version, source_revision, source_as_of,
+                   idempotency_key, payload_digest, created_at
+                 ) VALUES (?, 't-leg', 'site-leg', 'gsc_export', 'run-leg-1', 'ev-leg-1',
+                   'gsc.clicks', 'v1', 'gsc.clicks@v1',
+                   '2026-11-01', '2026-11-01', 'UTC', 'daily',
+                   ?, ?, 'integer', ?, 'v1', 1, '2026-11-03T00:00:00Z',
+                   ?, ?, 1000)`
+              )
+              .bind(`obs-leg-${n}`, JSON.stringify({ page: `/p${n}` }), `h${n}`, n * 10, `idem-obs-leg-${n}`, `pd-${n}`)
+          ),
+        ]);
+      } finally {
+        legacyInitDb.close();
+      }
+      const legToken = "legacy-upgrade-token";
+      const upgradedPod = await startLocalMeasurementPod({
+        host: "127.0.0.1",
+        port: 0,
+        dbPath: legacyDbPath,
+        env: {
+          FACTORY_HUB_TOKEN: "legacy-hub",
+          SCOPED_CALLER_GRANTS: JSON.stringify([
+            {
+              callerId: "legacy-caller",
+              tokenSha256: await sha256Hex(legToken),
+              grants: [{ tenantId: "t-leg", resourceIds: ["*"], actions: ["read", "write"] }],
+            },
+          ]),
+        },
+      });
+      const reqUpgraded = (method: string, path: string, body?: any) =>
+        new Promise<{ status: number; text: string }>((resolve, reject) => {
+          const req = httpRequest(
+            {
+              host: "127.0.0.1",
+              port: upgradedPod.port,
+              path,
+              method,
+              headers: {
+                Authorization: `Bearer ${legToken}`,
+                ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
+              },
+            },
+            (res) => {
+              let text = "";
+              res.setEncoding("utf8");
+              res.on("data", (c) => { text += c; });
+              res.on("end", () => resolve({ status: res.statusCode ?? 0, text }));
+            }
+          );
+          req.on("error", reject);
+          if (body !== undefined) req.write(JSON.stringify(body));
+          req.end();
+        });
+      try {
+        const legSeriesRes = await reqUpgraded("GET", "/api/measurement/series?tenantId=t-leg&resourceId=site-leg&metricId=gsc.clicks");
+        assert.equal(legSeriesRes.status, 200);
+        const legSeries = JSON.parse(legSeriesRes.text);
+        assert.equal(legSeries.total, 3);
+        const legSeqs = legSeries.points.map((p: any) => p.recordSeq).sort((a: number, b: number) => a - b);
+        assert.deepEqual(legSeqs, [1, 2, 3]);
+        // Delete legacy run via cascade and insert a new observation -> recordSeq MUST exceed 3!
+        await upgradedPod.db.prepare("DELETE FROM ms_runs WHERE run_id = 'run-leg-1'").run();
+        const postUpgradeIngest = await reqUpgraded("POST", "/api/measurement/ingest-atomic", {
+          tenantId: "t-leg",
+          groups: [{
+            resourceId: "site-leg", source: "gsc_export",
+            runId: "run-leg-2", runIdempotencyKey: "idem-leg-2",
+            sourceResourceId: "sc-domain:leg.test",
+            windowStart: "2026-11-04", windowEnd: "2026-11-04",
+            evidence: mkEv("ev-leg-2", await sha256Hex("ev-leg-2")),
+            observations: [{
+              metricId: "gsc.clicks", definitionVersion: "v1",
+              windowStart: "2026-11-04", windowEnd: "2026-11-04", windowTz: "UTC", grain: "daily",
+              dimensions: { page: "/after-upgrade" }, valueNum: 99,
+              interpretationVersion: "v1", sourceRevision: 1, sourceAsOf: "2026-11-04T00:00:00Z",
+              idempotencyKey: "idem-obs-leg-4",
+            }],
+          }],
+        });
+        assert.equal(postUpgradeIngest.status, 200);
+        const postUpgradeSeries = JSON.parse(
+          (await reqUpgraded("GET", "/api/measurement/series?tenantId=t-leg&resourceId=site-leg&metricId=gsc.clicks")).text
+        );
+        assert.equal(postUpgradeSeries.points.length, 1);
+        assert.ok(postUpgradeSeries.points[0].recordSeq > 3, `Expected recordSeq > 3, got ${postUpgradeSeries.points[0].recordSeq}`);
+        // Re-running upgrade helper is an idempotent no-op
+        const secondUpgrade = await ensureMeasurementSchemaUpgraded(upgradedPod.db);
+        assert.deepEqual(secondUpgrade, { migratedObservations: false, migratedStagedImports: false });
+      } finally {
+        await upgradedPod.close();
+        rmSync(legacyDir, { recursive: true, force: true });
+      }
+
+      // 10j. Import-level staging authorization boundary: sibling narrow caller CANNOT probe, append, or discover committed imports (sequential & concurrent)!
+      const narrowBetaToken = "narrow-beta-only-token";
+      const grantsWithBeta = [
+        ...JSON.parse(h.env.SCOPED_CALLER_GRANTS || "[]"),
+        {
+          callerId: "narrow-beta-only",
+          tokenSha256: await sha256Hex(narrowBetaToken),
+          grants: [{ tenantId: "tenant-alpha", resourceIds: ["site-beta"], actions: ["read", "write"] }],
+        },
+      ];
+      h.env.SCOPED_CALLER_GRANTS = JSON.stringify(grantsWithBeta);
+      const mkNarrowGroup = async (rid: string, tag: string) => [{
+        resourceId: rid, source: "gsc_export",
+        runId: `run-iso-${tag}`, runIdempotencyKey: `idem-iso-${tag}`,
+        sourceResourceId: rid === "site-alpha" ? "sc-domain:alpha.test" : "sc-domain:beta.test",
+        windowStart: "2026-12-07", windowEnd: "2026-12-07",
+        evidence: mkEv(`ev-iso-${tag}`, await sha256Hex(`ev-iso-${tag}`)),
+        observations: [{
+          metricId: "gsc.clicks", definitionVersion: "v1",
+          windowStart: "2026-12-07", windowEnd: "2026-12-07", windowTz: "UTC", grain: "daily",
+          dimensions: { page: `/iso/${tag}` }, valueNum: 10,
+          interpretationVersion: "v1", sourceRevision: 1, sourceAsOf: "2026-12-07T00:00:00Z",
+          idempotencyKey: `obs-iso-${tag}`,
+        }],
+      }];
+      // Narrow Alpha creates imp-iso chunk 0
+      assert.equal(
+        (await h.call("POST", "/api/measurement/imports/stage", narrowToken, {
+          tenantId: "tenant-alpha", importId: "imp-iso", chunkIndex: 0, groups: await mkNarrowGroup("site-alpha", "a0"),
+        })).status,
+        201
+      );
+      // Narrow Beta probing chunk 0 (occupied) MUST receive 403 forbidden (NEVER 409!)
+      const betaProbeChunk0 = await h.call("POST", "/api/measurement/imports/stage", narrowBetaToken, {
+        tenantId: "tenant-alpha", importId: "imp-iso", chunkIndex: 0, groups: await mkNarrowGroup("site-beta", "b0"),
+      });
+      assert.equal(betaProbeChunk0.status, 403);
+      assert.equal(await betaProbeChunk0.text(), JSON.stringify({ error: "forbidden" }));
+      // Narrow Beta appending chunk 1 MUST receive 403 forbidden (NEVER 201!)
+      const betaAppendChunk1 = await h.call("POST", "/api/measurement/imports/stage", narrowBetaToken, {
+        tenantId: "tenant-alpha", importId: "imp-iso", chunkIndex: 1, groups: await mkNarrowGroup("site-beta", "b1"),
+      });
+      assert.equal(betaAppendChunk1.status, 403);
+      assert.equal(await betaAppendChunk1.text(), JSON.stringify({ error: "forbidden" }));
+      // Narrow Alpha can STILL commit its own import cleanly!
+      assert.equal(
+        (await h.call("POST", "/api/measurement/imports/imp-iso/commit", narrowToken, {
+          tenantId: "tenant-alpha", expectedChunks: 1,
+        })).status,
+        200
+      );
+      // Narrow Beta probing already-committed import MUST receive 403 forbidden (NEVER 409 already-committed!)
+      const betaProbeCommitted = await h.call("POST", "/api/measurement/imports/stage", narrowBetaToken, {
+        tenantId: "tenant-alpha", importId: "imp-iso", chunkIndex: 0, groups: await mkNarrowGroup("site-beta", "b2"),
+      });
+      assert.equal(betaProbeCommitted.status, 403);
+      assert.equal(await betaProbeCommitted.text(), JSON.stringify({ error: "forbidden" }));
+      // Concurrent race between Narrow Alpha (chunk 0) and Narrow Beta (chunk 1) on same brand-new importId:
+      // EXACTLY ONE gets 201 and the OTHER gets 403 forbidden!
+      const [concIsoA, concIsoB] = await Promise.all([
+        h.call("POST", "/api/measurement/imports/stage", narrowToken, {
+          tenantId: "tenant-alpha", importId: "imp-iso-race", chunkIndex: 0, groups: await mkNarrowGroup("site-alpha", "ra"),
+        }),
+        h.call("POST", "/api/measurement/imports/stage", narrowBetaToken, {
+          tenantId: "tenant-alpha", importId: "imp-iso-race", chunkIndex: 1, groups: await mkNarrowGroup("site-beta", "rb"),
+        }),
+      ]);
+      assert.deepEqual([concIsoA.status, concIsoB.status].sort(), [201, 403]);
+      // Clean up winning staged chunk
+      assert.equal(
+        (await h.call("POST", "/api/measurement/imports/imp-iso-race/abort", h.tokenA, { tenantId: "tenant-alpha" })).status,
+        200
+      );
+
+      // 10k. Exhausted domain UNIQUE contention translates cleanly to 409 ConflictError (NEVER leaks HTTP 500)!
+      const alwaysUniqueContentionDb = {
+        prepare(sql: string) {
+          const stmt = origPrepare(sql);
+          return {
+            bind(...params: any[]) {
+              const bound = stmt.bind(...params);
+              return {
+                first: (...a: any[]) => (bound.first as any)(...a),
+                all: (...a: any[]) => (bound.all as any)(...a),
+                run: (...a: any[]) => (bound.run as any)(...a),
+                _raw: bound,
+                _sql: sql,
+              };
+            },
+            first: (...a: any[]) => (stmt.first as any)(...a),
+            all: (...a: any[]) => (stmt.all as any)(...a),
+            run: (...a: any[]) => (stmt.run as any)(...a),
+          };
+        },
+        async batch(stmts: any[]) {
+          if (stmts.some((s) => typeof s._sql === "string" && s._sql.includes("INSERT INTO ms_observations"))) {
+            throw new Error("UNIQUE constraint failed: ms_evidence.evidence_id");
+          }
+          return origBatch(stmts.map((s) => s._raw ?? s));
+        },
+      };
+      const contentionSvc = new MeasurementService(alwaysUniqueContentionDb as any);
+      const contentionSha = await sha256Hex("ev-contention-409");
+      await assert.rejects(
+        () =>
+          contentionSvc.ingestAtomicBatch({
+            tenantId: "tenant-alpha",
+            groups: [{
+              resourceId: "site-alpha", source: "gsc_export",
+              runId: "run-contention-409", runIdempotencyKey: "idem-contention-409",
+              sourceResourceId: "sc-domain:alpha.test",
+              windowStart: "2026-12-08", windowEnd: "2026-12-08",
+              evidence: mkEv("ev-contention-409", contentionSha),
+              observations: [{
+                metricId: "gsc.clicks", definitionVersion: "v1",
+                windowStart: "2026-12-08", windowEnd: "2026-12-08", windowTz: "UTC", grain: "daily",
+                dimensions: { page: "/contention-409" }, valueNum: 55,
+                interpretationVersion: "v1", sourceRevision: 1, sourceAsOf: "2026-12-08T00:00:00Z",
+                idempotencyKey: "obs-contention-409",
+              }],
+            }],
+          }),
+        (err: any) => err?.status === 409 && /contention/i.test(err?.message || "")
+      );
+
+      // 10l. Workers entrypoint (worker.fetch) auto-upgrades legacy DB (with schema.sql reapplied) cleanly on first request!
+      const workerLegDir = mkdtempSync(join(tmpdir(), "ms-pod-worker-legacy-"));
+      const workerLegDb = new SqliteFileStorage(join(workerLegDir, "worker-legacy.sqlite"));
+      try {
+        workerLegDb.exec(legacySchemaSql);
+        await workerLegDb.batch([
+          workerLegDb.prepare(
+            `INSERT INTO ms_resources (tenant_id, resource_id, entity_urn, resource_type, source_resource_id, active_from, created_at, updated_at)
+             VALUES ('t-wleg', 'site-wleg', 'site:t-wleg:site-wleg', 'site', 'sc-domain:wleg.test', '2026-01-01', 1000, 1000)`
+          ),
+          workerLegDb.prepare(
+            `INSERT INTO ms_definitions (tenant_id, metric_id, version, family, unit, value_type, grain, window_tz, dimensions_schema_json, aggregation_rule, comparability_key, created_at)
+             VALUES ('t-wleg', 'gsc.clicks', 'v1', 'seo', 'count', 'integer', 'daily', 'UTC', '{"page":{"type":"string","required":true}}', 'sum', 'gsc.clicks@v1', 1000)`
+          ),
+          workerLegDb.prepare(
+            `INSERT INTO ms_runs (run_id, tenant_id, resource_id, source, source_resource_id, idempotency_key, request_digest, window_start, window_end, status, created_at, updated_at)
+             VALUES ('run-wleg-1', 't-wleg', 'site-wleg', 'gsc_export', 'sc-domain:wleg.test', 'idem-wleg-1', 'dw1', '2026-11-01', '2026-11-01', 'succeeded', 1000, 1000)`
+          ),
+          workerLegDb.prepare(
+            `INSERT INTO ms_evidence (evidence_id, tenant_id, resource_id, run_id, uri_pointer, sha256, byte_size, media_type, privacy_class, retention_class, collected_at, source_as_of, adapter_name, adapter_version, created_at)
+             VALUES ('ev-wleg-1', 't-wleg', 'site-wleg', 'run-wleg-1', 'fixture://wleg/1', '${await sha256Hex("wleg-1")}', 10, 'application/json', 'internal', '90d', '2026-11-01T00:00:00Z', '2026-11-01T00:00:00Z', 'wleg', '1.0.0', 1000)`
+          ),
+          workerLegDb.prepare(
+            `INSERT INTO ms_observations (
+               obs_id, tenant_id, resource_id, source, run_id, evidence_id,
+               metric_id, definition_version, comparability_key,
+               window_start, window_end, window_tz, grain,
+               dimensions_json, dimensions_hash, value_type, value_num,
+               interpretation_version, source_revision, source_as_of,
+               idempotency_key, payload_digest, created_at
+             ) VALUES ('obs-wleg-1', 't-wleg', 'site-wleg', 'gsc_export', 'run-wleg-1', 'ev-wleg-1',
+               'gsc.clicks', 'v1', 'gsc.clicks@v1',
+               '2026-11-01', '2026-11-01', 'UTC', 'daily',
+               '{"page":"/w1"}', 'hw1', 'integer', 12, 'v1', 1, '2026-11-01T00:00:00Z',
+               'idem-wleg-obs-1', 'pdw1', 1000)`
+          ),
+        ]);
+        // Reapply current schema.sql (does not alter existing ms_observations table)
+        workerLegDb.exec(schemaSql);
+        const wLegToken = "worker-legacy-token";
+        const wLegEnv: Env = {
+          DB: workerLegDb,
+          POD_ID: "measurement-pod",
+          POD_NAME: "Measurement Pod",
+          POD_ROLE: "measurement",
+          POD_LOB: "measurement-evidence",
+          FACTORY_HUB_TOKEN: "wleg-hub",
+          SCOPED_CALLER_GRANTS: JSON.stringify([
+            {
+              callerId: "wleg-caller",
+              tokenSha256: await sha256Hex(wLegToken),
+              grants: [{ tenantId: "t-wleg", resourceIds: ["*"], actions: ["read", "write"] }],
+            },
+          ]),
+        };
+        // Invalid Authorization header MUST return 401 WITHOUT triggering migration on legacy DB!
+        const invalidAuthRes = await worker.fetch(
+          new Request("https://measurement.test/api/measurement/series?tenantId=t-wleg&resourceId=site-wleg&metricId=gsc.clicks", {
+            method: "GET",
+            headers: { Authorization: "Bearer invalid-unauthenticated-token" },
+          }),
+          wLegEnv
+        );
+        assert.equal(invalidAuthRes.status, 401);
+        const preAuthCols = await workerLegDb.prepare("PRAGMA table_info(ms_observations)").all<any>();
+        assert.equal((preAuthCols.results || []).some((c: any) => String(c.name) === "record_seq"), false);
+
+        const wLegRes = await worker.fetch(
+          new Request("https://measurement.test/api/measurement/series?tenantId=t-wleg&resourceId=site-wleg&metricId=gsc.clicks", {
+            method: "GET",
+            headers: { Authorization: `Bearer ${wLegToken}` },
+          }),
+          wLegEnv
+        );
+        assert.equal(wLegRes.status, 200);
+        const wLegBody = (await wLegRes.json()) as any;
+        assert.equal(wLegBody.total, 1);
+        assert.equal(wLegBody.points[0].recordSeq, 1);
+      } finally {
+        workerLegDb.close();
+        rmSync(workerLegDir, { recursive: true, force: true });
+      }
+
+      // 10l-ii. Concurrent independent upgraders (simulating two separate Worker isolates) reconcile cleanly on BOTH ms_observations and pre-generation ms_staged_imports!
+      const concUpgDir = mkdtempSync(join(tmpdir(), "ms-pod-conc-upgrade-"));
+      const concUpgDb = new SqliteFileStorage(join(concUpgDir, "conc-upgrade.sqlite"));
+      try {
+        concUpgDb.exec(legacySchemaSql);
+        concUpgDb.exec(`
+          CREATE TABLE ms_staged_imports (
+            tenant_id TEXT NOT NULL,
+            import_id TEXT NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            resource_ids_json TEXT NOT NULL,
+            groups_json TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (tenant_id, import_id, chunk_index)
+          );
+        `);
+        let obsArrived = 0;
+        let releaseObs!: () => void;
+        const obsBarrier = new Promise<void>((r) => { releaseObs = r; });
+        let stgArrived = 0;
+        let releaseStg!: () => void;
+        const stgBarrier = new Promise<void>((r) => { releaseStg = r; });
+        const makeBarrierDb = () => {
+          const op = concUpgDb.prepare.bind(concUpgDb);
+          const ob = concUpgDb.batch.bind(concUpgDb);
+          return {
+            prepare(sql: string) {
+              const stmt = op(sql);
+              return {
+                bind: (...p: any[]) => {
+                  const b = stmt.bind(...p);
+                  return { first: (...a: any[]) => (b.first as any)(...a), all: (...a: any[]) => (b.all as any)(...a), run: (...a: any[]) => (b.run as any)(...a), _raw: b };
+                },
+                first: (...a: any[]) => (stmt.first as any)(...a),
+                run: (...a: any[]) => (stmt.run as any)(...a),
+                all: async (...a: any[]) => {
+                  const res = await (stmt.all as any)(...a);
+                  if (sql === "PRAGMA table_info(ms_observations)" && !(res.results || []).some((c: any) => c.name === "record_seq")) {
+                    obsArrived += 1;
+                    if (obsArrived === 2) releaseObs();
+                    await obsBarrier;
+                  }
+                  if (sql === "PRAGMA table_info(ms_staged_imports)" && !(res.results || []).some((c: any) => c.name === "generation_id")) {
+                    stgArrived += 1;
+                    if (stgArrived === 2) releaseStg();
+                    await stgBarrier;
+                  }
+                  return res;
+                },
+                _raw: stmt,
+              };
+            },
+            batch: (stmts: any[]) => ob(stmts.map((s) => s._raw ?? s)),
+          };
+        };
+        const [upgA, upgB] = await Promise.all([
+          ensureMeasurementSchemaUpgraded(makeBarrierDb() as any),
+          ensureMeasurementSchemaUpgraded(makeBarrierDb() as any),
+        ]);
+        assert.deepEqual([upgA.migratedObservations, upgB.migratedObservations].sort(), [false, true]);
+        assert.deepEqual([upgA.migratedStagedImports, upgB.migratedStagedImports].sort(), [false, true]);
+        const finalStagedCols = await concUpgDb.prepare("PRAGMA table_info(ms_staged_imports)").all<any>();
+        assert.equal((finalStagedCols.results || []).some((c: any) => String(c.name) === "generation_id"), true);
+      } finally {
+        concUpgDb.close();
+        rmSync(concUpgDir, { recursive: true, force: true });
+      }
+
+      // 10m. Revoked caller grant CANNOT append to existing import; pre-session staged import is quarantined against claiming!
+      const mutableToken = "mutable-grant-caller-token";
+      const baseGrantsSnapshot = JSON.parse(h.env.SCOPED_CALLER_GRANTS || "[]");
+      h.env.SCOPED_CALLER_GRANTS = JSON.stringify([
+        ...baseGrantsSnapshot,
+        {
+          callerId: "mutable-caller",
+          tokenSha256: await sha256Hex(mutableToken),
+          grants: [{ tenantId: "tenant-alpha", resourceIds: ["site-alpha"], actions: ["read", "write"] }],
+        },
+      ]);
+      assert.equal(
+        (await h.call("POST", "/api/measurement/imports/stage", mutableToken, {
+          tenantId: "tenant-alpha", importId: "imp-revoked", chunkIndex: 0, groups: await mkNarrowGroup("site-alpha", "rev0"),
+        })).status,
+        201
+      );
+      // Change mutable-caller's grants from site-alpha to site-beta only!
+      h.env.SCOPED_CALLER_GRANTS = JSON.stringify([
+        ...baseGrantsSnapshot,
+        {
+          callerId: "mutable-caller",
+          tokenSha256: await sha256Hex(mutableToken),
+          grants: [{ tenantId: "tenant-alpha", resourceIds: ["site-beta"], actions: ["read", "write"] }],
+        },
+      ]);
+      const appendAfterRevoke = await h.call("POST", "/api/measurement/imports/stage", mutableToken, {
+        tenantId: "tenant-alpha", importId: "imp-revoked", chunkIndex: 1, groups: await mkNarrowGroup("site-beta", "rev1"),
+      });
+      assert.equal(appendAfterRevoke.status, 403);
+      assert.equal(await appendAfterRevoke.text(), JSON.stringify({ error: "forbidden" }));
+      assert.equal((await h.call("POST", "/api/measurement/imports/imp-revoked/abort", h.tokenA, { tenantId: "tenant-alpha" })).status, 200);
+      h.env.SCOPED_CALLER_GRANTS = JSON.stringify(baseGrantsSnapshot);
+
+      // Pre-session staged import (no session row) -> quarantined on upgrade AND blocked directly against sibling claiming!
+      const preSessionGroups = await mkNarrowGroup("site-alpha", "presess");
+      await h.db
+        .prepare(
+          `INSERT INTO ms_staged_imports (tenant_id, import_id, chunk_index, generation_id, resource_ids_json, groups_json, created_at)
+           VALUES (?, ?, 0, 'gen-presess', ?, ?, ?)`
+        )
+        .bind("tenant-alpha", "imp-presess", JSON.stringify(["site-alpha"]), JSON.stringify(preSessionGroups), Date.now())
+        .run();
+      await ensureMeasurementSchemaUpgraded(h.db);
+      const siblingClaimPreSess = await h.call("POST", "/api/measurement/imports/stage", narrowBetaToken, {
+        tenantId: "tenant-alpha", importId: "imp-presess", chunkIndex: 1, groups: await mkNarrowGroup("site-beta", "presess-b"),
+      });
+      assert.equal(siblingClaimPreSess.status, 403);
+      assert.equal(await siblingClaimPreSess.text(), JSON.stringify({ error: "forbidden" }));
+      assert.equal((await h.call("POST", "/api/measurement/imports/imp-presess/abort", h.tokenA, { tenantId: "tenant-alpha" })).status, 200);
+
+      // 10n. Concurrent abort between sibling's denied insert and post-denial lookup STILL returns uniform 403 forbidden (NEVER 409)!
+      await h.call("POST", "/api/measurement/imports/stage", narrowToken, {
+        tenantId: "tenant-alpha", importId: "imp-vanish", chunkIndex: 0, groups: await mkNarrowGroup("site-alpha", "van0"),
+      });
+      let injectedAbortOnVanish = false;
+      const vanishDb = {
+        prepare(sql: string) {
+          const stmt = origPrepare(sql);
+          return {
+            bind(...params: any[]) {
+              const bound = stmt.bind(...params);
+              return {
+                first: (...a: any[]) => (bound.first as any)(...a),
+                all: (...a: any[]) => (bound.all as any)(...a),
+                run: (...a: any[]) => (bound.run as any)(...a),
+                _raw: bound,
+                _sql: sql,
+              };
+            },
+            first: (...a: any[]) => (stmt.first as any)(...a),
+            all: (...a: any[]) => (stmt.all as any)(...a),
+            run: (...a: any[]) => (stmt.run as any)(...a),
+          };
+        },
+        async batch(stmts: any[]) {
+          // Simulate sibling's initial snapshot seeing empty state (concurrent with owner),
+          // then owner already holds session during sibling's INSERT -> changes=0 -> owner aborts immediately!
+          const isInitialRead =
+            !injectedAbortOnVanish &&
+            stmts.length === 3 &&
+            stmts.some((s) => typeof s._sql === "string" && s._sql.includes("FROM ms_staged_import_sessions"));
+          if (isInitialRead) {
+            return [{ results: [] }, { results: [] }, { results: [] }];
+          }
+          const res = await origBatch(stmts.map((s) => s._raw ?? s));
+          if (
+            !injectedAbortOnVanish &&
+            stmts.some((s) => typeof s._sql === "string" && s._sql.includes("INSERT OR IGNORE INTO ms_staged_imports"))
+          ) {
+            injectedAbortOnVanish = true;
+            await baseSvc.abortStagedImport("tenant-alpha", "imp-vanish");
+          }
+          return res;
+        },
+      };
+      const vanishSvc = new MeasurementService(vanishDb as any);
+      await assert.rejects(
+        () =>
+          vanishSvc.stageImportChunk(
+            {
+              tenantId: "tenant-alpha",
+              importId: "imp-vanish",
+              chunkIndex: 1,
+              groups: preSessionGroups.map((g) => ({ ...g, resourceId: "site-beta" })),
+            },
+            Date.now(),
+            {
+              callerId: "narrow-beta-only",
+              authorizeResourceWrite: (rid: string) => {
+                if (rid !== "site-beta") throw new Error("forbidden");
+              },
+            }
+          ),
+        (err: any) => err?.message === "forbidden"
+      );
+
+      // 10o. Bounded sharded completion receipts: 7,000 single-obs groups with long IDs stay <= 500 KB per row (well under D1's 2 MB limit) and replay identically!
+      const longPrefix = "r".repeat(90);
+      const longEvPrefix = "e".repeat(90);
+      const sharedBigSha = await sha256Hex("big-receipt-shared");
+      for (let c = 0; c < 7; c++) {
+        const chunkGroups = Array.from({ length: 1000 }, (_, i) => {
+          const n = c * 1000 + i;
+          return {
+            resourceId: "site-alpha",
+            source: "gsc_export",
+            runId: `${longPrefix}-${n}`,
+            runIdempotencyKey: `idem-${longPrefix}-${n}`,
+            sourceResourceId: "sc-domain:alpha.test",
+            windowStart: "2026-12-10",
+            windowEnd: "2026-12-10",
+            evidence: mkEv(`${longEvPrefix}-${n}`, sharedBigSha),
+            observations: [{
+              metricId: "gsc.clicks",
+              definitionVersion: "v1",
+              windowStart: "2026-12-10",
+              windowEnd: "2026-12-10",
+              windowTz: "UTC",
+              grain: "daily",
+              dimensions: { page: `/bigrcpt/${n}` },
+              valueNum: n,
+              interpretationVersion: "v1",
+              sourceRevision: 1,
+              sourceAsOf: "2026-12-10T00:00:00Z",
+              idempotencyKey: `obs-bigrcpt-${n}`,
+            }],
+          };
+        });
+        const stBig = await baseSvc.stageImportChunk({
+          tenantId: "tenant-alpha",
+          importId: "imp-big-receipt",
+          chunkIndex: c,
+          groups: chunkGroups,
+        });
+        assert.equal(stBig.existing, false);
+      }
+      const bigCommitRes = await baseSvc.commitStagedImport({
+        tenantId: "tenant-alpha",
+        importId: "imp-big-receipt",
+        expectedChunks: 7,
+      });
+      assert.equal(bigCommitRes.inserted, 7000);
+      assert.equal(bigCommitRes.groups.length, 7000);
+      const bigReceiptHeader = await h.db
+        .prepare("SELECT resource_ids_json, result_json FROM ms_staged_import_receipts WHERE tenant_id = ? AND import_id = ?")
+        .bind("tenant-alpha", "imp-big-receipt")
+        .first<any>();
+      assert.ok(bigReceiptHeader);
+      assert.ok(new TextEncoder().encode(String(bigReceiptHeader.result_json)).byteLength < 200);
+      const bigReceiptParts = await h.db
+        .prepare("SELECT part_index, resource_ids_json, groups_json FROM ms_staged_import_receipt_chunks WHERE tenant_id = ? AND import_id = ? ORDER BY part_index ASC")
+        .bind("tenant-alpha", "imp-big-receipt")
+        .all<any>();
+      const partsList = bigReceiptParts.results || [];
+      assert.ok(partsList.length >= 4, `Expected >= 4 bounded receipt parts for 7,000 long-ID groups, got ${partsList.length}`);
+      for (const part of partsList) {
+        const rowBytes =
+          new TextEncoder().encode("tenant-alpha").byteLength +
+          new TextEncoder().encode("imp-big-receipt").byteLength +
+          new TextEncoder().encode(String(part.resource_ids_json)).byteLength +
+          new TextEncoder().encode(String(part.groups_json)).byteLength;
+        assert.ok(rowBytes <= 500_000, `Receipt part ${part.part_index} exceeded 500 KB bound: ${rowBytes}`);
+      }
+      // Replay via sharded receipt returns exact 7,000 replayed groups and enforces narrow-caller authorization!
+      const bigReplay = await baseSvc.commitStagedImport({
+        tenantId: "tenant-alpha",
+        importId: "imp-big-receipt",
+        expectedChunks: 7,
+      });
+      assert.equal(bigReplay.inserted, 0);
+      assert.equal(bigReplay.replayedNoop, 7000);
+      assert.equal(bigReplay.groups.length, 7000);
+      const narrowBigReplayDenied = await h.call("POST", "/api/measurement/imports/imp-big-receipt/commit", narrowBetaToken, {
+        tenantId: "tenant-alpha",
+        expectedChunks: 7,
+      });
+      assert.equal(narrowBigReplayDenied.status, 403);
+      assert.equal(await narrowBigReplayDenied.text(), JSON.stringify({ error: "forbidden" }));
+
+      // 10p. Paged staged-import reads (>16 chunks): commit fetches <= 16 groups_json rows per query AND abort NEVER selects groups_json!
+      for (let c = 0; c < 20; c++) {
+        await baseSvc.stageImportChunk({
+          tenantId: "tenant-alpha",
+          importId: "imp-paged-20",
+          chunkIndex: c,
+          groups: await mkNarrowGroup("site-alpha", `pg20-${c}`),
+        });
+      }
+      let maxGroupsJsonPerQuery = 0;
+      const pagedInspectorDb = {
+        prepare(sql: string) {
+          const stmt = origPrepare(sql);
+          const wrapRes = (res: any) => {
+            if (Array.isArray(res?.results)) {
+              const nonNullGroups = res.results.filter((r: any) => r && r.groups_json !== undefined && r.groups_json !== null).length;
+              if (nonNullGroups > maxGroupsJsonPerQuery) maxGroupsJsonPerQuery = nonNullGroups;
+            }
+            return res;
+          };
+          return {
+            bind(...params: any[]) {
+              const bound = stmt.bind(...params);
+              return {
+                first: (...a: any[]) => (bound.first as any)(...a),
+                all: async (...a: any[]) => wrapRes(await (bound.all as any)(...a)),
+                run: (...a: any[]) => (bound.run as any)(...a),
+                _raw: bound,
+                _sql: sql,
+              };
+            },
+            first: (...a: any[]) => (stmt.first as any)(...a),
+            all: async (...a: any[]) => wrapRes(await (stmt.all as any)(...a)),
+            run: (...a: any[]) => (stmt.run as any)(...a),
+          };
+        },
+        async batch(stmts: any[]) {
+          const results = await origBatch(stmts.map((s) => s._raw ?? s));
+          for (const res of results) {
+            if (Array.isArray(res?.results)) {
+              const nonNullGroups = res.results.filter((r: any) => r && r.groups_json !== undefined && r.groups_json !== null).length;
+              if (nonNullGroups > maxGroupsJsonPerQuery) maxGroupsJsonPerQuery = nonNullGroups;
+            }
+          }
+          return results;
+        },
+      };
+      const pagedCommit = await new MeasurementService(pagedInspectorDb as any).commitStagedImport({
+        tenantId: "tenant-alpha",
+        importId: "imp-paged-20",
+        expectedChunks: 20,
+      });
+      assert.equal(pagedCommit.inserted, 20);
+      assert.ok(maxGroupsJsonPerQuery <= 16, `Expected <= 16 groups_json rows per query, got ${maxGroupsJsonPerQuery}`);
+
+      // Concurrent 20-chunk commit spanning page 2: winner commits & cleans up before loser reads page 2 -> loser reconciles cleanly to 200 idempotent replay!
+      for (let c = 0; c < 20; c++) {
+        await baseSvc.stageImportChunk({
+          tenantId: "tenant-alpha",
+          importId: "imp-paged-conc-20",
+          chunkIndex: c,
+          groups: await mkNarrowGroup("site-alpha", `pgc20-${c}`),
+        });
+      }
+      let winnerRanBeforePage2 = false;
+      let winnerOut: any = null;
+      const pagedRaceDb = {
+        prepare(sql: string) {
+          const stmt = origPrepare(sql);
+          return {
+            bind(...params: any[]) {
+              const bound = stmt.bind(...params);
+              return {
+                first: (...a: any[]) => (bound.first as any)(...a),
+                all: async (...a: any[]) => {
+                  if (!winnerRanBeforePage2 && sql.includes("chunk_index >= ? AND chunk_index < ?")) {
+                    winnerRanBeforePage2 = true;
+                    winnerOut = await baseSvc.commitStagedImport({
+                      tenantId: "tenant-alpha",
+                      importId: "imp-paged-conc-20",
+                      expectedChunks: 20,
+                    });
+                  }
+                  return (bound.all as any)(...a);
+                },
+                run: (...a: any[]) => (bound.run as any)(...a),
+                _raw: bound,
+              };
+            },
+            first: (...a: any[]) => (stmt.first as any)(...a),
+            all: (...a: any[]) => (stmt.all as any)(...a),
+            run: (...a: any[]) => (stmt.run as any)(...a),
+          };
+        },
+        batch: (stmts: any[]) => origBatch(stmts.map((s) => s._raw ?? s)),
+      };
+      const pagedLoserOut = await new MeasurementService(pagedRaceDb as any).commitStagedImport({
+        tenantId: "tenant-alpha",
+        importId: "imp-paged-conc-20",
+        expectedChunks: 20,
+      });
+      assert.equal(winnerOut.inserted, 20);
+      assert.equal(pagedLoserOut.inserted, 0);
+      assert.equal(pagedLoserOut.replayedNoop, 20);
+      assert.equal(pagedLoserOut.groups.length, 20);
+
+      // Abort NEVER selects groups_json at all even for 20 staged chunks!
+      for (let c = 0; c < 20; c++) {
+        await baseSvc.stageImportChunk({
+          tenantId: "tenant-alpha",
+          importId: "imp-abort-20",
+          chunkIndex: c,
+          groups: await mkNarrowGroup("site-alpha", `ab20-${c}`),
+        });
+      }
+      let abortSelectedGroupsJson = false;
+      const abortInspectorDb = {
+        prepare(sql: string) {
+          if (sql.includes("groups_json")) abortSelectedGroupsJson = true;
+          return origPrepare(sql);
+        },
+        batch: (stmts: any[]) => origBatch(stmts),
+      };
+      const abort20Res = await new MeasurementService(abortInspectorDb as any).abortStagedImport("tenant-alpha", "imp-abort-20");
+      assert.equal(abort20Res.discardedChunks, 20);
+      assert.equal(abortSelectedGroupsJson, false);
     } finally {
       h.cleanup();
     }

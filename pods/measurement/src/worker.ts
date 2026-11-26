@@ -10,7 +10,14 @@ import { TincanClient } from "@futr-work/pod-kernel/tincan";
 import { loadPodConfig } from "./config.js";
 import { activeHandler } from "./handler.js";
 import { createMeasurementMcpHandler } from "./mcp.js";
-import { ConflictError, MeasurementService, NotFoundError, ValidationError } from "./service.js";
+import {
+  ConflictError,
+  ensureMeasurementSchemaUpgraded,
+  ForbiddenError,
+  MeasurementService,
+  NotFoundError,
+  ValidationError,
+} from "./service.js";
 import { renderPodUiHtml } from "./ui.js";
 import type { TaskRecord } from "./types.js";
 
@@ -40,8 +47,39 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
+const upgradedDbs = new WeakMap<object, Promise<unknown>>();
+
+async function ensureDbReady(rawDb: unknown, storage: PodStorage): Promise<void> {
+  if (!rawDb || (typeof rawDb !== "object" && typeof rawDb !== "function")) {
+    await ensureMeasurementSchemaUpgraded(storage);
+    return;
+  }
+  let pending = upgradedDbs.get(rawDb as object);
+  if (!pending) {
+    pending = ensureMeasurementSchemaUpgraded(storage).catch((err) => {
+      upgradedDbs.delete(rawDb as object);
+      throw err;
+    });
+    upgradedDbs.set(rawDb as object, pending);
+  }
+  await pending;
+}
+
+function hasAnyTenantWriteGrant(
+  caller: { grants: Array<{ tenantId: string; resourceIds: string[]; actions: string[] }> },
+  tenantId: string
+): boolean {
+  return caller.grants.some(
+    (g) =>
+      g.tenantId === tenantId &&
+      g.resourceIds.length > 0 &&
+      (g.actions.includes("*") || g.actions.includes("write"))
+  );
+}
+
 function errorResponse(err: unknown): Response {
   if (err instanceof ValidationError) return jsonResponse({ error: err.message }, 400);
+  if (err instanceof ForbiddenError) return jsonResponse({ error: err.message }, 403);
   if (err instanceof ConflictError) return jsonResponse({ error: err.message }, 409);
   if (err instanceof NotFoundError) return jsonResponse({ error: err.message }, 404);
   const message = err instanceof Error ? err.message : "Internal error";
@@ -108,6 +146,19 @@ export default {
     //    Authenticated strictly via scoped caller credentials (never accepts ungranted shared hub token).
     if (url.pathname.startsWith("/api/measurement/")) {
       try {
+        const preAuthCallers = parseScopedCallerGrants(env.SCOPED_CALLER_GRANTS);
+        const preAuthCaller = await resolveScopedCaller(request, preAuthCallers);
+        if (!preAuthCaller) {
+          return new Response(JSON.stringify({ error: "unauthorized" }), {
+            status: 401,
+            headers: {
+              ...CORS_HEADERS,
+              "Content-Type": "application/json",
+              "WWW-Authenticate": 'Basic realm="measurement-pod"',
+            },
+          });
+        }
+        await ensureDbReady(env.DB, db);
         // POST /api/measurement/resources
         if (method === "POST" && url.pathname === "/api/measurement/resources") {
           const body = await parseJsonBody(request);
@@ -200,7 +251,7 @@ export default {
           return jsonResponse(result, 200);
         }
 
-        // POST /api/measurement/ingest-atomic (multi-group / up to 1,000 observations in one atomic transaction)
+        // POST /api/measurement/ingest-atomic (multi-group / up to 1,000 observations and 1,000 groups in one atomic transaction)
         if (method === "POST" && url.pathname === "/api/measurement/ingest-atomic") {
           const body = await parseJsonBody(request);
           const tenantId = typeof body.tenantId === "string" ? body.tenantId.trim() : "";
@@ -210,10 +261,13 @@ export default {
           if (!tenantId) {
             return jsonResponse({ error: "Field 'tenantId' must be a non-empty string" }, 400);
           }
-          if (!Array.isArray(body.groups) || body.groups.length === 0 || body.groups.length > 100) {
+          if (!hasAnyTenantWriteGrant(caller, tenantId)) {
+            return jsonResponse({ error: "forbidden" }, 403);
+          }
+          if (!Array.isArray(body.groups) || body.groups.length === 0 || body.groups.length > 1000) {
             const tenantDenied = authorizeScopedCaller(caller, { tenantId, resourceId: "*", action: "write" }, "measurement-pod");
             if (tenantDenied) return tenantDenied;
-            return jsonResponse({ error: "Field 'groups' must contain 1 to 100 items" }, 400);
+            return jsonResponse({ error: "Field 'groups' must contain 1 to 1000 items" }, 400);
           }
           const uniqueResourceIds = new Set<string>();
           for (let i = 0; i < body.groups.length; i++) {
@@ -232,6 +286,106 @@ export default {
             if (denied) return denied;
           }
           const result = await service.ingestAtomicBatch(body as any);
+          return jsonResponse(result, 200);
+        }
+
+        // POST /api/measurement/imports/stage (stage an invisible chunk for all-or-nothing atomic finalization up to 20,000 obs)
+        if (method === "POST" && url.pathname === "/api/measurement/imports/stage") {
+          const body = await parseJsonBody(request);
+          const tenantId = typeof body.tenantId === "string" ? body.tenantId.trim() : "";
+          const configured = parseScopedCallerGrants(env.SCOPED_CALLER_GRANTS);
+          const caller = await resolveScopedCaller(request, configured);
+          if (!caller) return jsonResponse({ error: "unauthorized" }, 401);
+          if (!tenantId) {
+            return jsonResponse({ error: "Field 'tenantId' must be a non-empty string" }, 400);
+          }
+          if (!hasAnyTenantWriteGrant(caller, tenantId)) {
+            return jsonResponse({ error: "forbidden" }, 403);
+          }
+          if (!Array.isArray(body.groups) || body.groups.length === 0 || body.groups.length > 1000) {
+            const tenantDenied = authorizeScopedCaller(caller, { tenantId, resourceId: "*", action: "write" }, "measurement-pod");
+            if (tenantDenied) return tenantDenied;
+            return jsonResponse({ error: "Field 'groups' must contain 1 to 1000 items" }, 400);
+          }
+          const uniqueResourceIds = new Set<string>();
+          for (let i = 0; i < body.groups.length; i++) {
+            const g = body.groups[i];
+            if (!g || typeof g !== "object" || Array.isArray(g)) {
+              return jsonResponse({ error: `groups[${i}] must be a JSON object` }, 400);
+            }
+            const rid = typeof g.resourceId === "string" ? g.resourceId.trim() : "";
+            if (!rid) {
+              return jsonResponse({ error: `groups[${i}].resourceId must be a non-empty string` }, 400);
+            }
+            uniqueResourceIds.add(rid);
+          }
+          for (const rid of uniqueResourceIds) {
+            const denied = authorizeScopedCaller(caller, { tenantId, resourceId: rid, action: "write" }, "measurement-pod");
+            if (denied) return denied;
+          }
+          const result = await service.stageImportChunk(body as any, Date.now(), {
+            callerId: caller.callerId,
+            authorizeResourceWrite: (rid: string) => {
+              const denied = authorizeScopedCaller(caller, { tenantId, resourceId: rid, action: "write" }, "measurement-pod");
+              if (denied) throw new ForbiddenError("forbidden");
+            },
+          });
+          return jsonResponse(result, result.existing ? 200 : 201);
+        }
+
+        // POST /api/measurement/imports/:importId/commit (authorizes and commits the EXACT same read snapshot atomically)
+        const commitImportMatch = url.pathname.match(/^\/api\/measurement\/imports\/([^/]+)\/commit$/);
+        if (method === "POST" && commitImportMatch) {
+          const importId = decodeURIComponent(commitImportMatch[1]);
+          const body = await parseJsonBody(request);
+          const tenantId = typeof body.tenantId === "string" ? body.tenantId.trim() : "";
+          const configured = parseScopedCallerGrants(env.SCOPED_CALLER_GRANTS);
+          const caller = await resolveScopedCaller(request, configured);
+          if (!caller) return jsonResponse({ error: "unauthorized" }, 401);
+          if (!tenantId) {
+            return jsonResponse({ error: "Field 'tenantId' must be a non-empty string" }, 400);
+          }
+          if (!hasAnyTenantWriteGrant(caller, tenantId)) {
+            return jsonResponse({ error: "forbidden" }, 403);
+          }
+          const result = await service.commitStagedImport(
+            {
+              tenantId,
+              importId,
+              expectedChunks: body.expectedChunks,
+            },
+            Date.now(),
+            {
+              authorizeResourceWrite: (rid: string) => {
+                const denied = authorizeScopedCaller(caller, { tenantId, resourceId: rid, action: "write" }, "measurement-pod");
+                if (denied) throw new ForbiddenError("forbidden");
+              },
+            }
+          );
+          return jsonResponse(result, 200);
+        }
+
+        // POST /api/measurement/imports/:importId/abort (authorizes and discards ONLY the exact authorized snapshot rows)
+        const abortImportMatch = url.pathname.match(/^\/api\/measurement\/imports\/([^/]+)\/abort$/);
+        if (method === "POST" && abortImportMatch) {
+          const importId = decodeURIComponent(abortImportMatch[1]);
+          const body = await parseJsonBody(request);
+          const tenantId = typeof body.tenantId === "string" ? body.tenantId.trim() : "";
+          const configured = parseScopedCallerGrants(env.SCOPED_CALLER_GRANTS);
+          const caller = await resolveScopedCaller(request, configured);
+          if (!caller) return jsonResponse({ error: "unauthorized" }, 401);
+          if (!tenantId) {
+            return jsonResponse({ error: "Field 'tenantId' must be a non-empty string" }, 400);
+          }
+          if (!hasAnyTenantWriteGrant(caller, tenantId)) {
+            return jsonResponse({ error: "forbidden" }, 403);
+          }
+          const result = await service.abortStagedImport(tenantId, importId, {
+            authorizeResourceWrite: (rid: string) => {
+              const denied = authorizeScopedCaller(caller, { tenantId, resourceId: rid, action: "write" }, "measurement-pod");
+              if (denied) throw new ForbiddenError("forbidden");
+            },
+          });
           return jsonResponse(result, 200);
         }
 
@@ -344,6 +498,11 @@ export default {
           const scoped = await resolveScopedCaller(request, configured);
           if (!scoped) return hubDenied;
         }
+        try {
+          await ensureDbReady(env.DB, db);
+        } catch (err) {
+          return errorResponse(err);
+        }
       }
       const mcpHandler = createMeasurementMcpHandler(env as any, config);
       return mcpHandler(request, env, ctx);
@@ -382,6 +541,7 @@ export default {
           action: requiredAction,
         });
         if (taskDenied) return taskDenied;
+        await ensureDbReady(env.DB, db);
 
         const normalizedSpec = { action, payload: normalizedPayload };
         const now = Date.now();
@@ -441,6 +601,11 @@ export default {
     // 4. Operator Cockpit & Hub Mesh routes — protected by shared kernel authGate
     const denied = authGate(request, env as any, "measurement-pod");
     if (denied) return denied;
+    try {
+      await ensureDbReady(env.DB, db);
+    } catch (err) {
+      return errorResponse(err);
+    }
 
     const tincan = new TincanClient(config, env.FACTORY_HUB);
 

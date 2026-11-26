@@ -158,7 +158,8 @@ CREATE TABLE IF NOT EXISTS ms_evidence (
 
 -- 5. Append-Only Typed Observations & Source Revisions
 CREATE TABLE IF NOT EXISTS ms_observations (
-  obs_id TEXT PRIMARY KEY,
+  record_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  obs_id TEXT NOT NULL UNIQUE,
   tenant_id TEXT NOT NULL,
   resource_id TEXT NOT NULL,
   source TEXT NOT NULL,
@@ -262,6 +263,54 @@ CREATE TABLE IF NOT EXISTS ms_events (
   event_type TEXT NOT NULL CHECK (event_type IN ('resource.registered', 'run.updated', 'observation.recorded', 'coverage.updated', 'annotation.recorded')),
   payload_json TEXT NOT NULL,
   created_at INTEGER NOT NULL
+);
+
+-- 9. Invisible Staged Multi-Chunk Imports (committed all-or-nothing in one atomic transaction)
+CREATE TABLE IF NOT EXISTS ms_schema_migrations (
+  migration_id TEXT PRIMARY KEY,
+  applied_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ms_staged_import_sessions (
+  tenant_id TEXT NOT NULL,
+  import_id TEXT NOT NULL,
+  owner_caller_id TEXT NOT NULL,
+  session_token TEXT NOT NULL,
+  resource_ids_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (tenant_id, import_id)
+);
+
+CREATE TABLE IF NOT EXISTS ms_staged_imports (
+  tenant_id TEXT NOT NULL,
+  import_id TEXT NOT NULL,
+  chunk_index INTEGER NOT NULL,
+  generation_id TEXT NOT NULL,
+  resource_ids_json TEXT NOT NULL,
+  groups_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (tenant_id, import_id, chunk_index)
+);
+
+-- 9b. Durable Staged Import Finalization Receipts (idempotent replay & atomic commit arbitration)
+CREATE TABLE IF NOT EXISTS ms_staged_import_receipts (
+  tenant_id TEXT NOT NULL,
+  import_id TEXT NOT NULL,
+  payload_digest TEXT NOT NULL,
+  expected_chunks INTEGER NOT NULL,
+  resource_ids_json TEXT NOT NULL,
+  result_json TEXT NOT NULL,
+  committed_at INTEGER NOT NULL,
+  PRIMARY KEY (tenant_id, import_id)
+);
+
+CREATE TABLE IF NOT EXISTS ms_staged_import_receipt_chunks (
+  tenant_id TEXT NOT NULL,
+  import_id TEXT NOT NULL,
+  part_index INTEGER NOT NULL,
+  resource_ids_json TEXT NOT NULL,
+  groups_json TEXT NOT NULL,
+  PRIMARY KEY (tenant_id, import_id, part_index)
 );
 
 -- Indexes for bounded paginated queries & capacity floor

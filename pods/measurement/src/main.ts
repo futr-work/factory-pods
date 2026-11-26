@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { SqliteFileStorage } from "@futr-work/pod-kernel/storage/sqlite";
+import { ensureMeasurementSchemaUpgraded } from "./service.js";
 import worker, { type Env } from "./worker.js";
 
 export interface LocalRuntimeOptions {
@@ -59,6 +60,7 @@ export async function startLocalMeasurementPod(options: LocalRuntimeOptions = {}
   const here = dirname(fileURLToPath(import.meta.url));
   const schemaPath = join(here, "..", "schema.sql");
   db.exec(readFileSync(schemaPath, "utf8"));
+  await ensureMeasurementSchemaUpgraded(db);
 
   const runtimeEnv: Env = {
     DB: db,
