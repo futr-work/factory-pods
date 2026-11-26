@@ -270,7 +270,8 @@ CREATE TABLE IF NOT EXISTS ms_staged_import_sessions (
   tenant_id TEXT NOT NULL,
   import_id TEXT NOT NULL,
   owner_caller_id TEXT NOT NULL,
-  seed_resource_ids_json TEXT NOT NULL,
+  session_token TEXT NOT NULL,
+  resource_ids_json TEXT NOT NULL,
   created_at INTEGER NOT NULL,
   PRIMARY KEY (tenant_id, import_id)
 );

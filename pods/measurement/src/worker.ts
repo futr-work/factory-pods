@@ -10,7 +10,14 @@ import { TincanClient } from "@futr-work/pod-kernel/tincan";
 import { loadPodConfig } from "./config.js";
 import { activeHandler } from "./handler.js";
 import { createMeasurementMcpHandler } from "./mcp.js";
-import { ConflictError, ForbiddenError, MeasurementService, NotFoundError, ValidationError } from "./service.js";
+import {
+  ConflictError,
+  ensureMeasurementSchemaUpgraded,
+  ForbiddenError,
+  MeasurementService,
+  NotFoundError,
+  ValidationError,
+} from "./service.js";
 import { renderPodUiHtml } from "./ui.js";
 import type { TaskRecord } from "./types.js";
 
@@ -38,6 +45,24 @@ function jsonResponse(body: unknown, status = 200): Response {
     status,
     headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
   });
+}
+
+const upgradedDbs = new WeakMap<object, Promise<unknown>>();
+
+async function ensureDbReady(rawDb: unknown, storage: PodStorage): Promise<void> {
+  if (!rawDb || (typeof rawDb !== "object" && typeof rawDb !== "function")) {
+    await ensureMeasurementSchemaUpgraded(storage);
+    return;
+  }
+  let pending = upgradedDbs.get(rawDb as object);
+  if (!pending) {
+    pending = ensureMeasurementSchemaUpgraded(storage).catch((err) => {
+      upgradedDbs.delete(rawDb as object);
+      throw err;
+    });
+    upgradedDbs.set(rawDb as object, pending);
+  }
+  await pending;
 }
 
 function hasAnyTenantWriteGrant(
@@ -115,6 +140,9 @@ export default {
     }
 
     const db: PodStorage = toPodStorage(env.DB);
+    if (request.headers.has("Authorization")) {
+      await ensureDbReady(env.DB, db);
+    }
     const service = new MeasurementService(db);
 
     // 2. Scoped measurement REST & Worldview projection API (/api/measurement/*)

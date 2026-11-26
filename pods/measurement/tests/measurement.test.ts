@@ -2459,6 +2459,194 @@ describe("Measurement Pod — Typed 4-Family Vertical Slice, Isolation, MCP v2 +
           }),
         (err: any) => err?.status === 409 && /contention/i.test(err?.message || "")
       );
+
+      // 10l. Workers entrypoint (worker.fetch) auto-upgrades legacy DB (with schema.sql reapplied) cleanly on first request!
+      const workerLegDir = mkdtempSync(join(tmpdir(), "ms-pod-worker-legacy-"));
+      const workerLegDb = new SqliteFileStorage(join(workerLegDir, "worker-legacy.sqlite"));
+      try {
+        workerLegDb.exec(legacySchemaSql);
+        await workerLegDb.batch([
+          workerLegDb.prepare(
+            `INSERT INTO ms_resources (tenant_id, resource_id, entity_urn, resource_type, source_resource_id, active_from, created_at, updated_at)
+             VALUES ('t-wleg', 'site-wleg', 'site:t-wleg:site-wleg', 'site', 'sc-domain:wleg.test', '2026-01-01', 1000, 1000)`
+          ),
+          workerLegDb.prepare(
+            `INSERT INTO ms_definitions (tenant_id, metric_id, version, family, unit, value_type, grain, window_tz, dimensions_schema_json, aggregation_rule, comparability_key, created_at)
+             VALUES ('t-wleg', 'gsc.clicks', 'v1', 'seo', 'count', 'integer', 'daily', 'UTC', '{"page":{"type":"string","required":true}}', 'sum', 'gsc.clicks@v1', 1000)`
+          ),
+          workerLegDb.prepare(
+            `INSERT INTO ms_runs (run_id, tenant_id, resource_id, source, source_resource_id, idempotency_key, request_digest, window_start, window_end, status, created_at, updated_at)
+             VALUES ('run-wleg-1', 't-wleg', 'site-wleg', 'gsc_export', 'sc-domain:wleg.test', 'idem-wleg-1', 'dw1', '2026-11-01', '2026-11-01', 'succeeded', 1000, 1000)`
+          ),
+          workerLegDb.prepare(
+            `INSERT INTO ms_evidence (evidence_id, tenant_id, resource_id, run_id, uri_pointer, sha256, byte_size, media_type, privacy_class, retention_class, collected_at, source_as_of, adapter_name, adapter_version, created_at)
+             VALUES ('ev-wleg-1', 't-wleg', 'site-wleg', 'run-wleg-1', 'fixture://wleg/1', '${await sha256Hex("wleg-1")}', 10, 'application/json', 'internal', '90d', '2026-11-01T00:00:00Z', '2026-11-01T00:00:00Z', 'wleg', '1.0.0', 1000)`
+          ),
+          workerLegDb.prepare(
+            `INSERT INTO ms_observations (
+               obs_id, tenant_id, resource_id, source, run_id, evidence_id,
+               metric_id, definition_version, comparability_key,
+               window_start, window_end, window_tz, grain,
+               dimensions_json, dimensions_hash, value_type, value_num,
+               interpretation_version, source_revision, source_as_of,
+               idempotency_key, payload_digest, created_at
+             ) VALUES ('obs-wleg-1', 't-wleg', 'site-wleg', 'gsc_export', 'run-wleg-1', 'ev-wleg-1',
+               'gsc.clicks', 'v1', 'gsc.clicks@v1',
+               '2026-11-01', '2026-11-01', 'UTC', 'daily',
+               '{"page":"/w1"}', 'hw1', 'integer', 12, 'v1', 1, '2026-11-01T00:00:00Z',
+               'idem-wleg-obs-1', 'pdw1', 1000)`
+          ),
+        ]);
+        // Reapply current schema.sql (does not alter existing ms_observations table)
+        workerLegDb.exec(schemaSql);
+        const wLegToken = "worker-legacy-token";
+        const wLegEnv: Env = {
+          DB: workerLegDb,
+          POD_ID: "measurement-pod",
+          POD_NAME: "Measurement Pod",
+          POD_ROLE: "measurement",
+          POD_LOB: "measurement-evidence",
+          FACTORY_HUB_TOKEN: "wleg-hub",
+          SCOPED_CALLER_GRANTS: JSON.stringify([
+            {
+              callerId: "wleg-caller",
+              tokenSha256: await sha256Hex(wLegToken),
+              grants: [{ tenantId: "t-wleg", resourceIds: ["*"], actions: ["read", "write"] }],
+            },
+          ]),
+        };
+        const wLegRes = await worker.fetch(
+          new Request("https://measurement.test/api/measurement/series?tenantId=t-wleg&resourceId=site-wleg&metricId=gsc.clicks", {
+            method: "GET",
+            headers: { Authorization: `Bearer ${wLegToken}` },
+          }),
+          wLegEnv
+        );
+        assert.equal(wLegRes.status, 200);
+        const wLegBody = (await wLegRes.json()) as any;
+        assert.equal(wLegBody.total, 1);
+        assert.equal(wLegBody.points[0].recordSeq, 1);
+      } finally {
+        workerLegDb.close();
+        rmSync(workerLegDir, { recursive: true, force: true });
+      }
+
+      // 10m. Revoked caller grant CANNOT append to existing import; pre-session staged import is quarantined against claiming!
+      const mutableToken = "mutable-grant-caller-token";
+      const baseGrantsSnapshot = JSON.parse(h.env.SCOPED_CALLER_GRANTS || "[]");
+      h.env.SCOPED_CALLER_GRANTS = JSON.stringify([
+        ...baseGrantsSnapshot,
+        {
+          callerId: "mutable-caller",
+          tokenSha256: await sha256Hex(mutableToken),
+          grants: [{ tenantId: "tenant-alpha", resourceIds: ["site-alpha"], actions: ["read", "write"] }],
+        },
+      ]);
+      assert.equal(
+        (await h.call("POST", "/api/measurement/imports/stage", mutableToken, {
+          tenantId: "tenant-alpha", importId: "imp-revoked", chunkIndex: 0, groups: await mkNarrowGroup("site-alpha", "rev0"),
+        })).status,
+        201
+      );
+      // Change mutable-caller's grants from site-alpha to site-beta only!
+      h.env.SCOPED_CALLER_GRANTS = JSON.stringify([
+        ...baseGrantsSnapshot,
+        {
+          callerId: "mutable-caller",
+          tokenSha256: await sha256Hex(mutableToken),
+          grants: [{ tenantId: "tenant-alpha", resourceIds: ["site-beta"], actions: ["read", "write"] }],
+        },
+      ]);
+      const appendAfterRevoke = await h.call("POST", "/api/measurement/imports/stage", mutableToken, {
+        tenantId: "tenant-alpha", importId: "imp-revoked", chunkIndex: 1, groups: await mkNarrowGroup("site-beta", "rev1"),
+      });
+      assert.equal(appendAfterRevoke.status, 403);
+      assert.equal(await appendAfterRevoke.text(), JSON.stringify({ error: "forbidden" }));
+      assert.equal((await h.call("POST", "/api/measurement/imports/imp-revoked/abort", h.tokenA, { tenantId: "tenant-alpha" })).status, 200);
+      h.env.SCOPED_CALLER_GRANTS = JSON.stringify(baseGrantsSnapshot);
+
+      // Pre-session staged import (no session row) -> quarantined on upgrade AND blocked directly against sibling claiming!
+      const preSessionGroups = await mkNarrowGroup("site-alpha", "presess");
+      await h.db
+        .prepare(
+          `INSERT INTO ms_staged_imports (tenant_id, import_id, chunk_index, generation_id, resource_ids_json, groups_json, created_at)
+           VALUES (?, ?, 0, 'gen-presess', ?, ?, ?)`
+        )
+        .bind("tenant-alpha", "imp-presess", JSON.stringify(["site-alpha"]), JSON.stringify(preSessionGroups), Date.now())
+        .run();
+      await ensureMeasurementSchemaUpgraded(h.db);
+      const siblingClaimPreSess = await h.call("POST", "/api/measurement/imports/stage", narrowBetaToken, {
+        tenantId: "tenant-alpha", importId: "imp-presess", chunkIndex: 1, groups: await mkNarrowGroup("site-beta", "presess-b"),
+      });
+      assert.equal(siblingClaimPreSess.status, 403);
+      assert.equal(await siblingClaimPreSess.text(), JSON.stringify({ error: "forbidden" }));
+      assert.equal((await h.call("POST", "/api/measurement/imports/imp-presess/abort", h.tokenA, { tenantId: "tenant-alpha" })).status, 200);
+
+      // 10n. Concurrent abort between sibling's denied insert and post-denial lookup STILL returns uniform 403 forbidden (NEVER 409)!
+      await h.call("POST", "/api/measurement/imports/stage", narrowToken, {
+        tenantId: "tenant-alpha", importId: "imp-vanish", chunkIndex: 0, groups: await mkNarrowGroup("site-alpha", "van0"),
+      });
+      let injectedAbortOnVanish = false;
+      const vanishDb = {
+        prepare(sql: string) {
+          const stmt = origPrepare(sql);
+          return {
+            bind(...params: any[]) {
+              const bound = stmt.bind(...params);
+              return {
+                first: (...a: any[]) => (bound.first as any)(...a),
+                all: (...a: any[]) => (bound.all as any)(...a),
+                run: (...a: any[]) => (bound.run as any)(...a),
+                _raw: bound,
+                _sql: sql,
+              };
+            },
+            first: (...a: any[]) => (stmt.first as any)(...a),
+            all: (...a: any[]) => (stmt.all as any)(...a),
+            run: (...a: any[]) => (stmt.run as any)(...a),
+          };
+        },
+        async batch(stmts: any[]) {
+          // Simulate sibling's initial snapshot seeing empty state (concurrent with owner),
+          // then owner already holds session during sibling's INSERT -> changes=0 -> owner aborts immediately!
+          const isInitialRead =
+            !injectedAbortOnVanish &&
+            stmts.length === 3 &&
+            stmts.some((s) => typeof s._sql === "string" && s._sql.includes("FROM ms_staged_import_sessions"));
+          if (isInitialRead) {
+            return [{ results: [] }, { results: [] }, { results: [] }];
+          }
+          const res = await origBatch(stmts.map((s) => s._raw ?? s));
+          if (
+            !injectedAbortOnVanish &&
+            stmts.some((s) => typeof s._sql === "string" && s._sql.includes("INSERT OR IGNORE INTO ms_staged_imports"))
+          ) {
+            injectedAbortOnVanish = true;
+            await baseSvc.abortStagedImport("tenant-alpha", "imp-vanish");
+          }
+          return res;
+        },
+      };
+      const vanishSvc = new MeasurementService(vanishDb as any);
+      await assert.rejects(
+        () =>
+          vanishSvc.stageImportChunk(
+            {
+              tenantId: "tenant-alpha",
+              importId: "imp-vanish",
+              chunkIndex: 1,
+              groups: preSessionGroups.map((g) => ({ ...g, resourceId: "site-beta" })),
+            },
+            Date.now(),
+            {
+              callerId: "narrow-beta-only",
+              authorizeResourceWrite: (rid: string) => {
+                if (rid !== "site-beta") throw new Error("forbidden");
+              },
+            }
+          ),
+        (err: any) => err?.message === "forbidden"
+      );
     } finally {
       h.cleanup();
     }

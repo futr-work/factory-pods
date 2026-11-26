@@ -148,7 +148,8 @@ export async function ensureMeasurementSchemaUpgraded(
       tenant_id TEXT NOT NULL,
       import_id TEXT NOT NULL,
       owner_caller_id TEXT NOT NULL,
-      seed_resource_ids_json TEXT NOT NULL,
+      session_token TEXT NOT NULL,
+      resource_ids_json TEXT NOT NULL,
       created_at INTEGER NOT NULL,
       PRIMARY KEY (tenant_id, import_id)
     )`),
@@ -253,6 +254,28 @@ export async function ensureMeasurementSchemaUpgraded(
       .run();
     migratedStagedImports = true;
   }
+
+  // Quarantine any pre-session staged imports so no caller can retroactively claim ownership or append to them.
+  await db
+    .prepare(
+      `INSERT OR IGNORE INTO ms_staged_import_sessions (
+         tenant_id, import_id, owner_caller_id, session_token, resource_ids_json, created_at
+       )
+       SELECT
+         s.tenant_id,
+         s.import_id,
+         '__legacy_unowned__',
+         'legacy-quarantined',
+         '["*"]',
+         MIN(s.created_at)
+       FROM ms_staged_imports s
+       WHERE NOT EXISTS (
+         SELECT 1 FROM ms_staged_import_sessions sess
+         WHERE sess.tenant_id = s.tenant_id AND sess.import_id = s.import_id
+       )
+       GROUP BY s.tenant_id, s.import_id`
+    )
+    .run();
 
   return { migratedObservations, migratedStagedImports };
 }
@@ -1273,114 +1296,215 @@ export class MeasurementService {
     }
 
     const ownerCallerId = auth?.callerId?.trim() || "__service__";
-    const generationId = crypto.randomUUID();
-    // Race-safe import-level ownership claim + immutable generation_id insert inside ONE atomic batch:
-    // 1. First writer claims (tenant_id, import_id) in ms_staged_import_sessions (only if no receipt exists).
-    // 2. Chunk insert succeeds ONLY when the session belongs to THIS caller and no receipt exists,
-    //    preventing concurrent or sequential cross-caller append/probing!
-    const [, insertRes] = await this.db.batch<any>([
-      this.db
-        .prepare(
-          `INSERT OR IGNORE INTO ms_staged_import_sessions (
-             tenant_id, import_id, owner_caller_id, seed_resource_ids_json, created_at
-           )
-           SELECT ?, ?, ?, ?, ?
-           WHERE NOT EXISTS (
-             SELECT 1 FROM ms_staged_import_receipts WHERE tenant_id = ? AND import_id = ?
-           )`
-        )
-        .bind(tenantId, importId, ownerCallerId, resourceIdsJson, now, tenantId, importId),
-      this.db
-        .prepare(
-          `INSERT OR IGNORE INTO ms_staged_imports (
-             tenant_id, import_id, chunk_index, generation_id, resource_ids_json, groups_json, created_at
-           )
-           SELECT ?, ?, ?, ?, ?, ?, ?
-           WHERE EXISTS (
-             SELECT 1 FROM ms_staged_import_sessions
-             WHERE tenant_id = ? AND import_id = ? AND owner_caller_id = ?
-           )
-           AND NOT EXISTS (
-             SELECT 1 FROM ms_staged_import_receipts WHERE tenant_id = ? AND import_id = ?
-           )`
-        )
-        .bind(
-          tenantId,
-          importId,
-          raw.chunkIndex,
-          generationId,
-          resourceIdsJson,
-          groupsJson,
-          now,
-          tenantId,
-          importId,
-          ownerCallerId,
-          tenantId,
-          importId
-        ),
-    ]);
-
-    if (Number(insertRes?.meta?.changes ?? 0) > 0) {
-      return { importId, chunkIndex: raw.chunkIndex, observations: chunkObs, existing: false };
-    }
-
-    // Authorize existing receipt/session/chunk resources BEFORE exposing any 409 conflict or completion state!
-    const [receiptRes, sessionRes, chunksRes] = await this.db.batch<any>([
-      this.db
-        .prepare("SELECT resource_ids_json FROM ms_staged_import_receipts WHERE tenant_id = ? AND import_id = ?")
-        .bind(tenantId, importId),
-      this.db
-        .prepare("SELECT owner_caller_id, seed_resource_ids_json FROM ms_staged_import_sessions WHERE tenant_id = ? AND import_id = ?")
-        .bind(tenantId, importId),
-      this.db
-        .prepare("SELECT chunk_index, resource_ids_json, groups_json FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ?")
-        .bind(tenantId, importId),
-    ]);
-    const receipt = (receiptRes?.results || [])[0] ?? null;
-    const session = (sessionRes?.results || [])[0] ?? null;
-    const existingChunks = chunksRes?.results || [];
-
-    const existingResourceIds = new Set<string>();
-    const collectResourceIds = (rawJson: unknown) => {
+    const collectResourceIds = (rawJson: unknown, target: Set<string>) => {
       try {
         const parsed = JSON.parse(String(rawJson || "[]"));
         if (Array.isArray(parsed)) {
           for (const rid of parsed) {
             const s = String(rid).trim();
-            if (s) existingResourceIds.add(s);
+            if (s) target.add(s);
           }
         }
       } catch {
-        // ignore malformed JSON; fail closed below if empty
+        // Malformed JSON handled fail-closed when set is empty
       }
     };
-    if (receipt) collectResourceIds(receipt.resource_ids_json);
-    if (session) collectResourceIds(session.seed_resource_ids_json);
-    for (const row of existingChunks) {
-      collectResourceIds(row.resource_ids_json);
-    }
-    if (existingResourceIds.size > 0) {
-      for (const rid of existingResourceIds) {
-        auth?.authorizeResourceWrite?.(rid);
+
+    const MAX_STAGE_CAS_ATTEMPTS = 4;
+    for (let attempt = 0; attempt < MAX_STAGE_CAS_ATTEMPTS; attempt++) {
+      // 1. Authoritative snapshot read of receipt, session, and all existing chunks for (tenantId, importId)
+      const [receiptRes, sessionRes, chunksRes] = await this.db.batch<any>([
+        this.db
+          .prepare("SELECT resource_ids_json FROM ms_staged_import_receipts WHERE tenant_id = ? AND import_id = ?")
+          .bind(tenantId, importId),
+        this.db
+          .prepare(
+            "SELECT owner_caller_id, session_token, resource_ids_json FROM ms_staged_import_sessions WHERE tenant_id = ? AND import_id = ?"
+          )
+          .bind(tenantId, importId),
+        this.db
+          .prepare("SELECT chunk_index, resource_ids_json, groups_json FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ?")
+          .bind(tenantId, importId),
+      ]);
+      const receipt = (receiptRes?.results || [])[0] ?? null;
+      const session = (sessionRes?.results || [])[0] ?? null;
+      const existingChunks = chunksRes?.results || [];
+
+      // 2. Authorize EVERY existing resource in receipt, session, AND chunks BEFORE appending or exposing state!
+      const existingResourceIds = new Set<string>();
+      if (receipt) collectResourceIds(receipt.resource_ids_json, existingResourceIds);
+      if (session) collectResourceIds(session.resource_ids_json, existingResourceIds);
+      for (const row of existingChunks) {
+        collectResourceIds(row.resource_ids_json, existingResourceIds);
       }
-    } else if (receipt || session) {
-      auth?.authorizeResourceWrite?.("*");
+      if (existingResourceIds.size > 0) {
+        for (const rid of existingResourceIds) {
+          auth?.authorizeResourceWrite?.(rid);
+        }
+      } else if (receipt || session || existingChunks.length > 0) {
+        auth?.authorizeResourceWrite?.("*");
+      }
+
+      // 3. Enforce terminal receipt, quarantine, ownership, and existing chunk replay/conflict rules
+      if (receipt) {
+        throw new ConflictError(`Staged import '${importId}' has already been committed`);
+      }
+      if (!session && existingChunks.length > 0) {
+        throw new ForbiddenError("forbidden");
+      }
+      if (session && String(session.owner_caller_id) !== ownerCallerId) {
+        throw new ForbiddenError("forbidden");
+      }
+
+      const existing = existingChunks.find((row: any) => Number(row.chunk_index) === raw.chunkIndex);
+      if (existing) {
+        if (existing.groups_json !== groupsJson) {
+          throw new ConflictError(`Staged import '${importId}' chunk ${raw.chunkIndex} already exists with different payload`);
+        }
+        return { importId, chunkIndex: raw.chunkIndex, observations: chunkObs, existing: true };
+      }
+
+      // 4. Transactional write fenced against concurrent session, resource-set, orphan-chunk, or receipt changes!
+      const nextSessionToken = crypto.randomUUID();
+      const generationId = crypto.randomUUID();
+      let insertChanges = 0;
+
+      if (!session) {
+        const [, insertRes] = await this.db.batch<any>([
+          this.db
+            .prepare(
+              `INSERT OR IGNORE INTO ms_staged_import_sessions (
+                 tenant_id, import_id, owner_caller_id, session_token, resource_ids_json, created_at
+               )
+               SELECT ?, ?, ?, ?, ?, ?
+               WHERE NOT EXISTS (SELECT 1 FROM ms_staged_import_receipts WHERE tenant_id = ? AND import_id = ?)
+                 AND NOT EXISTS (SELECT 1 FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ?)`
+            )
+            .bind(
+              tenantId,
+              importId,
+              ownerCallerId,
+              nextSessionToken,
+              resourceIdsJson,
+              now,
+              tenantId,
+              importId,
+              tenantId,
+              importId
+            ),
+          this.db
+            .prepare(
+              `INSERT OR IGNORE INTO ms_staged_imports (
+                 tenant_id, import_id, chunk_index, generation_id, resource_ids_json, groups_json, created_at
+               )
+               SELECT ?, ?, ?, ?, ?, ?, ?
+               WHERE EXISTS (
+                 SELECT 1 FROM ms_staged_import_sessions
+                 WHERE tenant_id = ? AND import_id = ? AND owner_caller_id = ? AND session_token = ?
+               )
+               AND NOT EXISTS (SELECT 1 FROM ms_staged_import_receipts WHERE tenant_id = ? AND import_id = ?)`
+            )
+            .bind(
+              tenantId,
+              importId,
+              raw.chunkIndex,
+              generationId,
+              resourceIdsJson,
+              groupsJson,
+              now,
+              tenantId,
+              importId,
+              ownerCallerId,
+              nextSessionToken,
+              tenantId,
+              importId
+            ),
+        ]);
+        insertChanges = Number(insertRes?.meta?.changes ?? 0);
+      } else {
+        const mergedResourceIdsJson = canonicalJson([...new Set([...existingResourceIds, ...resourceIds])].sort());
+        const [, insertRes] = await this.db.batch<any>([
+          this.db
+            .prepare(
+              `UPDATE ms_staged_import_sessions
+               SET session_token = ?, resource_ids_json = ?
+               WHERE tenant_id = ? AND import_id = ?
+                 AND owner_caller_id = ?
+                 AND session_token = ?
+                 AND resource_ids_json = ?
+                 AND NOT EXISTS (SELECT 1 FROM ms_staged_import_receipts WHERE tenant_id = ? AND import_id = ?)`
+            )
+            .bind(
+              nextSessionToken,
+              mergedResourceIdsJson,
+              tenantId,
+              importId,
+              ownerCallerId,
+              String(session.session_token),
+              String(session.resource_ids_json),
+              tenantId,
+              importId
+            ),
+          this.db
+            .prepare(
+              `INSERT OR IGNORE INTO ms_staged_imports (
+                 tenant_id, import_id, chunk_index, generation_id, resource_ids_json, groups_json, created_at
+               )
+               SELECT ?, ?, ?, ?, ?, ?, ?
+               WHERE EXISTS (
+                 SELECT 1 FROM ms_staged_import_sessions
+                 WHERE tenant_id = ? AND import_id = ? AND owner_caller_id = ? AND session_token = ?
+               )
+               AND NOT EXISTS (SELECT 1 FROM ms_staged_import_receipts WHERE tenant_id = ? AND import_id = ?)`
+            )
+            .bind(
+              tenantId,
+              importId,
+              raw.chunkIndex,
+              generationId,
+              resourceIdsJson,
+              groupsJson,
+              now,
+              tenantId,
+              importId,
+              ownerCallerId,
+              nextSessionToken,
+              tenantId,
+              importId
+            ),
+        ]);
+        insertChanges = Number(insertRes?.meta?.changes ?? 0);
+      }
+
+      if (insertChanges > 0) {
+        return { importId, chunkIndex: raw.chunkIndex, observations: chunkObs, existing: false };
+      }
+
+      // 5. Write lost a concurrent race! Inspect whether authorization state disappeared (e.g., concurrent abort):
+      //    fail closed with uniform 403 for any caller lacking tenant-wide authority so sibling callers never get 409!
+      const [postReceiptRes, postSessionRes, postChunksRes] = await this.db.batch<any>([
+        this.db
+          .prepare("SELECT resource_ids_json FROM ms_staged_import_receipts WHERE tenant_id = ? AND import_id = ?")
+          .bind(tenantId, importId),
+        this.db
+          .prepare("SELECT owner_caller_id, resource_ids_json FROM ms_staged_import_sessions WHERE tenant_id = ? AND import_id = ?")
+          .bind(tenantId, importId),
+        this.db
+          .prepare("SELECT chunk_index FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ?")
+          .bind(tenantId, importId),
+      ]);
+      const hasPostState =
+        (postReceiptRes?.results || []).length > 0 ||
+        (postSessionRes?.results || []).length > 0 ||
+        (postChunksRes?.results || []).length > 0;
+      if (!hasPostState) {
+        auth?.authorizeResourceWrite?.("*");
+        throw new ConflictError(`Staged import '${importId}' chunk ${raw.chunkIndex} changed concurrently`);
+      }
     }
 
-    if (receipt) {
-      throw new ConflictError(`Staged import '${importId}' has already been committed`);
-    }
-    if (session && String(session.owner_caller_id) !== ownerCallerId) {
-      throw new ForbiddenError("forbidden");
-    }
-    const existing = existingChunks.find((row: any) => Number(row.chunk_index) === raw.chunkIndex);
-    if (!existing) {
-      throw new ConflictError(`Staged import '${importId}' chunk ${raw.chunkIndex} changed concurrently`);
-    }
-    if (existing.groups_json !== groupsJson) {
-      throw new ConflictError(`Staged import '${importId}' chunk ${raw.chunkIndex} already exists with different payload`);
-    }
-    return { importId, chunkIndex: raw.chunkIndex, observations: chunkObs, existing: true };
+    auth?.authorizeResourceWrite?.("*");
+    throw new ConflictError(`Staged import '${importId}' chunk ${raw.chunkIndex} changed concurrently`);
   }
 
   private resolveStagedImportReceiptReplay(
