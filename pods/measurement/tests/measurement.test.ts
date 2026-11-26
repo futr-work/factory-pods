@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { SqliteFileStorage } from "@futr-work/pod-kernel/storage/sqlite";
 import { sha256Hex } from "@futr-work/pod-kernel/auth";
 import worker, { type Env } from "../src/worker.js";
-import { MeasurementService } from "../src/service.js";
+import { ensureMeasurementSchemaUpgraded, MeasurementService } from "../src/service.js";
 import { startLocalMeasurementPod } from "../src/main.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -2197,6 +2197,267 @@ describe("Measurement Pod — Typed 4-Family Vertical Slice, Isolation, MCP v2 +
       assert.ok(
         afterDelSeries.points[0].recordSeq > maxSeqBeforeDelete,
         `Expected strictly monotonic recordSeq > ${maxSeqBeforeDelete}, got ${afterDelSeries.points[0].recordSeq}`
+      );
+
+      // 10i. Data-preserving legacy database upgrade: base schema without record_seq upgrades cleanly on local runtime startup!
+      const legacyDir = mkdtempSync(join(tmpdir(), "ms-pod-legacy-upgrade-"));
+      const legacyDbPath = join(legacyDir, "legacy.sqlite");
+      const legacySchemaSql = schemaSql
+        .replace(
+          "  record_seq INTEGER PRIMARY KEY AUTOINCREMENT,\n  obs_id TEXT NOT NULL UNIQUE,",
+          "  obs_id TEXT PRIMARY KEY,"
+        )
+        .replace(/-- 9\. Invisible Staged Multi-Chunk Imports[\s\S]*?-- Indexes for bounded paginated queries/, "-- Indexes for bounded paginated queries");
+      const legacyInitDb = new SqliteFileStorage(legacyDbPath);
+      try {
+        legacyInitDb.exec(legacySchemaSql);
+        // Seed legacy resource, definition, run, evidence, and 3 observations (no record_seq column yet)
+        await legacyInitDb.batch([
+          legacyInitDb
+            .prepare(
+              `INSERT INTO ms_resources (tenant_id, resource_id, entity_urn, resource_type, source_resource_id, active_from, created_at, updated_at)
+               VALUES ('t-leg', 'site-leg', 'site:t-leg:site-leg', 'site', 'sc-domain:leg.test', '2026-01-01', 1000, 1000)`
+            ),
+          legacyInitDb
+            .prepare(
+              `INSERT INTO ms_definitions (tenant_id, metric_id, version, family, unit, value_type, grain, window_tz, dimensions_schema_json, aggregation_rule, comparability_key, created_at)
+               VALUES ('t-leg', 'gsc.clicks', 'v1', 'seo', 'count', 'integer', 'daily', 'UTC', '{"page":{"type":"string","required":true}}', 'sum', 'gsc.clicks@v1', 1000)`
+            ),
+          legacyInitDb
+            .prepare(
+              `INSERT INTO ms_runs (run_id, tenant_id, resource_id, source, source_resource_id, idempotency_key, request_digest, window_start, window_end, status, created_at, updated_at)
+               VALUES ('run-leg-1', 't-leg', 'site-leg', 'gsc_export', 'sc-domain:leg.test', 'idem-leg-1', 'd1', '2026-11-01', '2026-11-03', 'succeeded', 1000, 1000)`
+            ),
+          legacyInitDb
+            .prepare(
+              `INSERT INTO ms_evidence (evidence_id, tenant_id, resource_id, run_id, uri_pointer, sha256, byte_size, media_type, privacy_class, retention_class, collected_at, source_as_of, adapter_name, adapter_version, created_at)
+               VALUES ('ev-leg-1', 't-leg', 'site-leg', 'run-leg-1', 'fixture://leg/1', '${await sha256Hex("leg-1")}', 10, 'application/json', 'internal', '90d', '2026-11-03T00:00:00Z', '2026-11-03T00:00:00Z', 'leg', '1.0.0', 1000)`
+            ),
+          ...([1, 2, 3] as const).map((n) =>
+            legacyInitDb
+              .prepare(
+                `INSERT INTO ms_observations (
+                   obs_id, tenant_id, resource_id, source, run_id, evidence_id,
+                   metric_id, definition_version, comparability_key,
+                   window_start, window_end, window_tz, grain,
+                   dimensions_json, dimensions_hash, value_type, value_num,
+                   interpretation_version, source_revision, source_as_of,
+                   idempotency_key, payload_digest, created_at
+                 ) VALUES (?, 't-leg', 'site-leg', 'gsc_export', 'run-leg-1', 'ev-leg-1',
+                   'gsc.clicks', 'v1', 'gsc.clicks@v1',
+                   '2026-11-01', '2026-11-01', 'UTC', 'daily',
+                   ?, ?, 'integer', ?, 'v1', 1, '2026-11-03T00:00:00Z',
+                   ?, ?, 1000)`
+              )
+              .bind(`obs-leg-${n}`, JSON.stringify({ page: `/p${n}` }), `h${n}`, n * 10, `idem-obs-leg-${n}`, `pd-${n}`)
+          ),
+        ]);
+      } finally {
+        legacyInitDb.close();
+      }
+      const legToken = "legacy-upgrade-token";
+      const upgradedPod = await startLocalMeasurementPod({
+        host: "127.0.0.1",
+        port: 0,
+        dbPath: legacyDbPath,
+        env: {
+          FACTORY_HUB_TOKEN: "legacy-hub",
+          SCOPED_CALLER_GRANTS: JSON.stringify([
+            {
+              callerId: "legacy-caller",
+              tokenSha256: await sha256Hex(legToken),
+              grants: [{ tenantId: "t-leg", resourceIds: ["*"], actions: ["read", "write"] }],
+            },
+          ]),
+        },
+      });
+      const reqUpgraded = (method: string, path: string, body?: any) =>
+        new Promise<{ status: number; text: string }>((resolve, reject) => {
+          const req = httpRequest(
+            {
+              host: "127.0.0.1",
+              port: upgradedPod.port,
+              path,
+              method,
+              headers: {
+                Authorization: `Bearer ${legToken}`,
+                ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
+              },
+            },
+            (res) => {
+              let text = "";
+              res.setEncoding("utf8");
+              res.on("data", (c) => { text += c; });
+              res.on("end", () => resolve({ status: res.statusCode ?? 0, text }));
+            }
+          );
+          req.on("error", reject);
+          if (body !== undefined) req.write(JSON.stringify(body));
+          req.end();
+        });
+      try {
+        const legSeriesRes = await reqUpgraded("GET", "/api/measurement/series?tenantId=t-leg&resourceId=site-leg&metricId=gsc.clicks");
+        assert.equal(legSeriesRes.status, 200);
+        const legSeries = JSON.parse(legSeriesRes.text);
+        assert.equal(legSeries.total, 3);
+        const legSeqs = legSeries.points.map((p: any) => p.recordSeq).sort((a: number, b: number) => a - b);
+        assert.deepEqual(legSeqs, [1, 2, 3]);
+        // Delete legacy run via cascade and insert a new observation -> recordSeq MUST exceed 3!
+        await upgradedPod.db.prepare("DELETE FROM ms_runs WHERE run_id = 'run-leg-1'").run();
+        const postUpgradeIngest = await reqUpgraded("POST", "/api/measurement/ingest-atomic", {
+          tenantId: "t-leg",
+          groups: [{
+            resourceId: "site-leg", source: "gsc_export",
+            runId: "run-leg-2", runIdempotencyKey: "idem-leg-2",
+            sourceResourceId: "sc-domain:leg.test",
+            windowStart: "2026-11-04", windowEnd: "2026-11-04",
+            evidence: mkEv("ev-leg-2", await sha256Hex("ev-leg-2")),
+            observations: [{
+              metricId: "gsc.clicks", definitionVersion: "v1",
+              windowStart: "2026-11-04", windowEnd: "2026-11-04", windowTz: "UTC", grain: "daily",
+              dimensions: { page: "/after-upgrade" }, valueNum: 99,
+              interpretationVersion: "v1", sourceRevision: 1, sourceAsOf: "2026-11-04T00:00:00Z",
+              idempotencyKey: "idem-obs-leg-4",
+            }],
+          }],
+        });
+        assert.equal(postUpgradeIngest.status, 200);
+        const postUpgradeSeries = JSON.parse(
+          (await reqUpgraded("GET", "/api/measurement/series?tenantId=t-leg&resourceId=site-leg&metricId=gsc.clicks")).text
+        );
+        assert.equal(postUpgradeSeries.points.length, 1);
+        assert.ok(postUpgradeSeries.points[0].recordSeq > 3, `Expected recordSeq > 3, got ${postUpgradeSeries.points[0].recordSeq}`);
+        // Re-running upgrade helper is an idempotent no-op
+        const secondUpgrade = await ensureMeasurementSchemaUpgraded(upgradedPod.db);
+        assert.deepEqual(secondUpgrade, { migratedObservations: false, migratedStagedImports: false });
+      } finally {
+        await upgradedPod.close();
+        rmSync(legacyDir, { recursive: true, force: true });
+      }
+
+      // 10j. Import-level staging authorization boundary: sibling narrow caller CANNOT probe, append, or discover committed imports (sequential & concurrent)!
+      const narrowBetaToken = "narrow-beta-only-token";
+      const grantsWithBeta = [
+        ...JSON.parse(h.env.SCOPED_CALLER_GRANTS || "[]"),
+        {
+          callerId: "narrow-beta-only",
+          tokenSha256: await sha256Hex(narrowBetaToken),
+          grants: [{ tenantId: "tenant-alpha", resourceIds: ["site-beta"], actions: ["read", "write"] }],
+        },
+      ];
+      h.env.SCOPED_CALLER_GRANTS = JSON.stringify(grantsWithBeta);
+      const mkNarrowGroup = async (rid: string, tag: string) => [{
+        resourceId: rid, source: "gsc_export",
+        runId: `run-iso-${tag}`, runIdempotencyKey: `idem-iso-${tag}`,
+        sourceResourceId: rid === "site-alpha" ? "sc-domain:alpha.test" : "sc-domain:beta.test",
+        windowStart: "2026-12-07", windowEnd: "2026-12-07",
+        evidence: mkEv(`ev-iso-${tag}`, await sha256Hex(`ev-iso-${tag}`)),
+        observations: [{
+          metricId: "gsc.clicks", definitionVersion: "v1",
+          windowStart: "2026-12-07", windowEnd: "2026-12-07", windowTz: "UTC", grain: "daily",
+          dimensions: { page: `/iso/${tag}` }, valueNum: 10,
+          interpretationVersion: "v1", sourceRevision: 1, sourceAsOf: "2026-12-07T00:00:00Z",
+          idempotencyKey: `obs-iso-${tag}`,
+        }],
+      }];
+      // Narrow Alpha creates imp-iso chunk 0
+      assert.equal(
+        (await h.call("POST", "/api/measurement/imports/stage", narrowToken, {
+          tenantId: "tenant-alpha", importId: "imp-iso", chunkIndex: 0, groups: await mkNarrowGroup("site-alpha", "a0"),
+        })).status,
+        201
+      );
+      // Narrow Beta probing chunk 0 (occupied) MUST receive 403 forbidden (NEVER 409!)
+      const betaProbeChunk0 = await h.call("POST", "/api/measurement/imports/stage", narrowBetaToken, {
+        tenantId: "tenant-alpha", importId: "imp-iso", chunkIndex: 0, groups: await mkNarrowGroup("site-beta", "b0"),
+      });
+      assert.equal(betaProbeChunk0.status, 403);
+      assert.equal(await betaProbeChunk0.text(), JSON.stringify({ error: "forbidden" }));
+      // Narrow Beta appending chunk 1 MUST receive 403 forbidden (NEVER 201!)
+      const betaAppendChunk1 = await h.call("POST", "/api/measurement/imports/stage", narrowBetaToken, {
+        tenantId: "tenant-alpha", importId: "imp-iso", chunkIndex: 1, groups: await mkNarrowGroup("site-beta", "b1"),
+      });
+      assert.equal(betaAppendChunk1.status, 403);
+      assert.equal(await betaAppendChunk1.text(), JSON.stringify({ error: "forbidden" }));
+      // Narrow Alpha can STILL commit its own import cleanly!
+      assert.equal(
+        (await h.call("POST", "/api/measurement/imports/imp-iso/commit", narrowToken, {
+          tenantId: "tenant-alpha", expectedChunks: 1,
+        })).status,
+        200
+      );
+      // Narrow Beta probing already-committed import MUST receive 403 forbidden (NEVER 409 already-committed!)
+      const betaProbeCommitted = await h.call("POST", "/api/measurement/imports/stage", narrowBetaToken, {
+        tenantId: "tenant-alpha", importId: "imp-iso", chunkIndex: 0, groups: await mkNarrowGroup("site-beta", "b2"),
+      });
+      assert.equal(betaProbeCommitted.status, 403);
+      assert.equal(await betaProbeCommitted.text(), JSON.stringify({ error: "forbidden" }));
+      // Concurrent race between Narrow Alpha (chunk 0) and Narrow Beta (chunk 1) on same brand-new importId:
+      // EXACTLY ONE gets 201 and the OTHER gets 403 forbidden!
+      const [concIsoA, concIsoB] = await Promise.all([
+        h.call("POST", "/api/measurement/imports/stage", narrowToken, {
+          tenantId: "tenant-alpha", importId: "imp-iso-race", chunkIndex: 0, groups: await mkNarrowGroup("site-alpha", "ra"),
+        }),
+        h.call("POST", "/api/measurement/imports/stage", narrowBetaToken, {
+          tenantId: "tenant-alpha", importId: "imp-iso-race", chunkIndex: 1, groups: await mkNarrowGroup("site-beta", "rb"),
+        }),
+      ]);
+      assert.deepEqual([concIsoA.status, concIsoB.status].sort(), [201, 403]);
+      // Clean up winning staged chunk
+      assert.equal(
+        (await h.call("POST", "/api/measurement/imports/imp-iso-race/abort", h.tokenA, { tenantId: "tenant-alpha" })).status,
+        200
+      );
+
+      // 10k. Exhausted domain UNIQUE contention translates cleanly to 409 ConflictError (NEVER leaks HTTP 500)!
+      const alwaysUniqueContentionDb = {
+        prepare(sql: string) {
+          const stmt = origPrepare(sql);
+          return {
+            bind(...params: any[]) {
+              const bound = stmt.bind(...params);
+              return {
+                first: (...a: any[]) => (bound.first as any)(...a),
+                all: (...a: any[]) => (bound.all as any)(...a),
+                run: (...a: any[]) => (bound.run as any)(...a),
+                _raw: bound,
+                _sql: sql,
+              };
+            },
+            first: (...a: any[]) => (stmt.first as any)(...a),
+            all: (...a: any[]) => (stmt.all as any)(...a),
+            run: (...a: any[]) => (stmt.run as any)(...a),
+          };
+        },
+        async batch(stmts: any[]) {
+          if (stmts.some((s) => typeof s._sql === "string" && s._sql.includes("INSERT INTO ms_observations"))) {
+            throw new Error("UNIQUE constraint failed: ms_evidence.evidence_id");
+          }
+          return origBatch(stmts.map((s) => s._raw ?? s));
+        },
+      };
+      const contentionSvc = new MeasurementService(alwaysUniqueContentionDb as any);
+      const contentionSha = await sha256Hex("ev-contention-409");
+      await assert.rejects(
+        () =>
+          contentionSvc.ingestAtomicBatch({
+            tenantId: "tenant-alpha",
+            groups: [{
+              resourceId: "site-alpha", source: "gsc_export",
+              runId: "run-contention-409", runIdempotencyKey: "idem-contention-409",
+              sourceResourceId: "sc-domain:alpha.test",
+              windowStart: "2026-12-08", windowEnd: "2026-12-08",
+              evidence: mkEv("ev-contention-409", contentionSha),
+              observations: [{
+                metricId: "gsc.clicks", definitionVersion: "v1",
+                windowStart: "2026-12-08", windowEnd: "2026-12-08", windowTz: "UTC", grain: "daily",
+                dimensions: { page: "/contention-409" }, valueNum: 55,
+                interpretationVersion: "v1", sourceRevision: 1, sourceAsOf: "2026-12-08T00:00:00Z",
+                idempotencyKey: "obs-contention-409",
+              }],
+            }],
+          }),
+        (err: any) => err?.status === 409 && /contention/i.test(err?.message || "")
       );
     } finally {
       h.cleanup();

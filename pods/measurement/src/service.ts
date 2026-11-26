@@ -88,8 +88,174 @@ const MAX_STAGED_IMPORT_OBSERVATIONS = 20000;
 const MAX_STAGED_IMPORT_CHUNKS = 50;
 const MAX_STAGED_CHUNK_BYTES = 1_500_000;
 const MAX_FENCE_CHUNKS_PER_STMT = 30;
+const MAX_DOMAIN_CONTENTION_ATTEMPTS = 4;
 const MAX_IN_CLAUSE_ITEMS = 90;
 const MAX_LIST_LIMIT = 500;
+
+const MS_OBSERVATIONS_DATA_COLUMNS = [
+  "obs_id",
+  "tenant_id",
+  "resource_id",
+  "source",
+  "run_id",
+  "evidence_id",
+  "metric_id",
+  "definition_version",
+  "comparability_key",
+  "window_start",
+  "window_end",
+  "window_tz",
+  "grain",
+  "dimensions_json",
+  "dimensions_hash",
+  "value_type",
+  "value_num",
+  "value_text",
+  "currency",
+  "billing_date",
+  "gross_or_net",
+  "refund_text",
+  "credit_text",
+  "tax_text",
+  "collection_request_budget",
+  "numerator",
+  "denominator",
+  "exclusions_json",
+  "sample_time",
+  "gauge_reducer",
+  "counter_start",
+  "counter_end",
+  "counter_reset",
+  "interpretation_version",
+  "source_revision",
+  "source_as_of",
+  "idempotency_key",
+  "payload_digest",
+  "created_at",
+].join(", ");
+
+/**
+ * Idempotent, data-preserving schema upgrade for existing measurement-pod databases
+ * created before `record_seq` AUTOINCREMENT or staged-import generation/session tables.
+ * Preserves every existing observation row and its original insertion order (`rowid` -> `record_seq`)
+ * while durably initializing SQLite's `sqlite_sequence` so future inserts never reuse deleted sequences.
+ */
+export async function ensureMeasurementSchemaUpgraded(
+  db: PodStorage
+): Promise<{ migratedObservations: boolean; migratedStagedImports: boolean }> {
+  await db.batch([
+    db.prepare(`CREATE TABLE IF NOT EXISTS ms_staged_import_sessions (
+      tenant_id TEXT NOT NULL,
+      import_id TEXT NOT NULL,
+      owner_caller_id TEXT NOT NULL,
+      seed_resource_ids_json TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (tenant_id, import_id)
+    )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS ms_staged_imports (
+      tenant_id TEXT NOT NULL,
+      import_id TEXT NOT NULL,
+      chunk_index INTEGER NOT NULL,
+      generation_id TEXT NOT NULL,
+      resource_ids_json TEXT NOT NULL,
+      groups_json TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (tenant_id, import_id, chunk_index)
+    )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS ms_staged_import_receipts (
+      tenant_id TEXT NOT NULL,
+      import_id TEXT NOT NULL,
+      payload_digest TEXT NOT NULL,
+      expected_chunks INTEGER NOT NULL,
+      resource_ids_json TEXT NOT NULL,
+      result_json TEXT NOT NULL,
+      committed_at INTEGER NOT NULL,
+      PRIMARY KEY (tenant_id, import_id)
+    )`),
+  ]);
+
+  let migratedObservations = false;
+  let migratedStagedImports = false;
+
+  const obsColsRes = await db.prepare("PRAGMA table_info(ms_observations)").all<any>();
+  const obsCols = obsColsRes.results || [];
+  if (obsCols.length > 0 && !obsCols.some((col: any) => String(col.name) === "record_seq")) {
+    await db.batch([
+      db.prepare("DROP TABLE IF EXISTS ms_observations__migrating"),
+      db.prepare(`CREATE TABLE ms_observations__migrating (
+        record_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        obs_id TEXT NOT NULL UNIQUE,
+        tenant_id TEXT NOT NULL,
+        resource_id TEXT NOT NULL,
+        source TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        evidence_id TEXT NOT NULL,
+        metric_id TEXT NOT NULL,
+        definition_version TEXT NOT NULL,
+        comparability_key TEXT NOT NULL,
+        window_start TEXT NOT NULL,
+        window_end TEXT NOT NULL,
+        window_tz TEXT NOT NULL,
+        grain TEXT NOT NULL,
+        dimensions_json TEXT NOT NULL,
+        dimensions_hash TEXT NOT NULL,
+        value_type TEXT NOT NULL CHECK (value_type IN ('integer', 'decimal_string', 'gauge', 'counter')),
+        value_num REAL,
+        value_text TEXT,
+        currency TEXT,
+        billing_date TEXT,
+        gross_or_net TEXT CHECK (gross_or_net IS NULL OR gross_or_net IN ('gross', 'net')),
+        refund_text TEXT,
+        credit_text TEXT,
+        tax_text TEXT,
+        collection_request_budget INTEGER,
+        numerator REAL,
+        denominator REAL,
+        exclusions_json TEXT,
+        sample_time TEXT,
+        gauge_reducer TEXT CHECK (gauge_reducer IS NULL OR gauge_reducer IN ('last', 'min', 'max', 'mean')),
+        counter_start REAL,
+        counter_end REAL,
+        counter_reset INTEGER NOT NULL DEFAULT 0 CHECK (counter_reset IN (0, 1)),
+        interpretation_version TEXT NOT NULL,
+        source_revision INTEGER NOT NULL DEFAULT 1,
+        source_as_of TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        payload_digest TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        UNIQUE (tenant_id, idempotency_key),
+        FOREIGN KEY (tenant_id, resource_id) REFERENCES ms_resources(tenant_id, resource_id) ON DELETE CASCADE,
+        FOREIGN KEY (tenant_id, metric_id, definition_version) REFERENCES ms_definitions(tenant_id, metric_id, version),
+        FOREIGN KEY (run_id) REFERENCES ms_runs(run_id) ON DELETE CASCADE,
+        FOREIGN KEY (evidence_id) REFERENCES ms_evidence(evidence_id) ON DELETE CASCADE
+      )`),
+      db.prepare(
+        `INSERT INTO ms_observations__migrating (record_seq, ${MS_OBSERVATIONS_DATA_COLUMNS})
+         SELECT rowid, ${MS_OBSERVATIONS_DATA_COLUMNS} FROM ms_observations ORDER BY rowid ASC`
+      ),
+      db.prepare("DROP TABLE ms_observations"),
+      db.prepare("ALTER TABLE ms_observations__migrating RENAME TO ms_observations"),
+      db.prepare(
+        "CREATE INDEX IF NOT EXISTS idx_ms_obs_query ON ms_observations(tenant_id, resource_id, metric_id, window_start, window_end, source_revision DESC)"
+      ),
+      db.prepare(
+        "CREATE INDEX IF NOT EXISTS idx_ms_obs_compat ON ms_observations(tenant_id, resource_id, metric_id, comparability_key, dimensions_hash, source_revision DESC)"
+      ),
+    ]);
+    migratedObservations = true;
+  }
+
+  const stagedColsRes = await db.prepare("PRAGMA table_info(ms_staged_imports)").all<any>();
+  const stagedCols = stagedColsRes.results || [];
+  if (stagedCols.length > 0 && !stagedCols.some((col: any) => String(col.name) === "generation_id")) {
+    await db
+      .prepare("ALTER TABLE ms_staged_imports ADD COLUMN generation_id TEXT NOT NULL DEFAULT 'legacy-pre-generation'")
+      .run();
+    migratedStagedImports = true;
+  }
+
+  return { migratedObservations, migratedStagedImports };
+}
 
 function errorText(err: unknown): string {
   if (err instanceof Error) {
@@ -930,7 +1096,7 @@ export class MeasurementService {
       coverageStatus: string | null;
     }>;
   }> {
-    for (let attempt = 0; attempt < 2; attempt++) {
+    for (let attempt = 0; attempt < MAX_DOMAIN_CONTENTION_ATTEMPTS; attempt++) {
       const shared = await this.prefetchIngestState(tenantId, groups);
       const preparedList: any[] = [];
       for (const grp of groups) {
@@ -977,8 +1143,11 @@ export class MeasurementService {
         try {
           await this.db.batch(allStatements);
         } catch (err) {
-          if (attempt === 0 && isUniqueConstraintError(err) && !isReceiptUniqueError(err)) {
-            continue;
+          if (isUniqueConstraintError(err) && !isReceiptUniqueError(err)) {
+            if (attempt + 1 < MAX_DOMAIN_CONTENTION_ATTEMPTS) {
+              continue;
+            }
+            throw new ConflictError("Concurrent ingest contention; retry request");
           }
           throw err;
         }
@@ -987,7 +1156,7 @@ export class MeasurementService {
       return summary;
     }
 
-    throw new ConflictError("Concurrent ingest conflict; retry request");
+    throw new ConflictError("Concurrent ingest contention; retry request");
   }
 
   public async ingestBatch(raw: IngestBatchInput, now = Date.now()): Promise<{
@@ -1061,7 +1230,8 @@ export class MeasurementService {
 
   public async stageImportChunk(
     raw: StageImportChunkInput,
-    now = Date.now()
+    now = Date.now(),
+    auth?: { callerId?: string; authorizeResourceWrite?: (resourceId: string) => void }
   ): Promise<{ importId: string; chunkIndex: number; observations: number; existing: boolean }> {
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
       throw new ValidationError("Stage import payload must be a JSON object");
@@ -1102,37 +1272,108 @@ export class MeasurementService {
       );
     }
 
+    const ownerCallerId = auth?.callerId?.trim() || "__service__";
     const generationId = crypto.randomUUID();
-    // Race-safe idempotent insert with immutable generation_id, fenced against already-committed imports
-    const insertRes = await this.db
-      .prepare(
-        `INSERT OR IGNORE INTO ms_staged_imports (
-           tenant_id, import_id, chunk_index, generation_id, resource_ids_json, groups_json, created_at
-         )
-         SELECT ?, ?, ?, ?, ?, ?, ?
-         WHERE NOT EXISTS (
-           SELECT 1 FROM ms_staged_import_receipts WHERE tenant_id = ? AND import_id = ?
-         )`
-      )
-      .bind(tenantId, importId, raw.chunkIndex, generationId, resourceIdsJson, groupsJson, now, tenantId, importId)
-      .run();
+    // Race-safe import-level ownership claim + immutable generation_id insert inside ONE atomic batch:
+    // 1. First writer claims (tenant_id, import_id) in ms_staged_import_sessions (only if no receipt exists).
+    // 2. Chunk insert succeeds ONLY when the session belongs to THIS caller and no receipt exists,
+    //    preventing concurrent or sequential cross-caller append/probing!
+    const [, insertRes] = await this.db.batch<any>([
+      this.db
+        .prepare(
+          `INSERT OR IGNORE INTO ms_staged_import_sessions (
+             tenant_id, import_id, owner_caller_id, seed_resource_ids_json, created_at
+           )
+           SELECT ?, ?, ?, ?, ?
+           WHERE NOT EXISTS (
+             SELECT 1 FROM ms_staged_import_receipts WHERE tenant_id = ? AND import_id = ?
+           )`
+        )
+        .bind(tenantId, importId, ownerCallerId, resourceIdsJson, now, tenantId, importId),
+      this.db
+        .prepare(
+          `INSERT OR IGNORE INTO ms_staged_imports (
+             tenant_id, import_id, chunk_index, generation_id, resource_ids_json, groups_json, created_at
+           )
+           SELECT ?, ?, ?, ?, ?, ?, ?
+           WHERE EXISTS (
+             SELECT 1 FROM ms_staged_import_sessions
+             WHERE tenant_id = ? AND import_id = ? AND owner_caller_id = ?
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM ms_staged_import_receipts WHERE tenant_id = ? AND import_id = ?
+           )`
+        )
+        .bind(
+          tenantId,
+          importId,
+          raw.chunkIndex,
+          generationId,
+          resourceIdsJson,
+          groupsJson,
+          now,
+          tenantId,
+          importId,
+          ownerCallerId,
+          tenantId,
+          importId
+        ),
+    ]);
 
-    if (Number(insertRes.meta?.changes ?? 0) > 0) {
+    if (Number(insertRes?.meta?.changes ?? 0) > 0) {
       return { importId, chunkIndex: raw.chunkIndex, observations: chunkObs, existing: false };
     }
 
-    const [receiptRes, existingRes] = await this.db.batch<any>([
+    // Authorize existing receipt/session/chunk resources BEFORE exposing any 409 conflict or completion state!
+    const [receiptRes, sessionRes, chunksRes] = await this.db.batch<any>([
       this.db
-        .prepare("SELECT import_id FROM ms_staged_import_receipts WHERE tenant_id = ? AND import_id = ?")
+        .prepare("SELECT resource_ids_json FROM ms_staged_import_receipts WHERE tenant_id = ? AND import_id = ?")
         .bind(tenantId, importId),
       this.db
-        .prepare("SELECT groups_json FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ? AND chunk_index = ?")
-        .bind(tenantId, importId, raw.chunkIndex),
+        .prepare("SELECT owner_caller_id, seed_resource_ids_json FROM ms_staged_import_sessions WHERE tenant_id = ? AND import_id = ?")
+        .bind(tenantId, importId),
+      this.db
+        .prepare("SELECT chunk_index, resource_ids_json, groups_json FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ?")
+        .bind(tenantId, importId),
     ]);
-    if ((receiptRes?.results || []).length > 0) {
+    const receipt = (receiptRes?.results || [])[0] ?? null;
+    const session = (sessionRes?.results || [])[0] ?? null;
+    const existingChunks = chunksRes?.results || [];
+
+    const existingResourceIds = new Set<string>();
+    const collectResourceIds = (rawJson: unknown) => {
+      try {
+        const parsed = JSON.parse(String(rawJson || "[]"));
+        if (Array.isArray(parsed)) {
+          for (const rid of parsed) {
+            const s = String(rid).trim();
+            if (s) existingResourceIds.add(s);
+          }
+        }
+      } catch {
+        // ignore malformed JSON; fail closed below if empty
+      }
+    };
+    if (receipt) collectResourceIds(receipt.resource_ids_json);
+    if (session) collectResourceIds(session.seed_resource_ids_json);
+    for (const row of existingChunks) {
+      collectResourceIds(row.resource_ids_json);
+    }
+    if (existingResourceIds.size > 0) {
+      for (const rid of existingResourceIds) {
+        auth?.authorizeResourceWrite?.(rid);
+      }
+    } else if (receipt || session) {
+      auth?.authorizeResourceWrite?.("*");
+    }
+
+    if (receipt) {
       throw new ConflictError(`Staged import '${importId}' has already been committed`);
     }
-    const existing = (existingRes?.results || [])[0];
+    if (session && String(session.owner_caller_id) !== ownerCallerId) {
+      throw new ForbiddenError("forbidden");
+    }
+    const existing = existingChunks.find((row: any) => Number(row.chunk_index) === raw.chunkIndex);
     if (!existing) {
       throw new ConflictError(`Staged import '${importId}' chunk ${raw.chunkIndex} changed concurrently`);
     }
@@ -1362,14 +1603,18 @@ export class MeasurementService {
       return stmts;
     };
 
-    const buildPostStatements = () =>
-      rows.map((row) =>
+    const buildPostStatements = () => [
+      ...rows.map((row) =>
         this.db
           .prepare(
             "DELETE FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ? AND chunk_index = ? AND generation_id = ?"
           )
           .bind(tenantId, importId, Number(row.chunk_index), String(row.generation_id))
-      );
+      ),
+      this.db
+        .prepare("DELETE FROM ms_staged_import_sessions WHERE tenant_id = ? AND import_id = ?")
+        .bind(tenantId, importId),
+    ];
 
     try {
       const out = await this.commitGroupsAtomically(
@@ -1389,7 +1634,7 @@ export class MeasurementService {
         ...out,
       };
     } catch (err) {
-      if (isUniqueConstraintError(err) || isNotNullConstraintError(err)) {
+      if (isUniqueConstraintError(err) || isNotNullConstraintError(err) || err instanceof ConflictError) {
         const concurrentReceipt = await this.db
           .prepare(
             "SELECT payload_digest, expected_chunks, resource_ids_json, result_json FROM ms_staged_import_receipts WHERE tenant_id = ? AND import_id = ?"
@@ -1456,8 +1701,17 @@ export class MeasurementService {
         .prepare("DELETE FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ? AND chunk_index = ? AND generation_id = ?")
         .bind(tid, iid, Number(row.chunk_index), String(row.generation_id))
     );
-    const delRes = await this.db.batch(delStmts);
-    const discarded = delRes.reduce((sum, r) => sum + Number(r.meta?.changes ?? 0), 0);
+    const sessionCleanupStmt = this.db
+      .prepare(
+        `DELETE FROM ms_staged_import_sessions
+         WHERE tenant_id = ? AND import_id = ?
+           AND NOT EXISTS (
+             SELECT 1 FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ?
+           )`
+      )
+      .bind(tid, iid, tid, iid);
+    const delRes = await this.db.batch([...delStmts, sessionCleanupStmt]);
+    const discarded = delRes.slice(0, delStmts.length).reduce((sum, r) => sum + Number(r.meta?.changes ?? 0), 0);
     return { aborted: true, discardedChunks: discarded };
   }
 

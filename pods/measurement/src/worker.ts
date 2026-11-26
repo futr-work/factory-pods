@@ -285,7 +285,13 @@ export default {
             const denied = authorizeScopedCaller(caller, { tenantId, resourceId: rid, action: "write" }, "measurement-pod");
             if (denied) return denied;
           }
-          const result = await service.stageImportChunk(body as any);
+          const result = await service.stageImportChunk(body as any, Date.now(), {
+            callerId: caller.callerId,
+            authorizeResourceWrite: (rid: string) => {
+              const denied = authorizeScopedCaller(caller, { tenantId, resourceId: rid, action: "write" }, "measurement-pod");
+              if (denied) throw new ForbiddenError("forbidden");
+            },
+          });
           return jsonResponse(result, result.existing ? 200 : 201);
         }
 
