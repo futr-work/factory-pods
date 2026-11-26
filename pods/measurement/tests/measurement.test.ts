@@ -2937,6 +2937,39 @@ describe("Measurement Pod — Typed 4-Family Vertical Slice, Isolation, MCP v2 +
       const abort20Res = await new MeasurementService(abortInspectorDb as any).abortStagedImport("tenant-alpha", "imp-abort-20");
       assert.equal(abort20Res.discardedChunks, 20);
       assert.equal(abortSelectedGroupsJson, false);
+
+      // 10q. GET /api/measurement/evidence/:evidenceId/authorize enforces narrower `evidence:read` capability (never accepts aggregate read/write token!)
+      const rawEvTokenAlpha = "raw-evidence-read-alpha-only";
+      const grantsWithRaw = [
+        ...JSON.parse(h.env.SCOPED_CALLER_GRANTS || "[]"),
+        {
+          callerId: "raw-ev-alpha",
+          tokenSha256: await sha256Hex(rawEvTokenAlpha),
+          grants: [{ tenantId: "tenant-alpha", resourceIds: ["site-alpha"], actions: ["evidence:read"] }],
+        },
+      ];
+      h.env.SCOPED_CALLER_GRANTS = JSON.stringify(grantsWithRaw);
+      // Aggregate read/write token (tokenA) MUST be denied with 403 on /authorize even though metadata GET succeeds!
+      assert.equal((await h.call("GET", "/api/measurement/evidence/ev-atomic-1?tenantId=tenant-alpha", h.tokenA)).status, 200);
+      const aggAuthDenied = await h.call("GET", "/api/measurement/evidence/ev-atomic-1/authorize?tenantId=tenant-alpha", h.tokenA);
+      assert.equal(aggAuthDenied.status, 403);
+      assert.equal(await aggAuthDenied.text(), JSON.stringify({ error: "forbidden" }));
+      // Dedicated evidence:read token succeeds for granted site-alpha evidence
+      const rawAuthOk = await h.call("GET", "/api/measurement/evidence/ev-atomic-1/authorize?tenantId=tenant-alpha", rawEvTokenAlpha);
+      assert.equal(rawAuthOk.status, 200);
+      const rawAuthBody = (await rawAuthOk.json()) as any;
+      assert.equal(rawAuthBody.evidenceId, "ev-atomic-1");
+      assert.equal(rawAuthBody.resourceId, "site-alpha");
+      // Dedicated evidence:read token for site-alpha receives uniform 403 for site-beta, missing, and cross-tenant evidence (zero existence oracle!)
+      const rawAuthBeta = await h.call("GET", "/api/measurement/evidence/ev-atomic-2/authorize?tenantId=tenant-alpha", rawEvTokenAlpha);
+      const rawAuthMissing = await h.call("GET", "/api/measurement/evidence/ev-does-not-exist/authorize?tenantId=tenant-alpha", rawEvTokenAlpha);
+      const rawAuthCrossTenant = await h.call("GET", "/api/measurement/evidence/ev-atomic-1/authorize?tenantId=tenant-beta", rawEvTokenAlpha);
+      assert.equal(rawAuthBeta.status, 403);
+      assert.equal(rawAuthMissing.status, 403);
+      assert.equal(rawAuthCrossTenant.status, 403);
+      assert.equal(await rawAuthBeta.text(), JSON.stringify({ error: "forbidden" }));
+      assert.equal(await rawAuthMissing.text(), JSON.stringify({ error: "forbidden" }));
+      assert.equal(await rawAuthCrossTenant.text(), JSON.stringify({ error: "forbidden" }));
     } finally {
       h.cleanup();
     }

@@ -65,16 +65,24 @@ async function ensureDbReady(rawDb: unknown, storage: PodStorage): Promise<void>
   await pending;
 }
 
-function hasAnyTenantWriteGrant(
+function hasAnyTenantActionGrant(
   caller: { grants: Array<{ tenantId: string; resourceIds: string[]; actions: string[] }> },
-  tenantId: string
+  tenantId: string,
+  action: string
 ): boolean {
   return caller.grants.some(
     (g) =>
       g.tenantId === tenantId &&
       g.resourceIds.length > 0 &&
-      (g.actions.includes("*") || g.actions.includes("write"))
+      (g.actions.includes("*") || g.actions.includes(action))
   );
+}
+
+function hasAnyTenantWriteGrant(
+  caller: { grants: Array<{ tenantId: string; resourceIds: string[]; actions: string[] }> },
+  tenantId: string
+): boolean {
+  return hasAnyTenantActionGrant(caller, tenantId, "write");
 }
 
 function errorResponse(err: unknown): Response {
@@ -445,6 +453,43 @@ export default {
             offset: url.searchParams.get("offset") ? Number(url.searchParams.get("offset")) : undefined,
           });
           return jsonResponse(result, 200);
+        }
+
+        // GET /api/measurement/evidence/:evidenceId/authorize (strictly enforces narrower `evidence:read` capability!)
+        const evAuthMatch = url.pathname.match(/^\/api\/measurement\/evidence\/([^/]+)\/authorize$/);
+        if (method === "GET" && evAuthMatch) {
+          const evidenceId = decodeURIComponent(evAuthMatch[1]);
+          const tenantId = (url.searchParams.get("tenantId") || "").trim();
+          const configured = parseScopedCallerGrants(env.SCOPED_CALLER_GRANTS);
+          const caller = await resolveScopedCaller(request, configured);
+          if (!caller) return jsonResponse({ error: "unauthorized" }, 401);
+          if (!tenantId) {
+            return jsonResponse({ error: "Query param 'tenantId' must be a non-empty string" }, 400);
+          }
+          if (!hasAnyTenantActionGrant(caller, tenantId, "evidence:read")) {
+            return jsonResponse({ error: "forbidden" }, 403);
+          }
+          const evRow = await db
+            .prepare("SELECT resource_id FROM ms_evidence WHERE evidence_id = ? AND tenant_id = ?")
+            .bind(evidenceId, tenantId)
+            .first<any>();
+          if (!evRow) {
+            const tenantCheck = authorizeScopedCaller(
+              caller,
+              { tenantId, resourceId: "*", action: "evidence:read" },
+              "measurement-pod"
+            );
+            if (tenantCheck) return tenantCheck;
+            return jsonResponse({ error: `Evidence '${evidenceId}' not found` }, 404);
+          }
+          const denied = authorizeScopedCaller(
+            caller,
+            { tenantId, resourceId: evRow.resource_id, action: "evidence:read" },
+            "measurement-pod"
+          );
+          if (denied) return denied;
+          const meta = await service.getEvidenceMetadata(tenantId, evidenceId);
+          return jsonResponse(meta, 200);
         }
 
         // GET /api/measurement/evidence/:evidenceId (metadata only, never file bytes)
