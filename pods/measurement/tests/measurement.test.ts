@@ -2515,6 +2515,18 @@ describe("Measurement Pod — Typed 4-Family Vertical Slice, Isolation, MCP v2 +
             },
           ]),
         };
+        // Invalid Authorization header MUST return 401 WITHOUT triggering migration on legacy DB!
+        const invalidAuthRes = await worker.fetch(
+          new Request("https://measurement.test/api/measurement/series?tenantId=t-wleg&resourceId=site-wleg&metricId=gsc.clicks", {
+            method: "GET",
+            headers: { Authorization: "Bearer invalid-unauthenticated-token" },
+          }),
+          wLegEnv
+        );
+        assert.equal(invalidAuthRes.status, 401);
+        const preAuthCols = await workerLegDb.prepare("PRAGMA table_info(ms_observations)").all<any>();
+        assert.equal((preAuthCols.results || []).some((c: any) => String(c.name) === "record_seq"), false);
+
         const wLegRes = await worker.fetch(
           new Request("https://measurement.test/api/measurement/series?tenantId=t-wleg&resourceId=site-wleg&metricId=gsc.clicks", {
             method: "GET",
@@ -2529,6 +2541,74 @@ describe("Measurement Pod — Typed 4-Family Vertical Slice, Isolation, MCP v2 +
       } finally {
         workerLegDb.close();
         rmSync(workerLegDir, { recursive: true, force: true });
+      }
+
+      // 10l-ii. Concurrent independent upgraders (simulating two separate Worker isolates) reconcile cleanly on BOTH ms_observations and pre-generation ms_staged_imports!
+      const concUpgDir = mkdtempSync(join(tmpdir(), "ms-pod-conc-upgrade-"));
+      const concUpgDb = new SqliteFileStorage(join(concUpgDir, "conc-upgrade.sqlite"));
+      try {
+        concUpgDb.exec(legacySchemaSql);
+        concUpgDb.exec(`
+          CREATE TABLE ms_staged_imports (
+            tenant_id TEXT NOT NULL,
+            import_id TEXT NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            resource_ids_json TEXT NOT NULL,
+            groups_json TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (tenant_id, import_id, chunk_index)
+          );
+        `);
+        let obsArrived = 0;
+        let releaseObs!: () => void;
+        const obsBarrier = new Promise<void>((r) => { releaseObs = r; });
+        let stgArrived = 0;
+        let releaseStg!: () => void;
+        const stgBarrier = new Promise<void>((r) => { releaseStg = r; });
+        const makeBarrierDb = () => {
+          const op = concUpgDb.prepare.bind(concUpgDb);
+          const ob = concUpgDb.batch.bind(concUpgDb);
+          return {
+            prepare(sql: string) {
+              const stmt = op(sql);
+              return {
+                bind: (...p: any[]) => {
+                  const b = stmt.bind(...p);
+                  return { first: (...a: any[]) => (b.first as any)(...a), all: (...a: any[]) => (b.all as any)(...a), run: (...a: any[]) => (b.run as any)(...a), _raw: b };
+                },
+                first: (...a: any[]) => (stmt.first as any)(...a),
+                run: (...a: any[]) => (stmt.run as any)(...a),
+                all: async (...a: any[]) => {
+                  const res = await (stmt.all as any)(...a);
+                  if (sql === "PRAGMA table_info(ms_observations)" && !(res.results || []).some((c: any) => c.name === "record_seq")) {
+                    obsArrived += 1;
+                    if (obsArrived === 2) releaseObs();
+                    await obsBarrier;
+                  }
+                  if (sql === "PRAGMA table_info(ms_staged_imports)" && !(res.results || []).some((c: any) => c.name === "generation_id")) {
+                    stgArrived += 1;
+                    if (stgArrived === 2) releaseStg();
+                    await stgBarrier;
+                  }
+                  return res;
+                },
+                _raw: stmt,
+              };
+            },
+            batch: (stmts: any[]) => ob(stmts.map((s) => s._raw ?? s)),
+          };
+        };
+        const [upgA, upgB] = await Promise.all([
+          ensureMeasurementSchemaUpgraded(makeBarrierDb() as any),
+          ensureMeasurementSchemaUpgraded(makeBarrierDb() as any),
+        ]);
+        assert.deepEqual([upgA.migratedObservations, upgB.migratedObservations].sort(), [false, true]);
+        assert.deepEqual([upgA.migratedStagedImports, upgB.migratedStagedImports].sort(), [false, true]);
+        const finalStagedCols = await concUpgDb.prepare("PRAGMA table_info(ms_staged_imports)").all<any>();
+        assert.equal((finalStagedCols.results || []).some((c: any) => String(c.name) === "generation_id"), true);
+      } finally {
+        concUpgDb.close();
+        rmSync(concUpgDir, { recursive: true, force: true });
       }
 
       // 10m. Revoked caller grant CANNOT append to existing import; pre-session staged import is quarantined against claiming!

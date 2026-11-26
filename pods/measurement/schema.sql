@@ -266,6 +266,11 @@ CREATE TABLE IF NOT EXISTS ms_events (
 );
 
 -- 9. Invisible Staged Multi-Chunk Imports (committed all-or-nothing in one atomic transaction)
+CREATE TABLE IF NOT EXISTS ms_schema_migrations (
+  migration_id TEXT PRIMARY KEY,
+  applied_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS ms_staged_import_sessions (
   tenant_id TEXT NOT NULL,
   import_id TEXT NOT NULL,

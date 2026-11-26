@@ -140,15 +140,25 @@ export default {
     }
 
     const db: PodStorage = toPodStorage(env.DB);
-    if (request.headers.has("Authorization")) {
-      await ensureDbReady(env.DB, db);
-    }
     const service = new MeasurementService(db);
 
     // 2. Scoped measurement REST & Worldview projection API (/api/measurement/*)
     //    Authenticated strictly via scoped caller credentials (never accepts ungranted shared hub token).
     if (url.pathname.startsWith("/api/measurement/")) {
       try {
+        const preAuthCallers = parseScopedCallerGrants(env.SCOPED_CALLER_GRANTS);
+        const preAuthCaller = await resolveScopedCaller(request, preAuthCallers);
+        if (!preAuthCaller) {
+          return new Response(JSON.stringify({ error: "unauthorized" }), {
+            status: 401,
+            headers: {
+              ...CORS_HEADERS,
+              "Content-Type": "application/json",
+              "WWW-Authenticate": 'Basic realm="measurement-pod"',
+            },
+          });
+        }
+        await ensureDbReady(env.DB, db);
         // POST /api/measurement/resources
         if (method === "POST" && url.pathname === "/api/measurement/resources") {
           const body = await parseJsonBody(request);
@@ -488,6 +498,11 @@ export default {
           const scoped = await resolveScopedCaller(request, configured);
           if (!scoped) return hubDenied;
         }
+        try {
+          await ensureDbReady(env.DB, db);
+        } catch (err) {
+          return errorResponse(err);
+        }
       }
       const mcpHandler = createMeasurementMcpHandler(env as any, config);
       return mcpHandler(request, env, ctx);
@@ -526,6 +541,7 @@ export default {
           action: requiredAction,
         });
         if (taskDenied) return taskDenied;
+        await ensureDbReady(env.DB, db);
 
         const normalizedSpec = { action, payload: normalizedPayload };
         const now = Date.now();
@@ -585,6 +601,11 @@ export default {
     // 4. Operator Cockpit & Hub Mesh routes — protected by shared kernel authGate
     const denied = authGate(request, env as any, "measurement-pod");
     if (denied) return denied;
+    try {
+      await ensureDbReady(env.DB, db);
+    } catch (err) {
+      return errorResponse(err);
+    }
 
     const tincan = new TincanClient(config, env.FACTORY_HUB);
 

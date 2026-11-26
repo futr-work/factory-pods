@@ -144,6 +144,10 @@ export async function ensureMeasurementSchemaUpgraded(
   db: PodStorage
 ): Promise<{ migratedObservations: boolean; migratedStagedImports: boolean }> {
   await db.batch([
+    db.prepare(`CREATE TABLE IF NOT EXISTS ms_schema_migrations (
+      migration_id TEXT PRIMARY KEY,
+      applied_at INTEGER NOT NULL
+    )`),
     db.prepare(`CREATE TABLE IF NOT EXISTS ms_staged_import_sessions (
       tenant_id TEXT NOT NULL,
       import_id TEXT NOT NULL,
@@ -177,82 +181,107 @@ export async function ensureMeasurementSchemaUpgraded(
 
   let migratedObservations = false;
   let migratedStagedImports = false;
+  const now = Date.now();
 
   const obsColsRes = await db.prepare("PRAGMA table_info(ms_observations)").all<any>();
   const obsCols = obsColsRes.results || [];
   if (obsCols.length > 0 && !obsCols.some((col: any) => String(col.name) === "record_seq")) {
-    await db.batch([
-      db.prepare("DROP TABLE IF EXISTS ms_observations__migrating"),
-      db.prepare(`CREATE TABLE ms_observations__migrating (
-        record_seq INTEGER PRIMARY KEY AUTOINCREMENT,
-        obs_id TEXT NOT NULL UNIQUE,
-        tenant_id TEXT NOT NULL,
-        resource_id TEXT NOT NULL,
-        source TEXT NOT NULL,
-        run_id TEXT NOT NULL,
-        evidence_id TEXT NOT NULL,
-        metric_id TEXT NOT NULL,
-        definition_version TEXT NOT NULL,
-        comparability_key TEXT NOT NULL,
-        window_start TEXT NOT NULL,
-        window_end TEXT NOT NULL,
-        window_tz TEXT NOT NULL,
-        grain TEXT NOT NULL,
-        dimensions_json TEXT NOT NULL,
-        dimensions_hash TEXT NOT NULL,
-        value_type TEXT NOT NULL CHECK (value_type IN ('integer', 'decimal_string', 'gauge', 'counter')),
-        value_num REAL,
-        value_text TEXT,
-        currency TEXT,
-        billing_date TEXT,
-        gross_or_net TEXT CHECK (gross_or_net IS NULL OR gross_or_net IN ('gross', 'net')),
-        refund_text TEXT,
-        credit_text TEXT,
-        tax_text TEXT,
-        collection_request_budget INTEGER,
-        numerator REAL,
-        denominator REAL,
-        exclusions_json TEXT,
-        sample_time TEXT,
-        gauge_reducer TEXT CHECK (gauge_reducer IS NULL OR gauge_reducer IN ('last', 'min', 'max', 'mean')),
-        counter_start REAL,
-        counter_end REAL,
-        counter_reset INTEGER NOT NULL DEFAULT 0 CHECK (counter_reset IN (0, 1)),
-        interpretation_version TEXT NOT NULL,
-        source_revision INTEGER NOT NULL DEFAULT 1,
-        source_as_of TEXT NOT NULL,
-        idempotency_key TEXT NOT NULL,
-        payload_digest TEXT NOT NULL,
-        created_at INTEGER NOT NULL,
-        UNIQUE (tenant_id, idempotency_key),
-        FOREIGN KEY (tenant_id, resource_id) REFERENCES ms_resources(tenant_id, resource_id) ON DELETE CASCADE,
-        FOREIGN KEY (tenant_id, metric_id, definition_version) REFERENCES ms_definitions(tenant_id, metric_id, version),
-        FOREIGN KEY (run_id) REFERENCES ms_runs(run_id) ON DELETE CASCADE,
-        FOREIGN KEY (evidence_id) REFERENCES ms_evidence(evidence_id) ON DELETE CASCADE
-      )`),
-      db.prepare(
-        `INSERT INTO ms_observations__migrating (record_seq, ${MS_OBSERVATIONS_DATA_COLUMNS})
-         SELECT rowid, ${MS_OBSERVATIONS_DATA_COLUMNS} FROM ms_observations ORDER BY rowid ASC`
-      ),
-      db.prepare("DROP TABLE ms_observations"),
-      db.prepare("ALTER TABLE ms_observations__migrating RENAME TO ms_observations"),
-      db.prepare(
-        "CREATE INDEX IF NOT EXISTS idx_ms_obs_query ON ms_observations(tenant_id, resource_id, metric_id, window_start, window_end, source_revision DESC)"
-      ),
-      db.prepare(
-        "CREATE INDEX IF NOT EXISTS idx_ms_obs_compat ON ms_observations(tenant_id, resource_id, metric_id, comparability_key, dimensions_hash, source_revision DESC)"
-      ),
-    ]);
-    migratedObservations = true;
+    try {
+      await db.batch([
+        db
+          .prepare("INSERT INTO ms_schema_migrations (migration_id, applied_at) VALUES (?, ?)")
+          .bind("v2_obs_record_seq", now),
+        db.prepare("DROP TABLE IF EXISTS ms_observations__migrating"),
+        db.prepare(`CREATE TABLE ms_observations__migrating (
+          record_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+          obs_id TEXT NOT NULL UNIQUE,
+          tenant_id TEXT NOT NULL,
+          resource_id TEXT NOT NULL,
+          source TEXT NOT NULL,
+          run_id TEXT NOT NULL,
+          evidence_id TEXT NOT NULL,
+          metric_id TEXT NOT NULL,
+          definition_version TEXT NOT NULL,
+          comparability_key TEXT NOT NULL,
+          window_start TEXT NOT NULL,
+          window_end TEXT NOT NULL,
+          window_tz TEXT NOT NULL,
+          grain TEXT NOT NULL,
+          dimensions_json TEXT NOT NULL,
+          dimensions_hash TEXT NOT NULL,
+          value_type TEXT NOT NULL CHECK (value_type IN ('integer', 'decimal_string', 'gauge', 'counter')),
+          value_num REAL,
+          value_text TEXT,
+          currency TEXT,
+          billing_date TEXT,
+          gross_or_net TEXT CHECK (gross_or_net IS NULL OR gross_or_net IN ('gross', 'net')),
+          refund_text TEXT,
+          credit_text TEXT,
+          tax_text TEXT,
+          collection_request_budget INTEGER,
+          numerator REAL,
+          denominator REAL,
+          exclusions_json TEXT,
+          sample_time TEXT,
+          gauge_reducer TEXT CHECK (gauge_reducer IS NULL OR gauge_reducer IN ('last', 'min', 'max', 'mean')),
+          counter_start REAL,
+          counter_end REAL,
+          counter_reset INTEGER NOT NULL DEFAULT 0 CHECK (counter_reset IN (0, 1)),
+          interpretation_version TEXT NOT NULL,
+          source_revision INTEGER NOT NULL DEFAULT 1,
+          source_as_of TEXT NOT NULL,
+          idempotency_key TEXT NOT NULL,
+          payload_digest TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          UNIQUE (tenant_id, idempotency_key),
+          FOREIGN KEY (tenant_id, resource_id) REFERENCES ms_resources(tenant_id, resource_id) ON DELETE CASCADE,
+          FOREIGN KEY (tenant_id, metric_id, definition_version) REFERENCES ms_definitions(tenant_id, metric_id, version),
+          FOREIGN KEY (run_id) REFERENCES ms_runs(run_id) ON DELETE CASCADE,
+          FOREIGN KEY (evidence_id) REFERENCES ms_evidence(evidence_id) ON DELETE CASCADE
+        )`),
+        db.prepare(
+          `INSERT INTO ms_observations__migrating (record_seq, ${MS_OBSERVATIONS_DATA_COLUMNS})
+           SELECT rowid, ${MS_OBSERVATIONS_DATA_COLUMNS} FROM ms_observations ORDER BY rowid ASC`
+        ),
+        db.prepare("DROP TABLE ms_observations"),
+        db.prepare("ALTER TABLE ms_observations__migrating RENAME TO ms_observations"),
+        db.prepare(
+          "CREATE INDEX IF NOT EXISTS idx_ms_obs_query ON ms_observations(tenant_id, resource_id, metric_id, window_start, window_end, source_revision DESC)"
+        ),
+        db.prepare(
+          "CREATE INDEX IF NOT EXISTS idx_ms_obs_compat ON ms_observations(tenant_id, resource_id, metric_id, comparability_key, dimensions_hash, source_revision DESC)"
+        ),
+      ]);
+      migratedObservations = true;
+    } catch (err) {
+      const recheck = await db.prepare("PRAGMA table_info(ms_observations)").all<any>();
+      if (!(recheck.results || []).some((col: any) => String(col.name) === "record_seq")) {
+        throw err;
+      }
+    }
   }
 
   const stagedColsRes = await db.prepare("PRAGMA table_info(ms_staged_imports)").all<any>();
   const stagedCols = stagedColsRes.results || [];
   if (stagedCols.length > 0 && !stagedCols.some((col: any) => String(col.name) === "generation_id")) {
-    await db
-      .prepare("ALTER TABLE ms_staged_imports ADD COLUMN generation_id TEXT NOT NULL DEFAULT 'legacy-pre-generation'")
-      .run();
-    migratedStagedImports = true;
+    try {
+      await db.batch([
+        db
+          .prepare("INSERT INTO ms_schema_migrations (migration_id, applied_at) VALUES (?, ?)")
+          .bind("v2_staged_generation_id", now),
+        db.prepare("ALTER TABLE ms_staged_imports ADD COLUMN generation_id TEXT NOT NULL DEFAULT 'legacy-pre-generation'"),
+      ]);
+      migratedStagedImports = true;
+    } catch (err) {
+      const recheck = await db.prepare("PRAGMA table_info(ms_staged_imports)").all<any>();
+      if (!(recheck.results || []).some((col: any) => String(col.name) === "generation_id")) {
+        throw err;
+      }
+      await db
+        .prepare("INSERT OR IGNORE INTO ms_schema_migrations (migration_id, applied_at) VALUES (?, ?)")
+        .bind("v2_staged_generation_id", now)
+        .run();
+    }
   }
 
   // Quarantine any pre-session staged imports so no caller can retroactively claim ownership or append to them.
