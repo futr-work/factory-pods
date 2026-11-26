@@ -2789,6 +2789,8 @@ describe("Measurement Pod — Typed 4-Family Vertical Slice, Isolation, MCP v2 +
       assert.ok(partsList.length >= 4, `Expected >= 4 bounded receipt parts for 7,000 long-ID groups, got ${partsList.length}`);
       for (const part of partsList) {
         const rowBytes =
+          new TextEncoder().encode("tenant-alpha").byteLength +
+          new TextEncoder().encode("imp-big-receipt").byteLength +
           new TextEncoder().encode(String(part.resource_ids_json)).byteLength +
           new TextEncoder().encode(String(part.groups_json)).byteLength;
         assert.ok(rowBytes <= 500_000, `Receipt part ${part.part_index} exceeded 500 KB bound: ${rowBytes}`);
@@ -2863,6 +2865,57 @@ describe("Measurement Pod — Typed 4-Family Vertical Slice, Isolation, MCP v2 +
       });
       assert.equal(pagedCommit.inserted, 20);
       assert.ok(maxGroupsJsonPerQuery <= 16, `Expected <= 16 groups_json rows per query, got ${maxGroupsJsonPerQuery}`);
+
+      // Concurrent 20-chunk commit spanning page 2: winner commits & cleans up before loser reads page 2 -> loser reconciles cleanly to 200 idempotent replay!
+      for (let c = 0; c < 20; c++) {
+        await baseSvc.stageImportChunk({
+          tenantId: "tenant-alpha",
+          importId: "imp-paged-conc-20",
+          chunkIndex: c,
+          groups: await mkNarrowGroup("site-alpha", `pgc20-${c}`),
+        });
+      }
+      let winnerRanBeforePage2 = false;
+      let winnerOut: any = null;
+      const pagedRaceDb = {
+        prepare(sql: string) {
+          const stmt = origPrepare(sql);
+          return {
+            bind(...params: any[]) {
+              const bound = stmt.bind(...params);
+              return {
+                first: (...a: any[]) => (bound.first as any)(...a),
+                all: async (...a: any[]) => {
+                  if (!winnerRanBeforePage2 && sql.includes("chunk_index >= ? AND chunk_index < ?")) {
+                    winnerRanBeforePage2 = true;
+                    winnerOut = await baseSvc.commitStagedImport({
+                      tenantId: "tenant-alpha",
+                      importId: "imp-paged-conc-20",
+                      expectedChunks: 20,
+                    });
+                  }
+                  return (bound.all as any)(...a);
+                },
+                run: (...a: any[]) => (bound.run as any)(...a),
+                _raw: bound,
+              };
+            },
+            first: (...a: any[]) => (stmt.first as any)(...a),
+            all: (...a: any[]) => (stmt.all as any)(...a),
+            run: (...a: any[]) => (stmt.run as any)(...a),
+          };
+        },
+        batch: (stmts: any[]) => origBatch(stmts.map((s) => s._raw ?? s)),
+      };
+      const pagedLoserOut = await new MeasurementService(pagedRaceDb as any).commitStagedImport({
+        tenantId: "tenant-alpha",
+        importId: "imp-paged-conc-20",
+        expectedChunks: 20,
+      });
+      assert.equal(winnerOut.inserted, 20);
+      assert.equal(pagedLoserOut.inserted, 0);
+      assert.equal(pagedLoserOut.replayedNoop, 20);
+      assert.equal(pagedLoserOut.groups.length, 20);
 
       // Abort NEVER selects groups_json at all even for 20 staged chunks!
       for (let c = 0; c < 20; c++) {

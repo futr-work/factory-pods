@@ -1564,15 +1564,19 @@ export class MeasurementService {
     groups: Array<{ runId: string; evidenceId: string; totalObservations: number; coverageStatus: string | null }>
   ): Array<{ resourceIdsJson: string; groupsJson: string }> {
     const encoder = new TextEncoder();
+    // Reserve 1,024 bytes for paired empty-array JSON ("[]") plus primary-key/row metadata overhead
+    // so every persisted receipt detail row (keys + both JSON fields) stays strictly <= MAX_RECEIPT_PART_BYTES.
+    const maxPayloadBytes = MAX_RECEIPT_PART_BYTES - 1024;
     const parts: Array<{ resourceIdsJson: string; groupsJson: string }> = [];
 
-    // Partition resourceIds into <= MAX_RECEIPT_PART_BYTES slices
+    // Partition resourceIds into <= maxPayloadBytes - 2 slices (leaving room for paired "[]")
+    const maxSingleFieldBytes = maxPayloadBytes - 2;
     const ridSlices: string[][] = [];
     let curRids: string[] = [];
     let curRidBytes = 2; // "[]"
     for (const rid of resourceIds) {
       const itemBytes = encoder.encode(JSON.stringify(rid)).byteLength + (curRids.length > 0 ? 1 : 0);
-      if (curRids.length > 0 && curRidBytes + itemBytes > MAX_RECEIPT_PART_BYTES) {
+      if (curRids.length > 0 && curRidBytes + itemBytes > maxSingleFieldBytes) {
         ridSlices.push(curRids);
         curRids = [rid];
         curRidBytes = 2 + encoder.encode(JSON.stringify(rid)).byteLength;
@@ -1583,13 +1587,13 @@ export class MeasurementService {
     }
     if (curRids.length > 0) ridSlices.push(curRids);
 
-    // Partition groups into <= MAX_RECEIPT_PART_BYTES slices
+    // Partition groups into <= maxSingleFieldBytes slices (leaving room for paired "[]")
     const groupSlices: Array<Array<{ runId: string; evidenceId: string; totalObservations: number; coverageStatus: string | null }>> = [];
     let curGroups: Array<{ runId: string; evidenceId: string; totalObservations: number; coverageStatus: string | null }> = [];
     let curGroupBytes = 2; // "[]"
     for (const grp of groups) {
       const itemBytes = encoder.encode(canonicalJson(grp)).byteLength + (curGroups.length > 0 ? 1 : 0);
-      if (curGroups.length > 0 && curGroupBytes + itemBytes > MAX_RECEIPT_PART_BYTES) {
+      if (curGroups.length > 0 && curGroupBytes + itemBytes > maxSingleFieldBytes) {
         groupSlices.push(curGroups);
         curGroups = [grp];
         curGroupBytes = 2 + encoder.encode(canonicalJson(grp)).byteLength;
@@ -1600,12 +1604,12 @@ export class MeasurementService {
     }
     if (curGroups.length > 0) groupSlices.push(curGroups);
 
-    // Pack resourceId slices and group slices while ensuring combined row payload <= MAX_RECEIPT_PART_BYTES
+    // Pack resourceId slices and group slices while ensuring combined JSON payload <= maxPayloadBytes
     const total = Math.max(ridSlices.length, groupSlices.length, 1);
     for (let i = 0; i < total; i++) {
       const rJson = canonicalJson(ridSlices[i] || []);
       const gJson = canonicalJson(groupSlices[i] || []);
-      if (encoder.encode(rJson).byteLength + encoder.encode(gJson).byteLength <= MAX_RECEIPT_PART_BYTES) {
+      if (encoder.encode(rJson).byteLength + encoder.encode(gJson).byteLength <= maxPayloadBytes) {
         parts.push({ resourceIdsJson: rJson, groupsJson: gJson });
       } else {
         if ((ridSlices[i] || []).length > 0) {
@@ -1839,8 +1843,13 @@ export class MeasurementService {
       }
     }
 
+    // Snapshot generation digest binds paged reads and concurrent receipt reconciliation to the exact staged generations!
+    const snapshotGenerationDigest = await sha256Hex(
+      canonicalJson(rows.map((row) => [Number(row.chunk_index), String(row.generation_id)]))
+    );
+
     // Fetch any remaining chunks (>= MAX_COMMIT_PAYLOAD_PAGE_CHUNKS) in bounded pages of 16 (<= 24 MB/query)
-    // pinned to the exact generation_id snapshot from the initial read!
+    // pinned to the exact generation_id snapshot from the initial read; reconcile against receipt if a concurrent commit won!
     for (let start = MAX_COMMIT_PAYLOAD_PAGE_CHUNKS; start < rows.length; start += MAX_COMMIT_PAYLOAD_PAGE_CHUNKS) {
       const end = Math.min(start + MAX_COMMIT_PAYLOAD_PAGE_CHUNKS, rows.length);
       const pageRes = await this.db
@@ -1859,6 +1868,39 @@ export class MeasurementService {
       for (let idx = start; idx < end; idx++) {
         const fetched = pageByIndex.get(idx);
         if (!fetched || String(fetched.generation_id) !== String(rows[idx].generation_id)) {
+          const concurrentReceipt = await this.db
+            .prepare(
+              "SELECT payload_digest, expected_chunks, resource_ids_json, result_json FROM ms_staged_import_receipts WHERE tenant_id = ? AND import_id = ?"
+            )
+            .bind(tenantId, importId)
+            .first<any>();
+          if (concurrentReceipt) {
+            let committedGenDigest = "";
+            try {
+              committedGenDigest = String(JSON.parse(String(concurrentReceipt.result_json || "{}")).generationDigest || "");
+            } catch {
+              committedGenDigest = "";
+            }
+            if (committedGenDigest === snapshotGenerationDigest) {
+              return this.resolveStagedImportReceiptReplay(
+                tenantId,
+                importId,
+                concurrentReceipt,
+                raw.expectedChunks,
+                null,
+                auth
+              );
+            }
+            // Different generation committed concurrently: authorize receipt resources first, then reject with 409!
+            await this.resolveStagedImportReceiptReplay(
+              tenantId,
+              importId,
+              concurrentReceipt,
+              raw.expectedChunks,
+              `mismatch:${snapshotGenerationDigest}`,
+              auth
+            );
+          }
           throw new ConflictError(`Staged import '${importId}' was aborted or modified concurrently`);
         }
         rows[idx].groups_json = fetched.groups_json;
@@ -1928,6 +1970,7 @@ export class MeasurementService {
       const receiptHeader = canonicalJson({
         totalObservations: summary.inserted + summary.replayedNoop,
         detailChunks: receiptParts.length,
+        generationDigest: snapshotGenerationDigest,
       });
       const stmts: any[] = [
         this.db
