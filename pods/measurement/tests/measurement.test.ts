@@ -2970,6 +2970,36 @@ describe("Measurement Pod — Typed 4-Family Vertical Slice, Isolation, MCP v2 +
       assert.equal(await rawAuthBeta.text(), JSON.stringify({ error: "forbidden" }));
       assert.equal(await rawAuthMissing.text(), JSON.stringify({ error: "forbidden" }));
       assert.equal(await rawAuthCrossTenant.text(), JSON.stringify({ error: "forbidden" }));
+
+      // Cold-binding check: aggregate-only / cross-tenant callers MUST receive 403 BEFORE ensureDbReady() touches DB (even if DB throws!)
+      let coldDbTouches = 0;
+      const throwingColdDb = {
+        prepare() {
+          coldDbTouches += 1;
+          throw new Error("DB_SHOULD_NOT_BE_TOUCHED");
+        },
+        batch() {
+          coldDbTouches += 1;
+          throw new Error("DB_SHOULD_NOT_BE_TOUCHED");
+        },
+      };
+      const coldEnv: Env = { ...h.env, DB: throwingColdDb as any };
+      for (const [tok, tid] of [
+        [h.tokenA, "tenant-alpha"],
+        [h.tokenB, "tenant-alpha"],
+        [rawEvTokenAlpha, "tenant-beta"],
+      ] as const) {
+        const res = await worker.fetch(
+          new Request(`https://measurement.test/api/measurement/evidence/ev-atomic-1/authorize?tenantId=${tid}`, {
+            method: "GET",
+            headers: { Authorization: `Bearer ${tok}` },
+          }),
+          coldEnv
+        );
+        assert.equal(res.status, 403);
+        assert.equal(await res.text(), JSON.stringify({ error: "forbidden" }));
+      }
+      assert.equal(coldDbTouches, 0);
     } finally {
       h.cleanup();
     }

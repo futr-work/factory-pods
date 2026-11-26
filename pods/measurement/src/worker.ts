@@ -166,6 +166,17 @@ export default {
             },
           });
         }
+        // Fail closed BEFORE touching/migrating DB on /evidence/:id/authorize when caller lacks any tenant evidence:read grant!
+        const preEvAuthMatch = method === "GET" ? url.pathname.match(/^\/api\/measurement\/evidence\/([^/]+)\/authorize$/) : null;
+        if (preEvAuthMatch) {
+          const preTenantId = (url.searchParams.get("tenantId") || "").trim();
+          if (!preTenantId) {
+            return jsonResponse({ error: "Query param 'tenantId' must be a non-empty string" }, 400);
+          }
+          if (!hasAnyTenantActionGrant(preAuthCaller, preTenantId, "evidence:read")) {
+            return jsonResponse({ error: "forbidden" }, 403);
+          }
+        }
         await ensureDbReady(env.DB, db);
         // POST /api/measurement/resources
         if (method === "POST" && url.pathname === "/api/measurement/resources") {
