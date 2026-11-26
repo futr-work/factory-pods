@@ -1691,11 +1691,29 @@ describe("Measurement Pod — Typed 4-Family Vertical Slice, Isolation, MCP v2 +
       const preCommit = (await (await h.call("GET", "/api/measurement/series?tenantId=tenant-alpha&resourceId=site-alpha&metricId=gsc.clicks&windowStart=2026-11-28&windowEnd=2026-11-28", h.tokenA)).json()) as any;
       assert.equal(preCommit.total, 0);
 
-      // Cross-tenant commit attempt with tenant-beta token MUST fail closed (403)
-      const crossCommit = await h.call("POST", "/api/measurement/imports/imp-1200/commit", h.tokenB, {
+      // Cross-tenant commit and abort attempts with tenant-beta token MUST fail closed with uniform 403 (zero resource ID or existence disclosure)
+      const crossCommitExisting = await h.call("POST", "/api/measurement/imports/imp-1200/commit", h.tokenB, {
         tenantId: "tenant-alpha", expectedChunks: 1,
       });
-      assert.equal(crossCommit.status, 403);
+      const crossCommitMissing = await h.call("POST", "/api/measurement/imports/imp-does-not-exist/commit", h.tokenB, {
+        tenantId: "tenant-alpha", expectedChunks: 1,
+      });
+      const crossAbortExisting = await h.call("POST", "/api/measurement/imports/imp-1200/abort", h.tokenB, {
+        tenantId: "tenant-alpha",
+      });
+      const crossAbortMissing = await h.call("POST", "/api/measurement/imports/imp-does-not-exist/abort", h.tokenB, {
+        tenantId: "tenant-alpha",
+      });
+      assert.equal(crossCommitExisting.status, 403);
+      assert.equal(crossCommitMissing.status, 403);
+      assert.equal(crossAbortExisting.status, 403);
+      assert.equal(crossAbortMissing.status, 403);
+      const crossCommitExistingBody = await crossCommitExisting.text();
+      assert.equal(crossCommitExistingBody, JSON.stringify({ error: "forbidden" }));
+      assert.equal(await crossCommitMissing.text(), crossCommitExistingBody);
+      assert.equal(await crossAbortExisting.text(), crossCommitExistingBody);
+      assert.equal(await crossAbortMissing.text(), crossCommitExistingBody);
+      assert.doesNotMatch(crossCommitExistingBody, /site-alpha/);
 
       // Stage chunk 1 with remaining 600 observations, then commit atomically -> all 1,200 visible at once!
       const st1 = await h.call("POST", "/api/measurement/imports/stage", h.tokenA, {
@@ -1716,13 +1734,49 @@ describe("Measurement Pod — Typed 4-Family Vertical Slice, Isolation, MCP v2 +
       });
       assert.equal(commitRes.status, 200);
       assert.equal(((await commitRes.json()) as any).inserted, 1200);
-      const postCommit = (await (await h.call("GET", "/api/measurement/series?tenantId=tenant-alpha&resourceId=site-alpha&metricId=gsc.clicks&windowStart=2026-11-28&windowEnd=2026-11-28&limit=10", h.tokenA)).json()) as any;
+      const postCommit = (await (await h.call("GET", "/api/measurement/series?tenantId=tenant-alpha&resourceId=site-alpha&metricId=gsc.clicks&windowStart=2026-11-28&windowEnd=2026-11-28&limit=500", h.tokenA)).json()) as any;
       assert.equal(postCommit.total, 1200);
-      // Verify monotonic positive recordSeq is returned on every observation point
-      assert.ok(typeof postCommit.points[0].recordSeq === "number" && postCommit.points[0].recordSeq > 0);
-      const seq0 = postCommit.points.find((p: any) => p.dimensions.page === "/st1200/0");
-      const seq1 = postCommit.points.find((p: any) => p.dimensions.page === "/st1200/1");
-      if (seq0 && seq1) assert.ok(seq0.recordSeq < seq1.recordSeq);
+      // Verify monotonic positive recordSeq unconditionally on known points
+      const pt0 = (await (await h.call(
+        "GET",
+        `/api/measurement/series?tenantId=tenant-alpha&resourceId=site-alpha&metricId=gsc.clicks&windowStart=2026-11-28&windowEnd=2026-11-28&dimensions=${encodeURIComponent(JSON.stringify({ page: "/st1200/0" }))}`,
+        h.tokenA
+      )).json()) as any;
+      const pt1 = (await (await h.call(
+        "GET",
+        `/api/measurement/series?tenantId=tenant-alpha&resourceId=site-alpha&metricId=gsc.clicks&windowStart=2026-11-28&windowEnd=2026-11-28&dimensions=${encodeURIComponent(JSON.stringify({ page: "/st1200/1" }))}`,
+        h.tokenA
+      )).json()) as any;
+      assert.equal(pt0.points.length, 1);
+      assert.equal(pt1.points.length, 1);
+      assert.ok(typeof pt0.points[0].recordSeq === "number" && pt0.points[0].recordSeq > 0);
+      assert.ok(pt0.points[0].recordSeq < pt1.points[0].recordSeq);
+
+      // Durable completion receipt: sequential retry after commit succeeds idempotently (200, not 404); mismatched expectedChunks fails with 409; re-staging fails with 409
+      const commitRetryRes = await h.call("POST", "/api/measurement/imports/imp-1200/commit", h.tokenA, {
+        tenantId: "tenant-alpha", expectedChunks: 2,
+      });
+      assert.equal(commitRetryRes.status, 200);
+      const commitRetryBody = (await commitRetryRes.json()) as any;
+      assert.equal(commitRetryBody.inserted, 0);
+      assert.equal(commitRetryBody.replayedNoop, 1200);
+      const commitMismatchRes = await h.call("POST", "/api/measurement/imports/imp-1200/commit", h.tokenA, {
+        tenantId: "tenant-alpha", expectedChunks: 1,
+      });
+      assert.equal(commitMismatchRes.status, 409);
+      const restageAfterCommit = await h.call("POST", "/api/measurement/imports/stage", h.tokenA, {
+        tenantId: "tenant-alpha",
+        importId: "imp-1200",
+        chunkIndex: 0,
+        groups: [{
+          resourceId: "site-alpha", source: "gsc_export",
+          runId: "run-staged-1200", runIdempotencyKey: "idem-staged-1200",
+          sourceResourceId: "sc-domain:alpha.test",
+          windowStart: "2026-11-28", windowEnd: "2026-11-28",
+          evidence: stageEv, observations: mkChunkObs("st1200", 0, 1),
+        }],
+      });
+      assert.equal(restageAfterCommit.status, 409);
 
       // Staged import with conflict in chunk 1 commits ZERO rows from chunk 0 on commit!
       const badEv = mkEv("ev-staged-bad", await sha256Hex("ev-staged-bad"));
@@ -1825,41 +1879,10 @@ describe("Measurement Pod — Typed 4-Family Vertical Slice, Isolation, MCP v2 +
               const bound = stmt.bind(...params);
               return {
                 first: (...a: any[]) => (bound.first as any)(...a),
-                all: async (...a: any[]) => {
-                  const res = await (bound.all as any)(...a);
-                  if (!injectedAfterRead && sql.includes("FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ?")) {
-                    injectedAfterRead = true;
-                    // Simulate chunk 1 for site-beta arriving right after snapshot read!
-                    await origPrepare(
-                      "INSERT INTO ms_staged_imports (tenant_id, import_id, chunk_index, resource_ids_json, groups_json, created_at) VALUES (?, ?, ?, ?, ?, ?)"
-                    )
-                      .bind(
-                        "tenant-alpha",
-                        "imp-race",
-                        1,
-                        JSON.stringify(["site-beta"]),
-                        JSON.stringify([{
-                          resourceId: "site-beta", source: "gsc_export",
-                          runId: "run-beta-unseen", runIdempotencyKey: "idem-beta-unseen",
-                          sourceResourceId: "sc-domain:beta.test",
-                          windowStart: "2026-12-01", windowEnd: "2026-12-01",
-                          evidence: mkEv("ev-beta-unseen", await sha256Hex("ev-beta-unseen")),
-                          observations: [{
-                            metricId: "gsc.clicks", definitionVersion: "v1",
-                            windowStart: "2026-12-01", windowEnd: "2026-12-01", windowTz: "UTC", grain: "daily",
-                            dimensions: { page: "/beta-unseen" }, valueNum: 77,
-                            interpretationVersion: "v1", sourceRevision: 1, sourceAsOf: "2026-12-01T00:00:00Z",
-                            idempotencyKey: "obs-beta-unseen",
-                          }],
-                        }]),
-                        Date.now()
-                      )
-                      .run();
-                  }
-                  return res;
-                },
+                all: (...a: any[]) => (bound.all as any)(...a),
                 run: (...a: any[]) => (bound.run as any)(...a),
                 _raw: bound,
+                _sql: sql,
               };
             },
             first: (...a: any[]) => (stmt.first as any)(...a),
@@ -1867,8 +1890,42 @@ describe("Measurement Pod — Typed 4-Family Vertical Slice, Isolation, MCP v2 +
             run: (...a: any[]) => (stmt.run as any)(...a),
           };
         },
-        batch(stmts: any[]) {
-          return origBatch(stmts.map((s) => s._raw ?? s));
+        async batch(stmts: any[]) {
+          const res = await origBatch(stmts.map((s) => s._raw ?? s));
+          if (
+            !injectedAfterRead &&
+            stmts.some((s) => typeof s._sql === "string" && s._sql.includes("FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ?"))
+          ) {
+            injectedAfterRead = true;
+            // Simulate chunk 1 for site-beta arriving right after snapshot read!
+            await origPrepare(
+              "INSERT INTO ms_staged_imports (tenant_id, import_id, chunk_index, generation_id, resource_ids_json, groups_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+            )
+              .bind(
+                "tenant-alpha",
+                "imp-race",
+                1,
+                "gen-beta-unseen-1",
+                JSON.stringify(["site-beta"]),
+                JSON.stringify([{
+                  resourceId: "site-beta", source: "gsc_export",
+                  runId: "run-beta-unseen", runIdempotencyKey: "idem-beta-unseen",
+                  sourceResourceId: "sc-domain:beta.test",
+                  windowStart: "2026-12-01", windowEnd: "2026-12-01",
+                  evidence: mkEv("ev-beta-unseen", await sha256Hex("ev-beta-unseen")),
+                  observations: [{
+                    metricId: "gsc.clicks", definitionVersion: "v1",
+                    windowStart: "2026-12-01", windowEnd: "2026-12-01", windowTz: "UTC", grain: "daily",
+                    dimensions: { page: "/beta-unseen" }, valueNum: 77,
+                    interpretationVersion: "v1", sourceRevision: 1, sourceAsOf: "2026-12-01T00:00:00Z",
+                    idempotencyKey: "obs-beta-unseen",
+                  }],
+                }]),
+                Date.now()
+              )
+              .run();
+          }
+          return res;
         },
       };
       const interceptSvc = new MeasurementService(interceptDb as any);
@@ -1889,11 +1946,10 @@ describe("Measurement Pod — Typed 4-Family Vertical Slice, Isolation, MCP v2 +
         .all<any>();
       assert.deepEqual((remainingStaged.results || []).map((r: any) => Number(r.chunk_index)), [1]);
       assert.equal((await h.call("GET", "/api/measurement/runs/run-beta-unseen?tenantId=tenant-alpha", h.tokenA)).status, 404);
-      // Narrow caller attempting to abort now sees site-beta chunk 1 and MUST receive 403!
-      assert.equal(
-        (await h.call("POST", "/api/measurement/imports/imp-race/abort", narrowToken, { tenantId: "tenant-alpha" })).status,
-        403
-      );
+      // Narrow caller attempting to abort now sees site-beta chunk 1 and MUST receive uniform 403 (zero resource ID leak)!
+      const narrowAbortDenied = await h.call("POST", "/api/measurement/imports/imp-race/abort", narrowToken, { tenantId: "tenant-alpha" });
+      assert.equal(narrowAbortDenied.status, 403);
+      assert.equal(await narrowAbortDenied.text(), JSON.stringify({ error: "forbidden" }));
       // Authorized full caller can abort cleanly
       assert.equal(
         (await h.call("POST", "/api/measurement/imports/imp-race/abort", h.tokenA, { tenantId: "tenant-alpha" })).status,
@@ -1924,6 +1980,224 @@ describe("Measurement Pod — Typed 4-Family Vertical Slice, Isolation, MCP v2 +
       });
       assert.equal(oversizedRes.status, 400);
       assert.match(((await oversizedRes.json()) as any).error, /split into smaller chunks/);
+
+      // 10e. Lifecycle fencing: commit suspended across abort MUST fail with ConflictError (409) and publish ZERO rows!
+      const fenceGroup = [{
+        resourceId: "site-alpha", source: "gsc_export",
+        runId: "run-fence-abort", runIdempotencyKey: "idem-fence-abort",
+        sourceResourceId: "sc-domain:alpha.test",
+        windowStart: "2026-12-03", windowEnd: "2026-12-03",
+        evidence: mkEv("ev-fence-abort", await sha256Hex("ev-fence-abort")),
+        observations: [{
+          metricId: "gsc.clicks", definitionVersion: "v1",
+          windowStart: "2026-12-03", windowEnd: "2026-12-03", windowTz: "UTC", grain: "daily",
+          dimensions: { page: "/fence-abort" }, valueNum: 11,
+          interpretationVersion: "v1", sourceRevision: 1, sourceAsOf: "2026-12-03T00:00:00Z",
+          idempotencyKey: "obs-fence-abort",
+        }],
+      }];
+      assert.equal(
+        (await h.call("POST", "/api/measurement/imports/stage", h.tokenA, {
+          tenantId: "tenant-alpha", importId: "imp-fence-abort", chunkIndex: 0, groups: fenceGroup,
+        })).status,
+        201
+      );
+      let abortBeforeCommitBatch = false;
+      const makePausedBatchDb = (onBeforeWriteBatch: () => Promise<void>) => ({
+        prepare(sql: string) {
+          const stmt = origPrepare(sql);
+          return {
+            bind(...params: any[]) {
+              const bound = stmt.bind(...params);
+              return {
+                first: (...a: any[]) => (bound.first as any)(...a),
+                all: (...a: any[]) => (bound.all as any)(...a),
+                run: (...a: any[]) => (bound.run as any)(...a),
+                _raw: bound,
+                _sql: sql,
+              };
+            },
+            first: (...a: any[]) => (stmt.first as any)(...a),
+            all: (...a: any[]) => (stmt.all as any)(...a),
+            run: (...a: any[]) => (stmt.run as any)(...a),
+          };
+        },
+        async batch(stmts: any[]) {
+          if (stmts.some((s) => typeof s._sql === "string" && s._sql.includes("INSERT INTO ms_staged_import_receipts"))) {
+            await onBeforeWriteBatch();
+          }
+          return origBatch(stmts.map((s) => s._raw ?? s));
+        },
+      });
+      const abortRaceSvc = new MeasurementService(
+        makePausedBatchDb(async () => {
+          if (!abortBeforeCommitBatch) {
+            abortBeforeCommitBatch = true;
+            const ab = await new MeasurementService(h.db).abortStagedImport("tenant-alpha", "imp-fence-abort");
+            assert.equal(ab.discardedChunks, 1);
+          }
+        }) as any
+      );
+      await assert.rejects(
+        () => abortRaceSvc.commitStagedImport({ tenantId: "tenant-alpha", importId: "imp-fence-abort", expectedChunks: 1 }),
+        (err: any) => err?.status === 409
+      );
+      assert.equal((await h.call("GET", "/api/measurement/runs/run-fence-abort?tenantId=tenant-alpha", h.tokenA)).status, 404);
+
+      // 10f. ABA replacement race: abort and commit with stale generation_id MUST NOT delete or consume replacement chunk!
+      const abaGroup = [{
+        resourceId: "site-alpha", source: "gsc_export",
+        runId: "run-aba", runIdempotencyKey: "idem-aba",
+        sourceResourceId: "sc-domain:alpha.test",
+        windowStart: "2026-12-04", windowEnd: "2026-12-04",
+        evidence: mkEv("ev-aba", await sha256Hex("ev-aba")),
+        observations: [{
+          metricId: "gsc.clicks", definitionVersion: "v1",
+          windowStart: "2026-12-04", windowEnd: "2026-12-04", windowTz: "UTC", grain: "daily",
+          dimensions: { page: "/aba" }, valueNum: 22,
+          interpretationVersion: "v1", sourceRevision: 1, sourceAsOf: "2026-12-04T00:00:00Z",
+          idempotencyKey: "obs-aba",
+        }],
+      }];
+      const baseSvc = new MeasurementService(h.db);
+      await baseSvc.stageImportChunk({ tenantId: "tenant-alpha", importId: "imp-aba", chunkIndex: 0, groups: abaGroup });
+      let abaReplacedForAbort = false;
+      const abaAbortDb = {
+        prepare(sql: string) {
+          const stmt = origPrepare(sql);
+          return {
+            bind(...params: any[]) {
+              const bound = stmt.bind(...params);
+              return {
+                first: (...a: any[]) => (bound.first as any)(...a),
+                all: async (...a: any[]) => {
+                  const res = await (bound.all as any)(...a);
+                  if (!abaReplacedForAbort && sql.includes("FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ?")) {
+                    abaReplacedForAbort = true;
+                    // Delete original generation and re-stage identical groups_json with a brand-new generation_id!
+                    await baseSvc.abortStagedImport("tenant-alpha", "imp-aba");
+                    await baseSvc.stageImportChunk({ tenantId: "tenant-alpha", importId: "imp-aba", chunkIndex: 0, groups: abaGroup });
+                  }
+                  return res;
+                },
+                run: (...a: any[]) => (bound.run as any)(...a),
+                _raw: bound,
+                _sql: sql,
+              };
+            },
+            first: (...a: any[]) => (stmt.first as any)(...a),
+            all: (...a: any[]) => (stmt.all as any)(...a),
+            run: (...a: any[]) => (stmt.run as any)(...a),
+          };
+        },
+        batch(stmts: any[]) {
+          return origBatch(stmts.map((s) => s._raw ?? s));
+        },
+      };
+      const staleAbortRes = await new MeasurementService(abaAbortDb as any).abortStagedImport("tenant-alpha", "imp-aba");
+      assert.equal(staleAbortRes.discardedChunks, 0);
+      const abaRemaining = await h.db
+        .prepare("SELECT generation_id FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ?")
+        .bind("tenant-alpha", "imp-aba")
+        .all<any>();
+      assert.equal((abaRemaining.results || []).length, 1);
+
+      let abaReplacedForCommit = false;
+      const abaCommitSvc = new MeasurementService(
+        makePausedBatchDb(async () => {
+          if (!abaReplacedForCommit) {
+            abaReplacedForCommit = true;
+            await baseSvc.abortStagedImport("tenant-alpha", "imp-aba");
+            await baseSvc.stageImportChunk({ tenantId: "tenant-alpha", importId: "imp-aba", chunkIndex: 0, groups: abaGroup });
+          }
+        }) as any
+      );
+      await assert.rejects(
+        () => abaCommitSvc.commitStagedImport({ tenantId: "tenant-alpha", importId: "imp-aba", expectedChunks: 1 }),
+        (err: any) => err?.status === 409
+      );
+      assert.equal((await h.call("GET", "/api/measurement/runs/run-aba?tenantId=tenant-alpha", h.tokenA)).status, 404);
+      // Fresh commit of replacement generation succeeds cleanly
+      const abaFreshCommit = await baseSvc.commitStagedImport({ tenantId: "tenant-alpha", importId: "imp-aba", expectedChunks: 1 });
+      assert.equal(abaFreshCommit.inserted, 1);
+
+      // 10g. Concurrent identical commits both succeed (200 insert + 200 idempotent replay, NEVER 500 UNIQUE constraint failed!)
+      const raceCommitGroup = [{
+        resourceId: "site-alpha", source: "gsc_export",
+        runId: "run-concurrent-commit", runIdempotencyKey: "idem-concurrent-commit",
+        sourceResourceId: "sc-domain:alpha.test",
+        windowStart: "2026-12-05", windowEnd: "2026-12-05",
+        evidence: mkEv("ev-concurrent-commit", await sha256Hex("ev-concurrent-commit")),
+        observations: [{
+          metricId: "gsc.clicks", definitionVersion: "v1",
+          windowStart: "2026-12-05", windowEnd: "2026-12-05", windowTz: "UTC", grain: "daily",
+          dimensions: { page: "/concurrent-commit" }, valueNum: 33,
+          interpretationVersion: "v1", sourceRevision: 1, sourceAsOf: "2026-12-05T00:00:00Z",
+          idempotencyKey: "obs-concurrent-commit",
+        }],
+      }];
+      await baseSvc.stageImportChunk({ tenantId: "tenant-alpha", importId: "imp-conc", chunkIndex: 0, groups: raceCommitGroup });
+      let releaseBarrier!: () => void;
+      const barrier = new Promise<void>((resolve) => { releaseBarrier = resolve; });
+      let arrived = 0;
+      const barrierSvc = new MeasurementService(
+        makePausedBatchDb(async () => {
+          arrived += 1;
+          if (arrived === 2) releaseBarrier();
+          await barrier;
+        }) as any
+      );
+      const [concA, concB] = await Promise.all([
+        barrierSvc.commitStagedImport({ tenantId: "tenant-alpha", importId: "imp-conc", expectedChunks: 1 }),
+        barrierSvc.commitStagedImport({ tenantId: "tenant-alpha", importId: "imp-conc", expectedChunks: 1 }),
+      ]);
+      assert.deepEqual([concA.inserted, concB.inserted].sort(), [0, 1]);
+      assert.deepEqual([concA.replayedNoop, concB.replayedNoop].sort(), [0, 1]);
+      // Unauthorized caller retrying committed receipt receives uniform 403 (zero disclosure)
+      const unauthReceiptRetry = await h.call("POST", "/api/measurement/imports/imp-conc/commit", h.tokenB, {
+        tenantId: "tenant-alpha", expectedChunks: 1,
+      });
+      assert.equal(unauthReceiptRetry.status, 403);
+      assert.equal(await unauthReceiptRetry.text(), JSON.stringify({ error: "forbidden" }));
+
+      // 10h. Durable monotonic recordSeq NEVER reuses deleted sequence numbers after cascading deletion!
+      const beforeDelSeries = (await (await h.call(
+        "GET",
+        `/api/measurement/series?tenantId=tenant-alpha&resourceId=site-alpha&metricId=gsc.clicks&windowStart=2026-12-05&windowEnd=2026-12-05`,
+        h.tokenA
+      )).json()) as any;
+      assert.equal(beforeDelSeries.points.length, 1);
+      const maxSeqBeforeDelete = beforeDelSeries.points[0].recordSeq;
+      assert.ok(maxSeqBeforeDelete > 0);
+      await h.db.prepare("DELETE FROM ms_runs WHERE run_id = ?").bind("run-concurrent-commit").run();
+      const postDelRes = await h.call("POST", "/api/measurement/ingest-atomic", h.tokenA, {
+        tenantId: "tenant-alpha",
+        groups: [{
+          resourceId: "site-alpha", source: "gsc_export",
+          runId: "run-after-cascade-del", runIdempotencyKey: "idem-after-cascade-del",
+          sourceResourceId: "sc-domain:alpha.test",
+          windowStart: "2026-12-06", windowEnd: "2026-12-06",
+          evidence: mkEv("ev-after-cascade-del", await sha256Hex("ev-after-cascade-del")),
+          observations: [{
+            metricId: "gsc.clicks", definitionVersion: "v1",
+            windowStart: "2026-12-06", windowEnd: "2026-12-06", windowTz: "UTC", grain: "daily",
+            dimensions: { page: "/after-cascade-del" }, valueNum: 44,
+            interpretationVersion: "v1", sourceRevision: 1, sourceAsOf: "2026-12-06T00:00:00Z",
+            idempotencyKey: "obs-after-cascade-del",
+          }],
+        }],
+      });
+      assert.equal(postDelRes.status, 200);
+      const afterDelSeries = (await (await h.call(
+        "GET",
+        `/api/measurement/series?tenantId=tenant-alpha&resourceId=site-alpha&metricId=gsc.clicks&windowStart=2026-12-06&windowEnd=2026-12-06`,
+        h.tokenA
+      )).json()) as any;
+      assert.equal(afterDelSeries.points.length, 1);
+      assert.ok(
+        afterDelSeries.points[0].recordSeq > maxSeqBeforeDelete,
+        `Expected strictly monotonic recordSeq > ${maxSeqBeforeDelete}, got ${afterDelSeries.points[0].recordSeq}`
+      );
     } finally {
       h.cleanup();
     }

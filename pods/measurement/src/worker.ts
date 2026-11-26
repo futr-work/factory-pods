@@ -40,6 +40,18 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
+function hasAnyTenantWriteGrant(
+  caller: { grants: Array<{ tenantId: string; resourceIds: string[]; actions: string[] }> },
+  tenantId: string
+): boolean {
+  return caller.grants.some(
+    (g) =>
+      g.tenantId === tenantId &&
+      g.resourceIds.length > 0 &&
+      (g.actions.includes("*") || g.actions.includes("write"))
+  );
+}
+
 function errorResponse(err: unknown): Response {
   if (err instanceof ValidationError) return jsonResponse({ error: err.message }, 400);
   if (err instanceof ForbiddenError) return jsonResponse({ error: err.message }, 403);
@@ -211,6 +223,9 @@ export default {
           if (!tenantId) {
             return jsonResponse({ error: "Field 'tenantId' must be a non-empty string" }, 400);
           }
+          if (!hasAnyTenantWriteGrant(caller, tenantId)) {
+            return jsonResponse({ error: "forbidden" }, 403);
+          }
           if (!Array.isArray(body.groups) || body.groups.length === 0 || body.groups.length > 1000) {
             const tenantDenied = authorizeScopedCaller(caller, { tenantId, resourceId: "*", action: "write" }, "measurement-pod");
             if (tenantDenied) return tenantDenied;
@@ -245,6 +260,9 @@ export default {
           if (!caller) return jsonResponse({ error: "unauthorized" }, 401);
           if (!tenantId) {
             return jsonResponse({ error: "Field 'tenantId' must be a non-empty string" }, 400);
+          }
+          if (!hasAnyTenantWriteGrant(caller, tenantId)) {
+            return jsonResponse({ error: "forbidden" }, 403);
           }
           if (!Array.isArray(body.groups) || body.groups.length === 0 || body.groups.length > 1000) {
             const tenantDenied = authorizeScopedCaller(caller, { tenantId, resourceId: "*", action: "write" }, "measurement-pod");
@@ -283,6 +301,9 @@ export default {
           if (!tenantId) {
             return jsonResponse({ error: "Field 'tenantId' must be a non-empty string" }, 400);
           }
+          if (!hasAnyTenantWriteGrant(caller, tenantId)) {
+            return jsonResponse({ error: "forbidden" }, 403);
+          }
           const result = await service.commitStagedImport(
             {
               tenantId,
@@ -293,7 +314,7 @@ export default {
             {
               authorizeResourceWrite: (rid: string) => {
                 const denied = authorizeScopedCaller(caller, { tenantId, resourceId: rid, action: "write" }, "measurement-pod");
-                if (denied) throw new ForbiddenError(`Caller not authorized for resource '${rid}'`);
+                if (denied) throw new ForbiddenError("forbidden");
               },
             }
           );
@@ -312,10 +333,13 @@ export default {
           if (!tenantId) {
             return jsonResponse({ error: "Field 'tenantId' must be a non-empty string" }, 400);
           }
+          if (!hasAnyTenantWriteGrant(caller, tenantId)) {
+            return jsonResponse({ error: "forbidden" }, 403);
+          }
           const result = await service.abortStagedImport(tenantId, importId, {
             authorizeResourceWrite: (rid: string) => {
               const denied = authorizeScopedCaller(caller, { tenantId, resourceId: rid, action: "write" }, "measurement-pod");
-              if (denied) throw new ForbiddenError(`Caller not authorized for resource '${rid}'`);
+              if (denied) throw new ForbiddenError("forbidden");
             },
           });
           return jsonResponse(result, 200);

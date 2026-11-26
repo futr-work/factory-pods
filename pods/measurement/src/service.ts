@@ -87,8 +87,30 @@ const MAX_ATOMIC_GROUPS = 1000;
 const MAX_STAGED_IMPORT_OBSERVATIONS = 20000;
 const MAX_STAGED_IMPORT_CHUNKS = 50;
 const MAX_STAGED_CHUNK_BYTES = 1_500_000;
+const MAX_FENCE_CHUNKS_PER_STMT = 30;
 const MAX_IN_CLAUSE_ITEMS = 90;
 const MAX_LIST_LIMIT = 500;
+
+function errorText(err: unknown): string {
+  if (err instanceof Error) {
+    const cause = (err as any).cause;
+    return cause ? `${err.message} ${String(cause)}` : err.message;
+  }
+  return String(err ?? "");
+}
+
+function isUniqueConstraintError(err: unknown): boolean {
+  const msg = errorText(err);
+  return msg.includes("UNIQUE constraint failed") || msg.includes("PRIMARY KEY constraint failed");
+}
+
+function isNotNullConstraintError(err: unknown): boolean {
+  return errorText(err).includes("NOT NULL constraint failed");
+}
+
+function isReceiptUniqueError(err: unknown): boolean {
+  return isUniqueConstraintError(err) && errorText(err).includes("ms_staged_import_receipts");
+}
 
 function validateEvidencePointer(val: unknown): string {
   const uri = requireNonEmptyString(val, "evidence.uriPointer", 512);
@@ -870,7 +892,32 @@ export class MeasurementService {
   private async commitGroupsAtomically(
     tenantId: string,
     groups: Array<Record<string, any>>,
-    opts: { maxObservationsPerGroup: number; allowInlineRunCreate: boolean; extraStatements?: any[] },
+    opts: {
+      maxObservationsPerGroup: number;
+      allowInlineRunCreate: boolean;
+      buildPreStatements?: (summary: {
+        inserted: number;
+        replayedNoop: number;
+        groups: Array<{
+          runId: string;
+          evidenceId: string;
+          inserted: number;
+          replayedNoop: number;
+          coverageStatus: string | null;
+        }>;
+      }) => any[];
+      buildPostStatements?: (summary: {
+        inserted: number;
+        replayedNoop: number;
+        groups: Array<{
+          runId: string;
+          evidenceId: string;
+          inserted: number;
+          replayedNoop: number;
+          coverageStatus: string | null;
+        }>;
+      }) => any[];
+    },
     now: number
   ): Promise<{
     inserted: number;
@@ -883,52 +930,64 @@ export class MeasurementService {
       coverageStatus: string | null;
     }>;
   }> {
-    const shared = await this.prefetchIngestState(tenantId, groups);
-    const preparedList: any[] = [];
-    for (const grp of groups) {
-      const prepared = await this.prepareIngestGroup(
-        { ...grp, tenantId } as any,
-        { maxObservations: opts.maxObservationsPerGroup, allowInlineRunCreate: opts.allowInlineRunCreate },
-        shared
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const shared = await this.prefetchIngestState(tenantId, groups);
+      const preparedList: any[] = [];
+      for (const grp of groups) {
+        const prepared = await this.prepareIngestGroup(
+          { ...grp, tenantId } as any,
+          { maxObservations: opts.maxObservationsPerGroup, allowInlineRunCreate: opts.allowInlineRunCreate },
+          shared
+        );
+        preparedList.push(prepared);
+      }
+
+      const existingBatchMap = await this.fetchExistingBatches(
+        tenantId,
+        preparedList.map((p) => p.batchDigest)
       );
-      preparedList.push(prepared);
+
+      const groupResults: Array<{
+        runId: string;
+        evidenceId: string;
+        inserted: number;
+        replayedNoop: number;
+        coverageStatus: string | null;
+      }> = [];
+      let totalInserted = 0;
+      let totalReplayedNoop = 0;
+
+      for (const prepared of preparedList) {
+        const res = this.emitPreparedGroupStatements(prepared, existingBatchMap.get(prepared.batchDigest), shared, now);
+        groupResults.push(res);
+        totalInserted += res.inserted;
+        totalReplayedNoop += res.replayedNoop;
+      }
+
+      const summary = {
+        inserted: totalInserted,
+        replayedNoop: totalReplayedNoop,
+        groups: groupResults,
+      };
+      const preStatements = opts.buildPreStatements ? opts.buildPreStatements(summary) : [];
+      const postStatements = opts.buildPostStatements ? opts.buildPostStatements(summary) : [];
+      const allStatements = [...preStatements, ...shared.statements, ...postStatements];
+
+      if (allStatements.length > 0) {
+        try {
+          await this.db.batch(allStatements);
+        } catch (err) {
+          if (attempt === 0 && isUniqueConstraintError(err) && !isReceiptUniqueError(err)) {
+            continue;
+          }
+          throw err;
+        }
+      }
+
+      return summary;
     }
 
-    const existingBatchMap = await this.fetchExistingBatches(
-      tenantId,
-      preparedList.map((p) => p.batchDigest)
-    );
-
-    const groupResults: Array<{
-      runId: string;
-      evidenceId: string;
-      inserted: number;
-      replayedNoop: number;
-      coverageStatus: string | null;
-    }> = [];
-    let totalInserted = 0;
-    let totalReplayedNoop = 0;
-
-    for (const prepared of preparedList) {
-      const res = this.emitPreparedGroupStatements(prepared, existingBatchMap.get(prepared.batchDigest), shared, now);
-      groupResults.push(res);
-      totalInserted += res.inserted;
-      totalReplayedNoop += res.replayedNoop;
-    }
-
-    if (opts.extraStatements && opts.extraStatements.length > 0) {
-      shared.statements.push(...opts.extraStatements);
-    }
-
-    if (shared.statements.length > 0) {
-      await this.db.batch(shared.statements);
-    }
-
-    return {
-      inserted: totalInserted,
-      replayedNoop: totalReplayedNoop,
-      groups: groupResults,
-    };
+    throw new ConflictError("Concurrent ingest conflict; retry request");
   }
 
   public async ingestBatch(raw: IngestBatchInput, now = Date.now()): Promise<{
@@ -1043,23 +1102,37 @@ export class MeasurementService {
       );
     }
 
-    // Race-safe idempotent insert: INSERT OR IGNORE avoids unhandled PK 500 under concurrent staging
+    const generationId = crypto.randomUUID();
+    // Race-safe idempotent insert with immutable generation_id, fenced against already-committed imports
     const insertRes = await this.db
       .prepare(
-        `INSERT OR IGNORE INTO ms_staged_imports (tenant_id, import_id, chunk_index, resource_ids_json, groups_json, created_at)
-         VALUES (?, ?, ?, ?, ?, ?)`
+        `INSERT OR IGNORE INTO ms_staged_imports (
+           tenant_id, import_id, chunk_index, generation_id, resource_ids_json, groups_json, created_at
+         )
+         SELECT ?, ?, ?, ?, ?, ?, ?
+         WHERE NOT EXISTS (
+           SELECT 1 FROM ms_staged_import_receipts WHERE tenant_id = ? AND import_id = ?
+         )`
       )
-      .bind(tenantId, importId, raw.chunkIndex, resourceIdsJson, groupsJson, now)
+      .bind(tenantId, importId, raw.chunkIndex, generationId, resourceIdsJson, groupsJson, now, tenantId, importId)
       .run();
 
     if (Number(insertRes.meta?.changes ?? 0) > 0) {
       return { importId, chunkIndex: raw.chunkIndex, observations: chunkObs, existing: false };
     }
 
-    const existing = await this.db
-      .prepare("SELECT groups_json FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ? AND chunk_index = ?")
-      .bind(tenantId, importId, raw.chunkIndex)
-      .first<any>();
+    const [receiptRes, existingRes] = await this.db.batch<any>([
+      this.db
+        .prepare("SELECT import_id FROM ms_staged_import_receipts WHERE tenant_id = ? AND import_id = ?")
+        .bind(tenantId, importId),
+      this.db
+        .prepare("SELECT groups_json FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ? AND chunk_index = ?")
+        .bind(tenantId, importId, raw.chunkIndex),
+    ]);
+    if ((receiptRes?.results || []).length > 0) {
+      throw new ConflictError(`Staged import '${importId}' has already been committed`);
+    }
+    const existing = (existingRes?.results || [])[0];
     if (!existing) {
       throw new ConflictError(`Staged import '${importId}' chunk ${raw.chunkIndex} changed concurrently`);
     }
@@ -1067,6 +1140,64 @@ export class MeasurementService {
       throw new ConflictError(`Staged import '${importId}' chunk ${raw.chunkIndex} already exists with different payload`);
     }
     return { importId, chunkIndex: raw.chunkIndex, observations: chunkObs, existing: true };
+  }
+
+  private resolveStagedImportReceiptReplay(
+    importId: string,
+    receipt: any,
+    expectedChunks: number,
+    payloadDigest: string | null,
+    auth?: { authorizeResourceWrite?: (resourceId: string) => void }
+  ): {
+    importId: string;
+    inserted: number;
+    replayedNoop: number;
+    groups: Array<{
+      runId: string;
+      evidenceId: string;
+      inserted: number;
+      replayedNoop: number;
+      coverageStatus: string | null;
+    }>;
+  } {
+    let receiptResourceIds: string[] = [];
+    try {
+      const parsed = JSON.parse(receipt.resource_ids_json || "[]");
+      if (Array.isArray(parsed)) {
+        receiptResourceIds = parsed.map((rid) => String(rid).trim()).filter(Boolean);
+      }
+    } catch {
+      receiptResourceIds = [];
+    }
+    if (receiptResourceIds.length === 0) {
+      auth?.authorizeResourceWrite?.("*");
+    } else {
+      for (const rid of receiptResourceIds) {
+        auth?.authorizeResourceWrite?.(rid);
+      }
+    }
+    if (Number(receipt.expected_chunks) !== expectedChunks) {
+      throw new ConflictError(`Staged import '${importId}' was already committed with different chunk count`);
+    }
+    if (payloadDigest !== null && String(receipt.payload_digest) !== payloadDigest) {
+      throw new ConflictError(`Staged import '${importId}' was already committed with different payload`);
+    }
+    const stored = JSON.parse(receipt.result_json || "{}");
+    const groups = Array.isArray(stored.groups)
+      ? stored.groups.map((g: any) => ({
+          runId: String(g.runId),
+          evidenceId: String(g.evidenceId),
+          inserted: 0,
+          replayedNoop: Number(g.totalObservations ?? 0),
+          coverageStatus: g.coverageStatus ?? null,
+        }))
+      : [];
+    return {
+      importId,
+      inserted: 0,
+      replayedNoop: Number(stored.totalObservations ?? 0),
+      groups,
+    };
   }
 
   public async commitStagedImport(
@@ -1095,12 +1226,26 @@ export class MeasurementService {
       throw new ValidationError(`expectedChunks must be an integer in [1, ${MAX_STAGED_IMPORT_CHUNKS}]`);
     }
 
-    // Single authoritative read: authorization, validation, commit, and exact-row cleanup all bind to THIS exact snapshot!
-    const res = await this.db
-      .prepare("SELECT chunk_index, resource_ids_json, groups_json FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ? ORDER BY chunk_index ASC")
-      .bind(tenantId, importId)
-      .all<any>();
-    const rows = res.results || [];
+    // Single authoritative batched read: chunks + durable completion receipt
+    const [chunksRes, receiptRes] = await this.db.batch<any>([
+      this.db
+        .prepare(
+          "SELECT chunk_index, generation_id, resource_ids_json, groups_json FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ? ORDER BY chunk_index ASC"
+        )
+        .bind(tenantId, importId),
+      this.db
+        .prepare(
+          "SELECT payload_digest, expected_chunks, resource_ids_json, result_json FROM ms_staged_import_receipts WHERE tenant_id = ? AND import_id = ?"
+        )
+        .bind(tenantId, importId),
+    ]);
+    const rows = chunksRes?.results || [];
+    const existingReceipt = (receiptRes?.results || [])[0] ?? null;
+
+    if (existingReceipt) {
+      return this.resolveStagedImportReceiptReplay(importId, existingReceipt, raw.expectedChunks, null, auth);
+    }
+
     if (rows.length === 0) {
       auth?.authorizeResourceWrite?.("*");
       throw new NotFoundError(`Staged import '${importId}' not found`);
@@ -1125,8 +1270,12 @@ export class MeasurementService {
       }
     }
     // Authorize EVERY resource present in the exact read snapshot BEFORE validating/committing
-    for (const rid of seenResourceIds) {
-      auth?.authorizeResourceWrite?.(rid);
+    if (seenResourceIds.size === 0) {
+      auth?.authorizeResourceWrite?.("*");
+    } else {
+      for (const rid of seenResourceIds) {
+        auth?.authorizeResourceWrite?.(rid);
+      }
     }
 
     if (rows.length !== raw.expectedChunks) {
@@ -1141,29 +1290,127 @@ export class MeasurementService {
       throw new ValidationError(`Staged import exceeds maximum size (${MAX_STAGED_IMPORT_OBSERVATIONS} observations)`);
     }
 
-    // Delete ONLY the exact (chunk_index, groups_json) rows we read, authorized, and committed —
-    // never wipe out a concurrently staged unseen or replacement chunk!
-    const cleanupStmts = rows.map((row) =>
-      this.db
-        .prepare("DELETE FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ? AND chunk_index = ? AND groups_json = ?")
-        .bind(tenantId, importId, Number(row.chunk_index), String(row.groups_json))
+    const payloadDigest = await sha256Hex(
+      canonicalJson({
+        expectedChunks: raw.expectedChunks,
+        chunks: rows.map((row) => [Number(row.chunk_index), String(row.groups_json)]),
+      })
     );
+    const sortedResourceIdsJson = canonicalJson([...seenResourceIds].sort());
 
-    const out = await this.commitGroupsAtomically(
-      tenantId,
-      allGroups,
-      {
-        maxObservationsPerGroup: MAX_ATOMIC_OBSERVATIONS,
-        allowInlineRunCreate: true,
-        extraStatements: cleanupStmts,
-      },
-      now
-    );
-
-    return {
-      importId,
-      ...out,
+    // Transactional lifecycle fence + completion receipt + exact-generation cleanup inside ONE atomic db.batch:
+    // 1. INSERT into ms_staged_import_receipts arbitrates concurrent commits for (tenantId, importId).
+    // 2. UPDATE ms_staged_import_receipts asserts EVERY staged (chunk_index, generation_id) from our snapshot
+    //    is STILL present; if any chunk was aborted or replaced (ABA), payload_digest becomes NULL -> NOT NULL
+    //    constraint failure rolls back the entire transaction!
+    // 3. Domain writes execute.
+    // 4. DELETE removes ONLY the exact fenced (chunk_index, generation_id) rows.
+    const buildPreStatements = (summary: {
+      inserted: number;
+      replayedNoop: number;
+      groups: Array<{
+        runId: string;
+        evidenceId: string;
+        inserted: number;
+        replayedNoop: number;
+        coverageStatus: string | null;
+      }>;
+    }) => {
+      const receiptPayload = canonicalJson({
+        totalObservations: summary.inserted + summary.replayedNoop,
+        groups: summary.groups.map((g) => ({
+          runId: g.runId,
+          evidenceId: g.evidenceId,
+          totalObservations: g.inserted + g.replayedNoop,
+          coverageStatus: g.coverageStatus,
+        })),
+      });
+      const stmts: any[] = [
+        this.db
+          .prepare(
+            `INSERT INTO ms_staged_import_receipts (
+               tenant_id, import_id, payload_digest, expected_chunks, resource_ids_json, result_json, committed_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?)`
+          )
+          .bind(tenantId, importId, payloadDigest, raw.expectedChunks, sortedResourceIdsJson, receiptPayload, now),
+      ];
+      for (let i = 0; i < rows.length; i += MAX_FENCE_CHUNKS_PER_STMT) {
+        const slice = rows.slice(i, i + MAX_FENCE_CHUNKS_PER_STMT);
+        const clauses = slice.map(() => "(chunk_index = ? AND generation_id = ?)").join(" OR ");
+        const binds: unknown[] = [tenantId, importId];
+        for (const row of slice) {
+          binds.push(Number(row.chunk_index), String(row.generation_id));
+        }
+        binds.push(slice.length, tenantId, importId);
+        stmts.push(
+          this.db
+            .prepare(
+              `UPDATE ms_staged_import_receipts
+               SET payload_digest = CASE
+                 WHEN (
+                   SELECT COUNT(*) FROM ms_staged_imports
+                   WHERE tenant_id = ? AND import_id = ? AND (${clauses})
+                 ) = ?
+                 THEN payload_digest
+                 ELSE NULL
+               END
+               WHERE tenant_id = ? AND import_id = ?`
+            )
+            .bind(...binds)
+        );
+      }
+      return stmts;
     };
+
+    const buildPostStatements = () =>
+      rows.map((row) =>
+        this.db
+          .prepare(
+            "DELETE FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ? AND chunk_index = ? AND generation_id = ?"
+          )
+          .bind(tenantId, importId, Number(row.chunk_index), String(row.generation_id))
+      );
+
+    try {
+      const out = await this.commitGroupsAtomically(
+        tenantId,
+        allGroups,
+        {
+          maxObservationsPerGroup: MAX_ATOMIC_OBSERVATIONS,
+          allowInlineRunCreate: true,
+          buildPreStatements,
+          buildPostStatements,
+        },
+        now
+      );
+
+      return {
+        importId,
+        ...out,
+      };
+    } catch (err) {
+      if (isUniqueConstraintError(err) || isNotNullConstraintError(err)) {
+        const concurrentReceipt = await this.db
+          .prepare(
+            "SELECT payload_digest, expected_chunks, resource_ids_json, result_json FROM ms_staged_import_receipts WHERE tenant_id = ? AND import_id = ?"
+          )
+          .bind(tenantId, importId)
+          .first<any>();
+        if (concurrentReceipt) {
+          return this.resolveStagedImportReceiptReplay(
+            importId,
+            concurrentReceipt,
+            raw.expectedChunks,
+            payloadDigest,
+            auth
+          );
+        }
+        if (isNotNullConstraintError(err)) {
+          throw new ConflictError(`Staged import '${importId}' was aborted or modified concurrently`);
+        }
+      }
+      throw err;
+    }
   }
 
   public async abortStagedImport(
@@ -1173,9 +1420,9 @@ export class MeasurementService {
   ): Promise<{ aborted: true; discardedChunks: number }> {
     const tid = requireNonEmptyString(tenantId, "tenantId", 128);
     const iid = requireNonEmptyString(importId, "importId", 128);
-    // Single authoritative read: authorize EVERY resource in the read snapshot, then delete ONLY those exact rows!
+    // Single authoritative read: authorize EVERY resource in the read snapshot, then delete ONLY those exact immutable generations!
     const res = await this.db
-      .prepare("SELECT chunk_index, resource_ids_json, groups_json FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ?")
+      .prepare("SELECT chunk_index, generation_id, resource_ids_json, groups_json FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ?")
       .bind(tid, iid)
       .all<any>();
     const rows = res.results || [];
@@ -1197,13 +1444,17 @@ export class MeasurementService {
         }
       }
     }
-    for (const rid of seenResourceIds) {
-      auth?.authorizeResourceWrite?.(rid);
+    if (seenResourceIds.size === 0) {
+      auth?.authorizeResourceWrite?.("*");
+    } else {
+      for (const rid of seenResourceIds) {
+        auth?.authorizeResourceWrite?.(rid);
+      }
     }
     const delStmts = rows.map((row) =>
       this.db
-        .prepare("DELETE FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ? AND chunk_index = ? AND groups_json = ?")
-        .bind(tid, iid, Number(row.chunk_index), String(row.groups_json))
+        .prepare("DELETE FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ? AND chunk_index = ? AND generation_id = ?")
+        .bind(tid, iid, Number(row.chunk_index), String(row.generation_id))
     );
     const delRes = await this.db.batch(delStmts);
     const discarded = delRes.reduce((sum, r) => sum + Number(r.meta?.changes ?? 0), 0);
@@ -2102,9 +2353,9 @@ export class MeasurementService {
 
     const rowsRes = await this.db
       .prepare(
-        `SELECT rowid AS record_seq, * FROM ms_observations
+        `SELECT * FROM ms_observations
          WHERE ${where.join(" AND ")}
-         ORDER BY window_start ASC, window_end ASC, dimensions_hash ASC, source_revision DESC, created_at DESC, rowid DESC`
+         ORDER BY window_start ASC, window_end ASC, dimensions_hash ASC, source_revision DESC, created_at DESC, record_seq DESC`
       )
       .bind(...binds)
       .all<any>();
