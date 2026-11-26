@@ -304,6 +304,15 @@ CREATE TABLE IF NOT EXISTS ms_staged_import_receipts (
   PRIMARY KEY (tenant_id, import_id)
 );
 
+CREATE TABLE IF NOT EXISTS ms_staged_import_receipt_chunks (
+  tenant_id TEXT NOT NULL,
+  import_id TEXT NOT NULL,
+  part_index INTEGER NOT NULL,
+  resource_ids_json TEXT NOT NULL,
+  groups_json TEXT NOT NULL,
+  PRIMARY KEY (tenant_id, import_id, part_index)
+);
+
 -- Indexes for bounded paginated queries & capacity floor
 CREATE INDEX IF NOT EXISTS idx_tasks_task_id ON tasks(task_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);

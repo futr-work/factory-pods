@@ -2727,6 +2727,163 @@ describe("Measurement Pod — Typed 4-Family Vertical Slice, Isolation, MCP v2 +
           ),
         (err: any) => err?.message === "forbidden"
       );
+
+      // 10o. Bounded sharded completion receipts: 7,000 single-obs groups with long IDs stay <= 500 KB per row (well under D1's 2 MB limit) and replay identically!
+      const longPrefix = "r".repeat(90);
+      const longEvPrefix = "e".repeat(90);
+      const sharedBigSha = await sha256Hex("big-receipt-shared");
+      for (let c = 0; c < 7; c++) {
+        const chunkGroups = Array.from({ length: 1000 }, (_, i) => {
+          const n = c * 1000 + i;
+          return {
+            resourceId: "site-alpha",
+            source: "gsc_export",
+            runId: `${longPrefix}-${n}`,
+            runIdempotencyKey: `idem-${longPrefix}-${n}`,
+            sourceResourceId: "sc-domain:alpha.test",
+            windowStart: "2026-12-10",
+            windowEnd: "2026-12-10",
+            evidence: mkEv(`${longEvPrefix}-${n}`, sharedBigSha),
+            observations: [{
+              metricId: "gsc.clicks",
+              definitionVersion: "v1",
+              windowStart: "2026-12-10",
+              windowEnd: "2026-12-10",
+              windowTz: "UTC",
+              grain: "daily",
+              dimensions: { page: `/bigrcpt/${n}` },
+              valueNum: n,
+              interpretationVersion: "v1",
+              sourceRevision: 1,
+              sourceAsOf: "2026-12-10T00:00:00Z",
+              idempotencyKey: `obs-bigrcpt-${n}`,
+            }],
+          };
+        });
+        const stBig = await baseSvc.stageImportChunk({
+          tenantId: "tenant-alpha",
+          importId: "imp-big-receipt",
+          chunkIndex: c,
+          groups: chunkGroups,
+        });
+        assert.equal(stBig.existing, false);
+      }
+      const bigCommitRes = await baseSvc.commitStagedImport({
+        tenantId: "tenant-alpha",
+        importId: "imp-big-receipt",
+        expectedChunks: 7,
+      });
+      assert.equal(bigCommitRes.inserted, 7000);
+      assert.equal(bigCommitRes.groups.length, 7000);
+      const bigReceiptHeader = await h.db
+        .prepare("SELECT resource_ids_json, result_json FROM ms_staged_import_receipts WHERE tenant_id = ? AND import_id = ?")
+        .bind("tenant-alpha", "imp-big-receipt")
+        .first<any>();
+      assert.ok(bigReceiptHeader);
+      assert.ok(new TextEncoder().encode(String(bigReceiptHeader.result_json)).byteLength < 200);
+      const bigReceiptParts = await h.db
+        .prepare("SELECT part_index, resource_ids_json, groups_json FROM ms_staged_import_receipt_chunks WHERE tenant_id = ? AND import_id = ? ORDER BY part_index ASC")
+        .bind("tenant-alpha", "imp-big-receipt")
+        .all<any>();
+      const partsList = bigReceiptParts.results || [];
+      assert.ok(partsList.length >= 4, `Expected >= 4 bounded receipt parts for 7,000 long-ID groups, got ${partsList.length}`);
+      for (const part of partsList) {
+        const rowBytes =
+          new TextEncoder().encode(String(part.resource_ids_json)).byteLength +
+          new TextEncoder().encode(String(part.groups_json)).byteLength;
+        assert.ok(rowBytes <= 500_000, `Receipt part ${part.part_index} exceeded 500 KB bound: ${rowBytes}`);
+      }
+      // Replay via sharded receipt returns exact 7,000 replayed groups and enforces narrow-caller authorization!
+      const bigReplay = await baseSvc.commitStagedImport({
+        tenantId: "tenant-alpha",
+        importId: "imp-big-receipt",
+        expectedChunks: 7,
+      });
+      assert.equal(bigReplay.inserted, 0);
+      assert.equal(bigReplay.replayedNoop, 7000);
+      assert.equal(bigReplay.groups.length, 7000);
+      const narrowBigReplayDenied = await h.call("POST", "/api/measurement/imports/imp-big-receipt/commit", narrowBetaToken, {
+        tenantId: "tenant-alpha",
+        expectedChunks: 7,
+      });
+      assert.equal(narrowBigReplayDenied.status, 403);
+      assert.equal(await narrowBigReplayDenied.text(), JSON.stringify({ error: "forbidden" }));
+
+      // 10p. Paged staged-import reads (>16 chunks): commit fetches <= 16 groups_json rows per query AND abort NEVER selects groups_json!
+      for (let c = 0; c < 20; c++) {
+        await baseSvc.stageImportChunk({
+          tenantId: "tenant-alpha",
+          importId: "imp-paged-20",
+          chunkIndex: c,
+          groups: await mkNarrowGroup("site-alpha", `pg20-${c}`),
+        });
+      }
+      let maxGroupsJsonPerQuery = 0;
+      const pagedInspectorDb = {
+        prepare(sql: string) {
+          const stmt = origPrepare(sql);
+          const wrapRes = (res: any) => {
+            if (Array.isArray(res?.results)) {
+              const nonNullGroups = res.results.filter((r: any) => r && r.groups_json !== undefined && r.groups_json !== null).length;
+              if (nonNullGroups > maxGroupsJsonPerQuery) maxGroupsJsonPerQuery = nonNullGroups;
+            }
+            return res;
+          };
+          return {
+            bind(...params: any[]) {
+              const bound = stmt.bind(...params);
+              return {
+                first: (...a: any[]) => (bound.first as any)(...a),
+                all: async (...a: any[]) => wrapRes(await (bound.all as any)(...a)),
+                run: (...a: any[]) => (bound.run as any)(...a),
+                _raw: bound,
+                _sql: sql,
+              };
+            },
+            first: (...a: any[]) => (stmt.first as any)(...a),
+            all: async (...a: any[]) => wrapRes(await (stmt.all as any)(...a)),
+            run: (...a: any[]) => (stmt.run as any)(...a),
+          };
+        },
+        async batch(stmts: any[]) {
+          const results = await origBatch(stmts.map((s) => s._raw ?? s));
+          for (const res of results) {
+            if (Array.isArray(res?.results)) {
+              const nonNullGroups = res.results.filter((r: any) => r && r.groups_json !== undefined && r.groups_json !== null).length;
+              if (nonNullGroups > maxGroupsJsonPerQuery) maxGroupsJsonPerQuery = nonNullGroups;
+            }
+          }
+          return results;
+        },
+      };
+      const pagedCommit = await new MeasurementService(pagedInspectorDb as any).commitStagedImport({
+        tenantId: "tenant-alpha",
+        importId: "imp-paged-20",
+        expectedChunks: 20,
+      });
+      assert.equal(pagedCommit.inserted, 20);
+      assert.ok(maxGroupsJsonPerQuery <= 16, `Expected <= 16 groups_json rows per query, got ${maxGroupsJsonPerQuery}`);
+
+      // Abort NEVER selects groups_json at all even for 20 staged chunks!
+      for (let c = 0; c < 20; c++) {
+        await baseSvc.stageImportChunk({
+          tenantId: "tenant-alpha",
+          importId: "imp-abort-20",
+          chunkIndex: c,
+          groups: await mkNarrowGroup("site-alpha", `ab20-${c}`),
+        });
+      }
+      let abortSelectedGroupsJson = false;
+      const abortInspectorDb = {
+        prepare(sql: string) {
+          if (sql.includes("groups_json")) abortSelectedGroupsJson = true;
+          return origPrepare(sql);
+        },
+        batch: (stmts: any[]) => origBatch(stmts),
+      };
+      const abort20Res = await new MeasurementService(abortInspectorDb as any).abortStagedImport("tenant-alpha", "imp-abort-20");
+      assert.equal(abort20Res.discardedChunks, 20);
+      assert.equal(abortSelectedGroupsJson, false);
     } finally {
       h.cleanup();
     }

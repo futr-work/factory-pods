@@ -87,6 +87,9 @@ const MAX_ATOMIC_GROUPS = 1000;
 const MAX_STAGED_IMPORT_OBSERVATIONS = 20000;
 const MAX_STAGED_IMPORT_CHUNKS = 50;
 const MAX_STAGED_CHUNK_BYTES = 1_500_000;
+const MAX_COMMIT_PAYLOAD_PAGE_CHUNKS = 16;
+const MAX_RECEIPT_PART_BYTES = 500_000;
+const MAX_RECEIPT_READ_PAGE_PARTS = 20;
 const MAX_FENCE_CHUNKS_PER_STMT = 30;
 const MAX_DOMAIN_CONTENTION_ATTEMPTS = 4;
 const MAX_IN_CLAUSE_ITEMS = 90;
@@ -176,6 +179,14 @@ export async function ensureMeasurementSchemaUpgraded(
       result_json TEXT NOT NULL,
       committed_at INTEGER NOT NULL,
       PRIMARY KEY (tenant_id, import_id)
+    )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS ms_staged_import_receipt_chunks (
+      tenant_id TEXT NOT NULL,
+      import_id TEXT NOT NULL,
+      part_index INTEGER NOT NULL,
+      resource_ids_json TEXT NOT NULL,
+      groups_json TEXT NOT NULL,
+      PRIMARY KEY (tenant_id, import_id, part_index)
     )`),
   ]);
 
@@ -1335,16 +1346,16 @@ export class MeasurementService {
           }
         }
       } catch {
-        // Malformed JSON handled fail-closed when set is empty
+        // Non-array digest token or malformed JSON handled separately
       }
     };
 
     const MAX_STAGE_CAS_ATTEMPTS = 4;
     for (let attempt = 0; attempt < MAX_STAGE_CAS_ATTEMPTS; attempt++) {
-      // 1. Authoritative snapshot read of receipt, session, and all existing chunks for (tenantId, importId)
+      // 1. Authoritative snapshot read: bounded to at most 1 chunk's groups_json (<= 1.5 MB)
       const [receiptRes, sessionRes, chunksRes] = await this.db.batch<any>([
         this.db
-          .prepare("SELECT resource_ids_json FROM ms_staged_import_receipts WHERE tenant_id = ? AND import_id = ?")
+          .prepare("SELECT resource_ids_json, result_json FROM ms_staged_import_receipts WHERE tenant_id = ? AND import_id = ?")
           .bind(tenantId, importId),
         this.db
           .prepare(
@@ -1352,16 +1363,27 @@ export class MeasurementService {
           )
           .bind(tenantId, importId),
         this.db
-          .prepare("SELECT chunk_index, resource_ids_json, groups_json FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ?")
-          .bind(tenantId, importId),
+          .prepare(
+            `SELECT chunk_index, resource_ids_json,
+                    CASE WHEN chunk_index = ? THEN groups_json ELSE NULL END AS groups_json
+             FROM ms_staged_imports
+             WHERE tenant_id = ? AND import_id = ?`
+          )
+          .bind(raw.chunkIndex, tenantId, importId),
       ]);
       const receipt = (receiptRes?.results || [])[0] ?? null;
       const session = (sessionRes?.results || [])[0] ?? null;
       const existingChunks = chunksRes?.results || [];
 
-      // 2. Authorize EVERY existing resource in receipt, session, AND chunks BEFORE appending or exposing state!
+      // 2. Authorize EVERY existing resource in receipt (+ sharded receipt parts), session, AND chunks BEFORE appending or exposing state!
       const existingResourceIds = new Set<string>();
-      if (receipt) collectResourceIds(receipt.resource_ids_json, existingResourceIds);
+      if (receipt) {
+        collectResourceIds(receipt.resource_ids_json, existingResourceIds);
+        const receiptParts = await this.readStagedImportReceiptChunks(tenantId, importId, receipt.result_json);
+        for (const part of receiptParts) {
+          collectResourceIds(part.resource_ids_json, existingResourceIds);
+        }
+      }
       if (session) collectResourceIds(session.resource_ids_json, existingResourceIds);
       for (const row of existingChunks) {
         collectResourceIds(row.resource_ids_json, existingResourceIds);
@@ -1393,12 +1415,13 @@ export class MeasurementService {
         return { importId, chunkIndex: raw.chunkIndex, observations: chunkObs, existing: true };
       }
 
-      // 4. Transactional write fenced against concurrent session, resource-set, orphan-chunk, or receipt changes!
+      // 4. Transactional write fenced against concurrent session, resource-set digest, orphan-chunk, or receipt changes!
       const nextSessionToken = crypto.randomUUID();
       const generationId = crypto.randomUUID();
       let insertChanges = 0;
 
       if (!session) {
+        const seedDigest = await sha256Hex(resourceIdsJson);
         const [, insertRes] = await this.db.batch<any>([
           this.db
             .prepare(
@@ -1414,7 +1437,7 @@ export class MeasurementService {
               importId,
               ownerCallerId,
               nextSessionToken,
-              resourceIdsJson,
+              seedDigest,
               now,
               tenantId,
               importId,
@@ -1451,7 +1474,7 @@ export class MeasurementService {
         ]);
         insertChanges = Number(insertRes?.meta?.changes ?? 0);
       } else {
-        const mergedResourceIdsJson = canonicalJson([...new Set([...existingResourceIds, ...resourceIds])].sort());
+        const mergedDigest = await sha256Hex(canonicalJson([...new Set([...existingResourceIds, ...resourceIds])].sort()));
         const [, insertRes] = await this.db.batch<any>([
           this.db
             .prepare(
@@ -1465,7 +1488,7 @@ export class MeasurementService {
             )
             .bind(
               nextSessionToken,
-              mergedResourceIdsJson,
+              mergedDigest,
               tenantId,
               importId,
               ownerCallerId,
@@ -1513,10 +1536,10 @@ export class MeasurementService {
       //    fail closed with uniform 403 for any caller lacking tenant-wide authority so sibling callers never get 409!
       const [postReceiptRes, postSessionRes, postChunksRes] = await this.db.batch<any>([
         this.db
-          .prepare("SELECT resource_ids_json FROM ms_staged_import_receipts WHERE tenant_id = ? AND import_id = ?")
+          .prepare("SELECT import_id FROM ms_staged_import_receipts WHERE tenant_id = ? AND import_id = ?")
           .bind(tenantId, importId),
         this.db
-          .prepare("SELECT owner_caller_id, resource_ids_json FROM ms_staged_import_sessions WHERE tenant_id = ? AND import_id = ?")
+          .prepare("SELECT owner_caller_id FROM ms_staged_import_sessions WHERE tenant_id = ? AND import_id = ?")
           .bind(tenantId, importId),
         this.db
           .prepare("SELECT chunk_index FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ?")
@@ -1536,13 +1559,112 @@ export class MeasurementService {
     throw new ConflictError(`Staged import '${importId}' chunk ${raw.chunkIndex} changed concurrently`);
   }
 
-  private resolveStagedImportReceiptReplay(
+  private partitionReceiptParts(
+    resourceIds: string[],
+    groups: Array<{ runId: string; evidenceId: string; totalObservations: number; coverageStatus: string | null }>
+  ): Array<{ resourceIdsJson: string; groupsJson: string }> {
+    const encoder = new TextEncoder();
+    const parts: Array<{ resourceIdsJson: string; groupsJson: string }> = [];
+
+    // Partition resourceIds into <= MAX_RECEIPT_PART_BYTES slices
+    const ridSlices: string[][] = [];
+    let curRids: string[] = [];
+    let curRidBytes = 2; // "[]"
+    for (const rid of resourceIds) {
+      const itemBytes = encoder.encode(JSON.stringify(rid)).byteLength + (curRids.length > 0 ? 1 : 0);
+      if (curRids.length > 0 && curRidBytes + itemBytes > MAX_RECEIPT_PART_BYTES) {
+        ridSlices.push(curRids);
+        curRids = [rid];
+        curRidBytes = 2 + encoder.encode(JSON.stringify(rid)).byteLength;
+      } else {
+        curRids.push(rid);
+        curRidBytes += itemBytes;
+      }
+    }
+    if (curRids.length > 0) ridSlices.push(curRids);
+
+    // Partition groups into <= MAX_RECEIPT_PART_BYTES slices
+    const groupSlices: Array<Array<{ runId: string; evidenceId: string; totalObservations: number; coverageStatus: string | null }>> = [];
+    let curGroups: Array<{ runId: string; evidenceId: string; totalObservations: number; coverageStatus: string | null }> = [];
+    let curGroupBytes = 2; // "[]"
+    for (const grp of groups) {
+      const itemBytes = encoder.encode(canonicalJson(grp)).byteLength + (curGroups.length > 0 ? 1 : 0);
+      if (curGroups.length > 0 && curGroupBytes + itemBytes > MAX_RECEIPT_PART_BYTES) {
+        groupSlices.push(curGroups);
+        curGroups = [grp];
+        curGroupBytes = 2 + encoder.encode(canonicalJson(grp)).byteLength;
+      } else {
+        curGroups.push(grp);
+        curGroupBytes += itemBytes;
+      }
+    }
+    if (curGroups.length > 0) groupSlices.push(curGroups);
+
+    // Pack resourceId slices and group slices while ensuring combined row payload <= MAX_RECEIPT_PART_BYTES
+    const total = Math.max(ridSlices.length, groupSlices.length, 1);
+    for (let i = 0; i < total; i++) {
+      const rJson = canonicalJson(ridSlices[i] || []);
+      const gJson = canonicalJson(groupSlices[i] || []);
+      if (encoder.encode(rJson).byteLength + encoder.encode(gJson).byteLength <= MAX_RECEIPT_PART_BYTES) {
+        parts.push({ resourceIdsJson: rJson, groupsJson: gJson });
+      } else {
+        if ((ridSlices[i] || []).length > 0) {
+          parts.push({ resourceIdsJson: rJson, groupsJson: "[]" });
+        }
+        if ((groupSlices[i] || []).length > 0) {
+          parts.push({ resourceIdsJson: "[]", groupsJson: gJson });
+        }
+      }
+    }
+    return parts;
+  }
+
+  private async readStagedImportReceiptChunks(
+    tenantId: string,
+    importId: string,
+    resultJsonRaw: unknown
+  ): Promise<Array<{ part_index: number; resource_ids_json: string; groups_json: string }>> {
+    let detailChunks = 0;
+    try {
+      const parsed = JSON.parse(String(resultJsonRaw || "{}"));
+      detailChunks = Number(parsed?.detailChunks ?? 0);
+    } catch {
+      detailChunks = 0;
+    }
+    if (!Number.isInteger(detailChunks) || detailChunks <= 0) {
+      return [];
+    }
+    const allParts: Array<{ part_index: number; resource_ids_json: string; groups_json: string }> = [];
+    for (let start = 0; start < detailChunks; start += MAX_RECEIPT_READ_PAGE_PARTS) {
+      const end = start + MAX_RECEIPT_READ_PAGE_PARTS;
+      const pageRes = await this.db
+        .prepare(
+          `SELECT part_index, resource_ids_json, groups_json
+           FROM ms_staged_import_receipt_chunks
+           WHERE tenant_id = ? AND import_id = ? AND part_index >= ? AND part_index < ?
+           ORDER BY part_index ASC`
+        )
+        .bind(tenantId, importId, start, end)
+        .all<any>();
+      for (const row of pageRes.results || []) {
+        allParts.push({
+          part_index: Number(row.part_index),
+          resource_ids_json: String(row.resource_ids_json || "[]"),
+          groups_json: String(row.groups_json || "[]"),
+        });
+      }
+    }
+    return allParts;
+  }
+
+  private async resolveStagedImportReceiptReplay(
+    tenantId: string,
     importId: string,
     receipt: any,
     expectedChunks: number,
     payloadDigest: string | null,
     auth?: { authorizeResourceWrite?: (resourceId: string) => void }
-  ): {
+  ): Promise<{
     importId: string;
     inserted: number;
     replayedNoop: number;
@@ -1553,17 +1675,28 @@ export class MeasurementService {
       replayedNoop: number;
       coverageStatus: string | null;
     }>;
-  } {
-    let receiptResourceIds: string[] = [];
-    try {
-      const parsed = JSON.parse(receipt.resource_ids_json || "[]");
-      if (Array.isArray(parsed)) {
-        receiptResourceIds = parsed.map((rid) => String(rid).trim()).filter(Boolean);
+  }> {
+    const parts = await this.readStagedImportReceiptChunks(tenantId, importId, receipt.result_json);
+    const receiptResourceIds = new Set<string>();
+    const collectRids = (rawJson: unknown) => {
+      try {
+        const parsed = JSON.parse(String(rawJson || "[]"));
+        if (Array.isArray(parsed)) {
+          for (const rid of parsed) {
+            const s = String(rid).trim();
+            if (s) receiptResourceIds.add(s);
+          }
+        }
+      } catch {
+        // fail closed if empty
       }
-    } catch {
-      receiptResourceIds = [];
+    };
+    collectRids(receipt.resource_ids_json);
+    for (const part of parts) {
+      collectRids(part.resource_ids_json);
     }
-    if (receiptResourceIds.length === 0) {
+
+    if (receiptResourceIds.size === 0) {
       auth?.authorizeResourceWrite?.("*");
     } else {
       for (const rid of receiptResourceIds) {
@@ -1576,16 +1709,41 @@ export class MeasurementService {
     if (payloadDigest !== null && String(receipt.payload_digest) !== payloadDigest) {
       throw new ConflictError(`Staged import '${importId}' was already committed with different payload`);
     }
+
     const stored = JSON.parse(receipt.result_json || "{}");
-    const groups = Array.isArray(stored.groups)
-      ? stored.groups.map((g: any) => ({
+    const groups: Array<{
+      runId: string;
+      evidenceId: string;
+      inserted: number;
+      replayedNoop: number;
+      coverageStatus: string | null;
+    }> = [];
+    if (parts.length > 0) {
+      for (const part of parts) {
+        const parsedGroups = JSON.parse(part.groups_json || "[]");
+        if (Array.isArray(parsedGroups)) {
+          for (const g of parsedGroups) {
+            groups.push({
+              runId: String(g.runId),
+              evidenceId: String(g.evidenceId),
+              inserted: 0,
+              replayedNoop: Number(g.totalObservations ?? 0),
+              coverageStatus: g.coverageStatus ?? null,
+            });
+          }
+        }
+      }
+    } else if (Array.isArray(stored.groups)) {
+      for (const g of stored.groups) {
+        groups.push({
           runId: String(g.runId),
           evidenceId: String(g.evidenceId),
           inserted: 0,
           replayedNoop: Number(g.totalObservations ?? 0),
           coverageStatus: g.coverageStatus ?? null,
-        }))
-      : [];
+        });
+      }
+    }
     return {
       importId,
       inserted: 0,
@@ -1620,24 +1778,28 @@ export class MeasurementService {
       throw new ValidationError(`expectedChunks must be an integer in [1, ${MAX_STAGED_IMPORT_CHUNKS}]`);
     }
 
-    // Single authoritative batched read: chunks + durable completion receipt
+    // Bounded initial read (at most MAX_COMMIT_PAYLOAD_PAGE_CHUNKS = 16 chunks of groups_json -> <= 24 MB, well below D1's 50 MB query limit)
     const [chunksRes, receiptRes] = await this.db.batch<any>([
       this.db
         .prepare(
-          "SELECT chunk_index, generation_id, resource_ids_json, groups_json FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ? ORDER BY chunk_index ASC"
+          `SELECT chunk_index, generation_id, resource_ids_json,
+                  CASE WHEN chunk_index < ? THEN groups_json ELSE NULL END AS groups_json
+           FROM ms_staged_imports
+           WHERE tenant_id = ? AND import_id = ?
+           ORDER BY chunk_index ASC`
         )
-        .bind(tenantId, importId),
+        .bind(MAX_COMMIT_PAYLOAD_PAGE_CHUNKS, tenantId, importId),
       this.db
         .prepare(
           "SELECT payload_digest, expected_chunks, resource_ids_json, result_json FROM ms_staged_import_receipts WHERE tenant_id = ? AND import_id = ?"
         )
         .bind(tenantId, importId),
     ]);
-    const rows = chunksRes?.results || [];
+    const rows = (chunksRes?.results || []).map((row: any) => ({ ...row }));
     const existingReceipt = (receiptRes?.results || [])[0] ?? null;
 
     if (existingReceipt) {
-      return this.resolveStagedImportReceiptReplay(importId, existingReceipt, raw.expectedChunks, null, auth);
+      return this.resolveStagedImportReceiptReplay(tenantId, importId, existingReceipt, raw.expectedChunks, null, auth);
     }
 
     if (rows.length === 0) {
@@ -1645,25 +1807,21 @@ export class MeasurementService {
       throw new NotFoundError(`Staged import '${importId}' not found`);
     }
 
-    const allGroups: Array<Record<string, any>> = [];
+    // Authorize all resource IDs from metadata snapshot BEFORE fetching additional payload pages or validating counts!
     const seenResourceIds = new Set<string>();
-    let totalObservations = 0;
-    for (let idx = 0; idx < rows.length; idx++) {
-      const parsed = JSON.parse(rows[idx].groups_json);
-      if (!Array.isArray(parsed)) {
-        throw new ValidationError(`Staged import '${importId}' chunk ${idx} is malformed`);
-      }
-      for (const grp of parsed) {
-        if (typeof grp?.resourceId === "string" && grp.resourceId.trim()) {
-          seenResourceIds.add(grp.resourceId.trim());
+    for (const row of rows) {
+      try {
+        const rids = JSON.parse(row.resource_ids_json || "[]");
+        if (Array.isArray(rids)) {
+          for (const rid of rids) {
+            const s = String(rid).trim();
+            if (s) seenResourceIds.add(s);
+          }
         }
-        if (Array.isArray(grp?.observations)) {
-          totalObservations += grp.observations.length;
-        }
-        allGroups.push(grp);
+      } catch {
+        // validated below
       }
     }
-    // Authorize EVERY resource present in the exact read snapshot BEFORE validating/committing
     if (seenResourceIds.size === 0) {
       auth?.authorizeResourceWrite?.("*");
     } else {
@@ -1680,6 +1838,57 @@ export class MeasurementService {
         throw new ValidationError(`Staged import '${importId}' is missing chunk index ${idx}`);
       }
     }
+
+    // Fetch any remaining chunks (>= MAX_COMMIT_PAYLOAD_PAGE_CHUNKS) in bounded pages of 16 (<= 24 MB/query)
+    // pinned to the exact generation_id snapshot from the initial read!
+    for (let start = MAX_COMMIT_PAYLOAD_PAGE_CHUNKS; start < rows.length; start += MAX_COMMIT_PAYLOAD_PAGE_CHUNKS) {
+      const end = Math.min(start + MAX_COMMIT_PAYLOAD_PAGE_CHUNKS, rows.length);
+      const pageRes = await this.db
+        .prepare(
+          `SELECT chunk_index, generation_id, groups_json
+           FROM ms_staged_imports
+           WHERE tenant_id = ? AND import_id = ? AND chunk_index >= ? AND chunk_index < ?
+           ORDER BY chunk_index ASC`
+        )
+        .bind(tenantId, importId, start, end)
+        .all<any>();
+      const pageByIndex = new Map<number, any>();
+      for (const p of pageRes.results || []) {
+        pageByIndex.set(Number(p.chunk_index), p);
+      }
+      for (let idx = start; idx < end; idx++) {
+        const fetched = pageByIndex.get(idx);
+        if (!fetched || String(fetched.generation_id) !== String(rows[idx].generation_id)) {
+          throw new ConflictError(`Staged import '${importId}' was aborted or modified concurrently`);
+        }
+        rows[idx].groups_json = fetched.groups_json;
+      }
+    }
+
+    const allGroups: Array<Record<string, any>> = [];
+    let totalObservations = 0;
+    for (let idx = 0; idx < rows.length; idx++) {
+      const parsed = JSON.parse(rows[idx].groups_json);
+      if (!Array.isArray(parsed)) {
+        throw new ValidationError(`Staged import '${importId}' chunk ${idx} is malformed`);
+      }
+      for (const grp of parsed) {
+        if (typeof grp?.resourceId === "string" && grp.resourceId.trim()) {
+          const rid = grp.resourceId.trim();
+          if (!seenResourceIds.has(rid)) {
+            seenResourceIds.add(rid);
+            auth?.authorizeResourceWrite?.(rid);
+          }
+        }
+        if (Array.isArray(grp?.observations)) {
+          totalObservations += grp.observations.length;
+        }
+        allGroups.push(grp);
+      }
+    }
+    if (seenResourceIds.size === 0) {
+      auth?.authorizeResourceWrite?.("*");
+    }
     if (totalObservations > MAX_STAGED_IMPORT_OBSERVATIONS) {
       throw new ValidationError(`Staged import exceeds maximum size (${MAX_STAGED_IMPORT_OBSERVATIONS} observations)`);
     }
@@ -1690,15 +1899,14 @@ export class MeasurementService {
         chunks: rows.map((row) => [Number(row.chunk_index), String(row.groups_json)]),
       })
     );
-    const sortedResourceIdsJson = canonicalJson([...seenResourceIds].sort());
+    const sortedResourceIds = [...seenResourceIds].sort();
 
-    // Transactional lifecycle fence + completion receipt + exact-generation cleanup inside ONE atomic db.batch:
-    // 1. INSERT into ms_staged_import_receipts arbitrates concurrent commits for (tenantId, importId).
-    // 2. UPDATE ms_staged_import_receipts asserts EVERY staged (chunk_index, generation_id) from our snapshot
-    //    is STILL present; if any chunk was aborted or replaced (ABA), payload_digest becomes NULL -> NOT NULL
-    //    constraint failure rolls back the entire transaction!
-    // 3. Domain writes execute.
-    // 4. DELETE removes ONLY the exact fenced (chunk_index, generation_id) rows.
+    // Transactional lifecycle fence + bounded sharded completion receipt + exact-generation cleanup in ONE atomic db.batch:
+    // 1. INSERT into ms_staged_import_receipts (compact < 200B header row) arbitrates concurrent commits.
+    // 2. INSERT into ms_staged_import_receipt_chunks stores bounded <= 500 KB detail parts (well below D1's 2 MB row limit).
+    // 3. UPDATE ms_staged_import_receipts asserts EVERY staged (chunk_index, generation_id) from our snapshot is STILL present.
+    // 4. Domain writes execute.
+    // 5. DELETE removes ONLY the exact fenced (chunk_index, generation_id) rows + session row.
     const buildPreStatements = (summary: {
       inserted: number;
       replayedNoop: number;
@@ -1710,23 +1918,34 @@ export class MeasurementService {
         coverageStatus: string | null;
       }>;
     }) => {
-      const receiptPayload = canonicalJson({
+      const receiptGroups = summary.groups.map((g) => ({
+        runId: g.runId,
+        evidenceId: g.evidenceId,
+        totalObservations: g.inserted + g.replayedNoop,
+        coverageStatus: g.coverageStatus,
+      }));
+      const receiptParts = this.partitionReceiptParts(sortedResourceIds, receiptGroups);
+      const receiptHeader = canonicalJson({
         totalObservations: summary.inserted + summary.replayedNoop,
-        groups: summary.groups.map((g) => ({
-          runId: g.runId,
-          evidenceId: g.evidenceId,
-          totalObservations: g.inserted + g.replayedNoop,
-          coverageStatus: g.coverageStatus,
-        })),
+        detailChunks: receiptParts.length,
       });
       const stmts: any[] = [
         this.db
           .prepare(
             `INSERT INTO ms_staged_import_receipts (
                tenant_id, import_id, payload_digest, expected_chunks, resource_ids_json, result_json, committed_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?)`
+             ) VALUES (?, ?, ?, ?, '[]', ?, ?)`
           )
-          .bind(tenantId, importId, payloadDigest, raw.expectedChunks, sortedResourceIdsJson, receiptPayload, now),
+          .bind(tenantId, importId, payloadDigest, raw.expectedChunks, receiptHeader, now),
+        ...receiptParts.map((part, partIndex) =>
+          this.db
+            .prepare(
+              `INSERT INTO ms_staged_import_receipt_chunks (
+                 tenant_id, import_id, part_index, resource_ids_json, groups_json
+               ) VALUES (?, ?, ?, ?, ?)`
+            )
+            .bind(tenantId, importId, partIndex, part.resourceIdsJson, part.groupsJson)
+        ),
       ];
       for (let i = 0; i < rows.length; i += MAX_FENCE_CHUNKS_PER_STMT) {
         const slice = rows.slice(i, i + MAX_FENCE_CHUNKS_PER_STMT);
@@ -1796,6 +2015,7 @@ export class MeasurementService {
           .first<any>();
         if (concurrentReceipt) {
           return this.resolveStagedImportReceiptReplay(
+            tenantId,
             importId,
             concurrentReceipt,
             raw.expectedChunks,
@@ -1818,9 +2038,9 @@ export class MeasurementService {
   ): Promise<{ aborted: true; discardedChunks: number }> {
     const tid = requireNonEmptyString(tenantId, "tenantId", 128);
     const iid = requireNonEmptyString(importId, "importId", 128);
-    // Single authoritative read: authorize EVERY resource in the read snapshot, then delete ONLY those exact immutable generations!
+    // Bounded metadata-only read (never selects groups_json so even 50 x 1.5 MB = 75 MB imports stay well under D1's 50 MB limit!)
     const res = await this.db
-      .prepare("SELECT chunk_index, generation_id, resource_ids_json, groups_json FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ?")
+      .prepare("SELECT chunk_index, generation_id, resource_ids_json FROM ms_staged_imports WHERE tenant_id = ? AND import_id = ?")
       .bind(tid, iid)
       .all<any>();
     const rows = res.results || [];
@@ -1831,15 +2051,8 @@ export class MeasurementService {
     const seenResourceIds = new Set<string>();
     for (const row of rows) {
       for (const rid of JSON.parse(row.resource_ids_json || "[]")) {
-        seenResourceIds.add(String(rid));
-      }
-      const parsed = JSON.parse(row.groups_json || "[]");
-      if (Array.isArray(parsed)) {
-        for (const g of parsed) {
-          if (typeof g?.resourceId === "string" && g.resourceId.trim()) {
-            seenResourceIds.add(g.resourceId.trim());
-          }
-        }
+        const s = String(rid).trim();
+        if (s) seenResourceIds.add(s);
       }
     }
     if (seenResourceIds.size === 0) {
