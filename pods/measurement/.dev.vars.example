@@ -2,3 +2,5 @@
 FACTORY_HUB_TOKEN=replace-with-random-token
 # Optional JSON array of ScopedCallerConfig entries (SHA-256 token fingerprints + tenant/resource/action grants)
 SCOPED_CALLER_GRANTS=[]
+# Server-side collector credentials map (NEVER stored in D1; bind exact resourceId -> allowed provider properties)
+COLLECTOR_CREDENTIALS={}

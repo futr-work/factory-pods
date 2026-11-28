@@ -70,6 +70,7 @@ export async function startLocalMeasurementPod(options: LocalRuntimeOptions = {}
     POD_LOB: process.env.POD_LOB || "measurement-evidence",
     FACTORY_HUB_TOKEN: process.env.FACTORY_HUB_TOKEN,
     SCOPED_CALLER_GRANTS: process.env.SCOPED_CALLER_GRANTS,
+    COLLECTOR_CREDENTIALS: process.env.COLLECTOR_CREDENTIALS,
     ...options.env,
   };
 
