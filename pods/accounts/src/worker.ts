@@ -19,6 +19,7 @@ import {
   ValidationError,
 } from "./service.js";
 import { renderPodUiHtml } from "./ui.js";
+import { assertNoEmbeddedSecretPayload, redactSecrets } from "./vault/adapters.js";
 import type { AssetKind, TaskRecord } from "./types.js";
 
 export interface Env {
@@ -48,11 +49,86 @@ function jsonResponse(body: unknown, status = 200): Response {
 }
 
 function errorResponse(err: unknown): Response {
-  if (err instanceof ValidationError) return jsonResponse({ error: err.message }, 400);
-  if (err instanceof ForbiddenError) return jsonResponse({ error: err.message }, 403);
-  if (err instanceof ConflictError) return jsonResponse({ error: err.message }, 409);
-  if (err instanceof NotFoundError) return jsonResponse({ error: err.message }, 404);
+  if (err instanceof ValidationError) return jsonResponse({ error: redactSecrets(err.message) }, 400);
+  if (err instanceof ForbiddenError) return jsonResponse({ error: redactSecrets(err.message) }, 403);
+  if (err instanceof ConflictError) return jsonResponse({ error: redactSecrets(err.message) }, 409);
+  if (err instanceof NotFoundError) return jsonResponse({ error: redactSecrets(err.message) }, 404);
   return jsonResponse({ error: "Internal server error" }, 500);
+}
+
+const ALLOWED_TASK_BODY_KEYS = new Set(["taskId", "topic", "spec"]);
+const ALLOWED_TASK_SPEC_KEYS = new Set([
+  "action",
+  "payload",
+  "tenantId",
+  "assetId",
+  "assetKind",
+  "provider",
+  "brandGroup",
+  "expectedProviders",
+  "accountId",
+  "connectionId",
+  "autoCreateAssets",
+  "items",
+]);
+
+function sanitizeHttpTaskRequest(body: Record<string, any>): {
+  taskId: string;
+  topic: string;
+  action: string;
+  tenantId: string;
+  assetId?: string;
+  isWrite: boolean;
+  spec: Record<string, unknown>;
+} {
+  try {
+    assertNoEmbeddedSecretPayload(body, "task");
+  } catch (err: any) {
+    throw new ValidationError(err?.message || "Task payload contains forbidden secret material");
+  }
+  for (const k of Object.keys(body)) {
+    if (!ALLOWED_TASK_BODY_KEYS.has(k)) {
+      throw new ValidationError(`Unsupported task field '${k}'`);
+    }
+  }
+  const rawSpec = body.spec;
+  if (!rawSpec || typeof rawSpec !== "object" || Array.isArray(rawSpec)) {
+    throw new ValidationError("Task spec must be an object");
+  }
+  for (const k of Object.keys(rawSpec)) {
+    if (!ALLOWED_TASK_SPEC_KEYS.has(k)) {
+      throw new ValidationError(`Unsupported task spec field '${k}'`);
+    }
+  }
+  if (rawSpec.payload !== undefined) {
+    if (!rawSpec.payload || typeof rawSpec.payload !== "object" || Array.isArray(rawSpec.payload)) {
+      throw new ValidationError("Task spec.payload must be an object");
+    }
+    for (const k of Object.keys(rawSpec.payload)) {
+      if (!ALLOWED_TASK_SPEC_KEYS.has(k)) {
+        throw new ValidationError(`Unsupported task payload field '${k}'`);
+      }
+    }
+  }
+  const topic = typeof body.topic === "string" && body.topic.trim() ? body.topic.trim() : "accounts.matrix";
+  const payload = rawSpec.payload && typeof rawSpec.payload === "object" ? rawSpec.payload : rawSpec;
+  const action =
+    typeof rawSpec.action === "string" && rawSpec.action.trim()
+      ? rawSpec.action.trim()
+      : topic.includes(".")
+        ? topic.split(".")[1]
+        : "matrix";
+  if (!["who_owns", "overlaps", "gaps", "discover", "ingest_discovery", "matrix"].includes(action)) {
+    throw new ValidationError("Unsupported accounts task action");
+  }
+  const tenantId = typeof payload.tenantId === "string" ? payload.tenantId.trim() : "";
+  if (!tenantId) {
+    throw new ValidationError("Scoped accounts task requires an explicit tenantId");
+  }
+  const assetId = typeof payload.assetId === "string" && payload.assetId.trim() ? payload.assetId.trim() : undefined;
+  const isWrite = action === "discover" || action === "ingest_discovery";
+  const taskId = typeof body.taskId === "string" && body.taskId.trim() ? body.taskId.trim() : `task_${Date.now()}`;
+  return { taskId, topic, action, tenantId, assetId, isWrite, spec: rawSpec };
 }
 
 async function parseJsonBody(request: Request): Promise<Record<string, any>> {
@@ -337,27 +413,39 @@ export default {
       }
     }
 
-    // 5. Mesh task execution endpoint (protected by hub token)
+    // 5. Scoped task execution endpoint (strictly requires scoped caller tenant/resource/action grant; hub token alone fails closed)
     if (url.pathname === "/api/tasks" && method === "POST") {
-      const denied = authGate(request, env as any, "accounts-pod");
-      if (denied) return denied;
       try {
         const body = await parseJsonBody(request);
+        const taskInput = sanitizeHttpTaskRequest(body);
+        const auth = await resolveAndAuthorize(request, env, {
+          tenantId: taskInput.tenantId,
+          resourceId: taskInput.action === "who_owns" ? taskInput.assetId : undefined,
+          action: taskInput.isWrite ? "write" : "read",
+        });
+        if (auth.denied) return auth.denied;
+
         const now = Date.now();
-        const taskId = typeof body.taskId === "string" && body.taskId.trim() ? body.taskId.trim() : `task_${now}`;
-        const topic = typeof body.topic === "string" && body.topic.trim() ? body.topic.trim() : "accounts.matrix";
-        const spec = body.spec && typeof body.spec === "object" ? body.spec : {};
         await storage
           .prepare(
             `INSERT INTO tasks (task_id, owner_id, topic, source, spec_json, status, created_at, updated_at)
-             VALUES (?, 'hub', ?, 'api', ?, 'running', ?, ?)`
+             VALUES (?, ?, ?, 'api', ?, 'running', ?, ?)`
           )
-          .bind(taskId, topic, JSON.stringify(spec), now, now)
+          .bind(taskInput.taskId, auth.caller.callerId, taskInput.topic, JSON.stringify(taskInput.spec), now, now)
           .run();
 
         const tincan = new TincanClient(config, env.FACTORY_HUB);
         const output = await activeHandler.handle(
-          { taskId, ownerId: "hub", topic, source: "api", spec, status: "running", createdAt: now, updatedAt: now },
+          {
+            taskId: taskInput.taskId,
+            ownerId: auth.caller.callerId,
+            topic: taskInput.topic,
+            source: "api",
+            spec: taskInput.spec,
+            status: "running",
+            createdAt: now,
+            updatedAt: now,
+          },
           {
             podConfig: config,
             now,
@@ -367,7 +455,7 @@ export default {
         );
         await storage
           .prepare("UPDATE tasks SET status = 'completed', result_json = ?, updated_at = ? WHERE task_id = ?")
-          .bind(JSON.stringify(output), Date.now(), taskId)
+          .bind(JSON.stringify(output), Date.now(), taskInput.taskId)
           .run();
         return jsonResponse(output, 200);
       } catch (err) {

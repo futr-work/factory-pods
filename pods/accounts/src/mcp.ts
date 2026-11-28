@@ -8,7 +8,27 @@ import {
 } from "@futr-work/pod-kernel/auth";
 import { toPodStorage, type PodStorage } from "@futr-work/pod-kernel/storage";
 import { AccountsService } from "./service.js";
+import { assertNoEmbeddedSecretPayload } from "./vault/adapters.js";
 import type { PodConfig } from "./types.js";
+
+const ALLOWED_MCP_TASK_KEYS = new Set(["requestId", "objective", "repo", "branch", "title", "constraints", "tenantId", "assetId", "provider"]);
+
+function sanitizeMcpTaskParams(params: Record<string, any>): Record<string, unknown> {
+  if (!params || typeof params !== "object" || Array.isArray(params)) {
+    throw new Error("Invalid task parameters");
+  }
+  assertNoEmbeddedSecretPayload(params, "task");
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(params)) {
+    if (!ALLOWED_MCP_TASK_KEYS.has(k)) {
+      throw new Error(`Unsupported task field '${k}'`);
+    }
+    if (v !== undefined) {
+      out[k] = v;
+    }
+  }
+  return out;
+}
 
 async function requireGrant(
   request: Request,
@@ -199,6 +219,7 @@ export function createAccountsMcpHandler(env: Record<string, any>, config: PodCo
     coreHandlers: {
       onSubmitTask: async (params, ctx) => {
         const { ownerId } = await resolveTaskPrincipal(ctx.request, ctx.env ?? env, true);
+        const sanitizedParams = sanitizeMcpTaskParams(params as any);
         const db = getDb(ctx.env);
         const taskId = `task_${ownerId}_${params.requestId}`;
         const existing = await db
@@ -213,7 +234,7 @@ export function createAccountsMcpHandler(env: Record<string, any>, config: PodCo
             `INSERT INTO tasks (task_id, owner_id, topic, source, spec_json, status, lease_expires_at, created_at, updated_at)
              VALUES (?, ?, 'mcp.task', 'mcp', ?, 'running', ?, ?, ?)`
           )
-          .bind(taskId, ownerId, JSON.stringify(params), ctx.now + 15 * 60 * 1000, ctx.now, ctx.now)
+          .bind(taskId, ownerId, JSON.stringify(sanitizedParams), ctx.now + 15 * 60 * 1000, ctx.now, ctx.now)
           .run();
         return { taskId, requestId: params.requestId, phase: "running", status: "running", existing: false };
       },
