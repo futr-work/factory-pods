@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 const pkgRoot = resolve(fileURLToPath(new URL(".", import.meta.url)), "..");
 const repoRoot = resolve(pkgRoot, "..", "..");
 const out = join(pkgRoot, "templates");
-const TEMPLATES = ["starter", "model-governor", "sentinel-radar", "authority-seo", "measurement"];
+const TEMPLATES = ["starter", "model-governor", "sentinel-radar", "authority-seo", "measurement", "accounts"];
 
 rmSync(out, { recursive: true, force: true });
 mkdirSync(out, { recursive: true });
