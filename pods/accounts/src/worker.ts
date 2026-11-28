@@ -88,7 +88,7 @@ function sanitizeHttpTaskRequest(body: Record<string, any>): {
   }
   for (const k of Object.keys(body)) {
     if (!ALLOWED_TASK_BODY_KEYS.has(k)) {
-      throw new ValidationError(`Unsupported task field '${k}'`);
+      throw new ValidationError("Unsupported task field");
     }
   }
   const rawSpec = body.spec;
@@ -97,7 +97,7 @@ function sanitizeHttpTaskRequest(body: Record<string, any>): {
   }
   for (const k of Object.keys(rawSpec)) {
     if (!ALLOWED_TASK_SPEC_KEYS.has(k)) {
-      throw new ValidationError(`Unsupported task spec field '${k}'`);
+      throw new ValidationError("Unsupported task spec field");
     }
   }
   if (rawSpec.payload !== undefined) {
@@ -106,18 +106,18 @@ function sanitizeHttpTaskRequest(body: Record<string, any>): {
     }
     for (const k of Object.keys(rawSpec.payload)) {
       if (!ALLOWED_TASK_SPEC_KEYS.has(k)) {
-        throw new ValidationError(`Unsupported task payload field '${k}'`);
+        throw new ValidationError("Unsupported task payload field");
       }
     }
   }
   const topic = typeof body.topic === "string" && body.topic.trim() ? body.topic.trim() : "accounts.matrix";
   const payload = rawSpec.payload && typeof rawSpec.payload === "object" ? rawSpec.payload : rawSpec;
   const action =
-    typeof rawSpec.action === "string" && rawSpec.action.trim()
+    typeof rawSpec.action === "string"
       ? rawSpec.action.trim()
       : topic.includes(".")
-        ? topic.split(".")[1]
-        : "matrix";
+        ? topic.split(".")[1].trim()
+        : "";
   if (!["who_owns", "overlaps", "gaps", "discover", "ingest_discovery", "matrix"].includes(action)) {
     throw new ValidationError("Unsupported accounts task action");
   }
@@ -126,9 +126,16 @@ function sanitizeHttpTaskRequest(body: Record<string, any>): {
     throw new ValidationError("Scoped accounts task requires an explicit tenantId");
   }
   const assetId = typeof payload.assetId === "string" && payload.assetId.trim() ? payload.assetId.trim() : undefined;
+  if (action === "who_owns" && !assetId) {
+    throw new ValidationError("who_owns task requires an explicit assetId");
+  }
   const isWrite = action === "discover" || action === "ingest_discovery";
   const taskId = typeof body.taskId === "string" && body.taskId.trim() ? body.taskId.trim() : `task_${Date.now()}`;
-  return { taskId, topic, action, tenantId, assetId, isWrite, spec: rawSpec };
+  const normalizedPayload = { ...payload, tenantId, ...(assetId ? { assetId } : {}) };
+  delete (normalizedPayload as any).action;
+  delete (normalizedPayload as any).payload;
+  const normalizedSpec = { action, payload: normalizedPayload };
+  return { taskId, topic, action, tenantId, assetId, isWrite, spec: normalizedSpec };
 }
 
 async function parseJsonBody(request: Request): Promise<Record<string, any>> {

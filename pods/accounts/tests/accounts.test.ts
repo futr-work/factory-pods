@@ -188,8 +188,14 @@ test("VaultAdapterRegistry resolves across Infisical, 1Password, LastPass, Bitwa
     bridgeUrl: "https://bw-bridge.example.com",
     accessToken: bwToken,
     fetchImpl: async (url) => {
-      if (String(url).includes("CIPHER")) {
+      if (String(url).includes("CIPHER2")) {
         return new Response(JSON.stringify({ decrypted: true, value: "2.aXZiYXNlNjQ=|Y3RiYXNlNjQ=|bWFjYmFzZTY0" }), { status: 200 });
+      }
+      if (String(url).includes("CIPHER3")) {
+        return new Response(JSON.stringify({ decrypted: true, value: "3.UlNBMjA0OE9BRVBTSEEyNTY=" }), { status: 200 });
+      }
+      if (String(url).includes("CIPHER4")) {
+        return new Response(JSON.stringify({ decrypted: true, value: "4.UlNBMjA0OE9BRVBTSEEx" }), { status: 200 });
       }
       if (String(url).includes("UNFLAGGED")) {
         return new Response(JSON.stringify({ value: "raw-without-decrypted-flag" }), { status: 200 });
@@ -216,8 +222,10 @@ test("VaultAdapterRegistry resolves across Infisical, 1Password, LastPass, Bitwa
   assert.equal((await registry.resolve("vault://bw-main/uuid-123")).value, "val-from-bitwarden-bridge");
   assert.equal((await registry.resolve("vault://cf-env/bing:acct1#credential")).value, "val-from-cf-secret");
 
-  // Bitwarden adapter MUST reject ciphertext envelopes and unflagged plaintext
-  await assert.rejects(() => bwAdapter.resolveSecret("vault://bw-main/CIPHER"), /CipherString/);
+  // Bitwarden adapter MUST reject multi-component AND single-component RSA CipherString envelopes + unflagged plaintext
+  await assert.rejects(() => bwAdapter.resolveSecret("vault://bw-main/CIPHER2"), /CipherString/);
+  await assert.rejects(() => bwAdapter.resolveSecret("vault://bw-main/CIPHER3"), /CipherString/);
+  await assert.rejects(() => bwAdapter.resolveSecret("vault://bw-main/CIPHER4"), /CipherString/);
   await assert.rejects(() => bwAdapter.resolveSecret("vault://bw-main/UNFLAGGED"), /decrypted plaintext/);
 
   // Fallback across heterogeneous vault backends (Infisical -> 1Password)
@@ -470,7 +478,7 @@ test("HTTP Worker enforces scoped auth on /api/tasks, rejects raw credentials in
       401
     );
 
-    // 3. Value-free validation error NEVER reflects synthetic credential supplied as driver
+    // 3. Value-free validation error NEVER reflects synthetic credential supplied as driver OR arbitrary caller object keys
     const canaryBearer = makeSynthetic("driver-canary-secret");
     const badDriverRes = await call("/api/accounts/vault-backends", {
       method: "POST",
@@ -481,7 +489,30 @@ test("HTTP Worker enforces scoped auth on /api/tasks, rejects raw credentials in
     const badDriverText = await badDriverRes.text();
     assert.ok(!badDriverText.includes(canaryBearer), "400 validation error must never reflect caller-supplied credential");
 
-    // 4. Undeclared password field rejected on BOTH HTTP /api/tasks and MCP submit_task (never persisted in SQLite!)
+    const keyCanary = "synthetic-caller-key-canary-99";
+    const badMetaRes = await call("/api/accounts/principals", {
+      method: "POST",
+      token: alphaAdminToken,
+      body: {
+        tenantId: "tenant-alpha",
+        principalId: "person:meta-bad",
+        kind: "human",
+        displayName: "Meta Bad",
+        metadata: { [keyCanary]: { password: "secret" } },
+      },
+    });
+    assert.equal(badMetaRes.status, 400);
+    assert.ok(!(await badMetaRes.text()).includes(keyCanary), "400 validation error must not echo caller-controlled object keys");
+
+    // Short Bearer credential in displayName rejected
+    const shortBearerRes = await call("/api/accounts/principals", {
+      method: "POST",
+      token: alphaAdminToken,
+      body: { tenantId: "tenant-alpha", principalId: "person:short-bearer", kind: "human", displayName: "Bearer ab12" },
+    });
+    assert.equal(shortBearerRes.status, 400);
+
+    // 4. Undeclared password & credential-bearing URL rejected on HTTP /api/tasks and MCP submit_task; conformant submit_task succeeds!
     const pwCanary = makeSynthetic("raw-task-pw");
     const badHttpTask = await call("/api/tasks", {
       method: "POST",
@@ -490,6 +521,16 @@ test("HTTP Worker enforces scoped auth on /api/tasks, rejects raw credentials in
     });
     assert.equal(badHttpTask.status, 400);
 
+    const credUrlTask = await call("/api/tasks", {
+      method: "POST",
+      token: alphaAdminToken,
+      body: {
+        topic: "accounts.matrix",
+        spec: { action: "matrix", tenantId: "tenant-alpha", brandGroup: `https://example.test/?access_token=${pwCanary}` },
+      },
+    });
+    assert.equal(credUrlTask.status, 400);
+
     const badMcpTask = await call("/mcp", {
       method: "POST",
       token: alphaAdminToken,
@@ -497,13 +538,41 @@ test("HTTP Worker enforces scoped auth on /api/tasks, rejects raw credentials in
         jsonrpc: "2.0",
         id: 10,
         method: "tools/call",
-        params: { name: "submit_task", arguments: { requestId: "req-pw", objective: "test", password: pwCanary } },
+        params: { name: "submit_task", arguments: { repo: "org/demo", issue: 1, requestId: "req-pw", password: pwCanary } },
       },
     });
     const badMcpJson: any = await badMcpTask.json();
     assert.ok(badMcpJson.error || badMcpJson.result?.isError, "MCP submit_task must reject raw password field");
+
+    const badMcpUrlTask = await call("/mcp", {
+      method: "POST",
+      token: alphaAdminToken,
+      body: {
+        jsonrpc: "2.0",
+        id: 11,
+        method: "tools/call",
+        params: { name: "submit_task", arguments: { repo: "org/demo", issue: 2, requestId: "req-url", body: `https://example.test/?access_token=${pwCanary}` } },
+      },
+    });
+    const badMcpUrlJson: any = await badMcpUrlTask.json();
+    assert.ok(badMcpUrlJson.error || badMcpUrlJson.result?.isError, "MCP submit_task must reject credential-bearing URL in body");
+
+    // Conformant schema-valid submit_task succeeds cleanly!
+    const okMcpTask = await call("/mcp", {
+      method: "POST",
+      token: alphaAdminToken,
+      body: {
+        jsonrpc: "2.0",
+        id: 12,
+        method: "tools/call",
+        params: { name: "submit_task", arguments: { repo: "org/demo", issue: 42, requestId: "req-ok-42", title: "Audit account bindings" } },
+      },
+    });
+    const okMcpJson: any = await okMcpTask.json();
+    assert.ok(!okMcpJson.error && !okMcpJson.result?.isError, "Schema-conformant MCP submit_task must succeed");
+
     const storedTasks = await db.prepare("SELECT spec_json FROM tasks").all<any>();
-    assert.ok(!JSON.stringify(storedTasks.results || []).includes(pwCanary), "Raw password must never be persisted to tasks table");
+    assert.ok(!JSON.stringify(storedTasks.results || []).includes(pwCanary), "Raw credential must never be persisted to tasks table");
 
     // 5. Seed graph via HTTP API (include angle brackets in backendId-adjacent audit summary via assetId to test actual cockpit HTML rendering)
     assert.equal(
@@ -613,7 +682,58 @@ test("HTTP Worker enforces scoped auth on /api/tasks, rejects raw credentials in
       403
     );
 
-    // 6. Resource-scoped caller can query who-owns for site:example.com, NOT site:other.com
+    // 6. Resource-scoped caller: who_owns with trailing whitespace MUST execute who_owns (NEVER default to matrix!) and expose only site:example.com
+    const trimmedActionTask = await call("/api/tasks", {
+      method: "POST",
+      token: alphaAssetScopedToken,
+      body: {
+        topic: "accounts.who_owns",
+        spec: { action: "who_owns ", tenantId: "tenant-alpha", assetId: "site:example.com" },
+      },
+    });
+    assert.equal(trimmedActionTask.status, 200);
+    const trimmedTaskBody = await trimmedActionTask.text();
+    assert.ok(trimmedTaskBody.includes("site:example.com"));
+    assert.ok(!trimmedTaskBody.includes("site:other.com"), "Padded who_owns action must never fall through to tenant-wide matrix");
+
+    // String PEM in timestamp columns (lastVerifiedAt / lastDiscoveredAt) MUST be rejected with 400!
+    const pemStr = "-----BEGIN PRIVATE KEY-----\n" + "B".repeat(160) + "\n-----END PRIVATE KEY-----";
+    assert.equal(
+      (
+        await call("/api/accounts/connections", {
+          method: "POST",
+          token: alphaAdminToken,
+          body: {
+            tenantId: "tenant-alpha",
+            connectionId: "conn:bad-ts",
+            accountId: "acct:gsc:ops",
+            authType: "gcp_service_account",
+            vaultBackendId: "inf-dev",
+            vaultUri: "vault://inf-dev/gcloud/SA_JSON",
+            lastVerifiedAt: pemStr,
+          },
+        })
+      ).status,
+      400
+    );
+    assert.equal(
+      (
+        await call("/api/accounts/bindings", {
+          method: "POST",
+          token: alphaAdminToken,
+          body: {
+            tenantId: "tenant-alpha",
+            assetId: "site:example.com",
+            accountId: "acct:gsc:ops",
+            provider: "gsc",
+            externalResourceId: "sc-domain:example.com",
+            lastDiscoveredAt: pemStr,
+          },
+        })
+      ).status,
+      400
+    );
+
     assert.equal((await call("/api/accounts/who-owns?tenantId=tenant-alpha&assetId=site:example.com", { token: alphaAssetScopedToken })).status, 200);
     assert.equal((await call("/api/accounts/who-owns?tenantId=tenant-alpha&assetId=site:other.com", { token: alphaAssetScopedToken })).status, 403);
 

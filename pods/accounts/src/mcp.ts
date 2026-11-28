@@ -11,7 +11,7 @@ import { AccountsService } from "./service.js";
 import { assertNoEmbeddedSecretPayload } from "./vault/adapters.js";
 import type { PodConfig } from "./types.js";
 
-const ALLOWED_MCP_TASK_KEYS = new Set(["requestId", "objective", "repo", "branch", "title", "constraints", "tenantId", "assetId", "provider"]);
+const ALLOWED_MCP_TASK_KEYS = new Set(["repo", "issue", "requestId", "remote", "title", "body"]);
 
 function sanitizeMcpTaskParams(params: Record<string, any>): Record<string, unknown> {
   if (!params || typeof params !== "object" || Array.isArray(params)) {
@@ -21,11 +21,14 @@ function sanitizeMcpTaskParams(params: Record<string, any>): Record<string, unkn
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(params)) {
     if (!ALLOWED_MCP_TASK_KEYS.has(k)) {
-      throw new Error(`Unsupported task field '${k}'`);
+      throw new Error("Unsupported task field");
     }
     if (v !== undefined) {
       out[k] = v;
     }
+  }
+  if (typeof out.repo !== "string" || !out.repo.trim() || typeof out.issue !== "number" || !Number.isInteger(out.issue) || typeof out.requestId !== "string" || !out.requestId.trim()) {
+    throw new Error("submit_task requires repo (string), issue (integer), and requestId (string)");
   }
   return out;
 }
