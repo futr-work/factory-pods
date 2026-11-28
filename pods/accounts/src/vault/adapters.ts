@@ -37,28 +37,22 @@ const DEFAULT_VAULT_TIMEOUT_MS = 10_000;
 
 export const FORBIDDEN_IDENTIFIER_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
-export const FORBIDDEN_SECRET_FIELD_NAMES = new Set([
-  "apikey",
-  "api_key",
-  "password",
-  "passwd",
-  "secret",
-  "clientsecret",
-  "client_secret",
-  "refreshtoken",
-  "refresh_token",
-  "accesstoken",
-  "access_token",
-  "privatekey",
-  "private_key",
-  "privatekeypem",
-  "private_key_pem",
-  "bearertoken",
-  "bearer_token",
-  "servicetoken",
-  "service_token",
-  "authtoken",
-  "auth_token",
+const FORBIDDEN_SECRET_FIELD_RE =
+  /(?:^|_|-)(?:secret|password|passwd|token|private.?key|api.?key|credential|auth.?header|cookie|session.?id|access.?key|refresh.?token|bearer)(?:$|_|-)|(?:secret|password|passwd|token|privatekey|apikey|credential)/i;
+
+const PEM_PRIVATE_KEY_RE = /-----BEGIN\s+[A-Z0-9 ]*PRIVATE KEY-----/;
+const BITWARDEN_CIPHERTEXT_RE = /^\d+\.[A-Za-z0-9+/=]+\|[A-Za-z0-9+/=]+(?:\|[A-Za-z0-9+/=]+)?$/;
+const VAULT_SEGMENT_RE = /^[A-Za-z0-9._:@-]{1,128}$/;
+const VAULT_FRAGMENT_RE = /^[A-Za-z0-9._-]{1,64}$/;
+
+const RESERVED_OAUTH_PARAMS = new Set([
+  "response_type",
+  "client_id",
+  "redirect_uri",
+  "scope",
+  "state",
+  "code_challenge",
+  "code_challenge_method",
 ]);
 
 function isNonEmptyString(v: unknown): v is string {
@@ -70,11 +64,13 @@ export function redactSecrets(text: string, knownSecrets: readonly string[] = []
   const variants = new Set<string>();
   for (const s of knownSecrets) {
     if (typeof s !== "string") continue;
-    if (s.length >= 6) variants.add(s);
+    if (s.length > 0) variants.add(s);
     const trimmed = s.trim();
-    if (trimmed.length >= 6) variants.add(trimmed);
+    if (trimmed.length > 0) variants.add(trimmed);
   }
-  for (const secret of variants) {
+  // Redact longest secrets first so shorter substrings do not leave partial fragments
+  const ordered = [...variants].sort((a, b) => b.length - a.length);
+  for (const secret of ordered) {
     out = out.split(secret).join("[REDACTED]");
     const enc = encodeURIComponent(secret);
     if (enc !== secret) out = out.split(enc).join("[REDACTED]");
@@ -86,12 +82,16 @@ export function redactSecrets(text: string, knownSecrets: readonly string[] = []
 }
 
 /**
- * Recursively reject embedded credentials or private keys in any non-secret config/metadata object stored in D1.
+ * Recursively reject embedded credentials, secret-named keys, prototype keys, or PEM private keys
+ * across ANY string, array, or object persisted into D1.
  */
 export function assertNoEmbeddedSecretPayload(value: unknown, path = "$"): void {
   if (typeof value === "string") {
-    if (/-----BEGIN\s+[A-Z0-9 ]*PRIVATE KEY-----/.test(value)) {
-      throw new Error(`Embedded PEM private key material is forbidden at '${path}'; store credentials in a vault backend`);
+    if (PEM_PRIVATE_KEY_RE.test(value)) {
+      throw new Error(`Embedded PEM private key material is forbidden at '${path}'`);
+    }
+    if (/Bearer\s+[A-Za-z0-9\-._~+/]{12,}/i.test(value)) {
+      throw new Error(`Embedded Bearer credential is forbidden at '${path}'`);
     }
     return;
   }
@@ -104,11 +104,10 @@ export function assertNoEmbeddedSecretPayload(value: unknown, path = "$"): void 
   }
   for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
     if (FORBIDDEN_IDENTIFIER_KEYS.has(key)) {
-      throw new Error(`Forbidden object key '${key}' at '${path}'`);
+      throw new Error(`Forbidden object key at '${path}'`);
     }
-    const normalized = key.toLowerCase();
-    if (FORBIDDEN_SECRET_FIELD_NAMES.has(normalized)) {
-      throw new Error(`Embedded secret field '${path}.${key}' is forbidden; store credentials in a vault backend`);
+    if (FORBIDDEN_SECRET_FIELD_RE.test(key)) {
+      throw new Error(`Embedded secret field is forbidden at '${path}'`);
     }
     assertNoEmbeddedSecretPayload(val, `${path}.${key}`);
   }
@@ -116,7 +115,7 @@ export function assertNoEmbeddedSecretPayload(value: unknown, path = "$"): void 
 
 /**
  * Parse and strictly validate a vault-agnostic pointer URI:
- *   vault://<backendId>/<segment1>[/<segment2>...][#<fragment>]
+ *   vault://<backendId>/<segment1>[/<segment2>...][#<fieldLabel>]
  */
 export function parseVaultUri(rawUri: string): ParsedVaultUri {
   if (!isNonEmptyString(rawUri)) {
@@ -125,8 +124,8 @@ export function parseVaultUri(rawUri: string): ParsedVaultUri {
   if (rawUri !== rawUri.trim() || /[\s\r\n\0]/.test(rawUri)) {
     throw new Error("vaultUri must not contain whitespace or control characters");
   }
-  if (rawUri.includes("*")) {
-    throw new Error("vaultUri must not contain wildcards");
+  if (rawUri.includes("*") || rawUri.includes("?") || rawUri.includes("=")) {
+    throw new Error("vaultUri must not contain wildcards, query strings, or key=value pairs");
   }
   if (!rawUri.startsWith("vault://")) {
     throw new Error("vaultUri must use the vault:// scheme");
@@ -135,8 +134,10 @@ export function parseVaultUri(rawUri: string): ParsedVaultUri {
   const hashIdx = withoutScheme.indexOf("#");
   const pathPart = hashIdx >= 0 ? withoutScheme.slice(0, hashIdx) : withoutScheme;
   const fragment = hashIdx >= 0 ? withoutScheme.slice(hashIdx + 1) : null;
-  if (hashIdx >= 0 && !isNonEmptyString(fragment)) {
-    throw new Error("vaultUri fragment must be non-empty when '#' is present");
+  if (hashIdx >= 0) {
+    if (!fragment || !VAULT_FRAGMENT_RE.test(fragment) || FORBIDDEN_IDENTIFIER_KEYS.has(fragment)) {
+      throw new Error("vaultUri fragment must be a simple field identifier");
+    }
   }
   const slashIdx = pathPart.indexOf("/");
   if (slashIdx <= 0) {
@@ -145,44 +146,41 @@ export function parseVaultUri(rawUri: string): ParsedVaultUri {
   const backendId = pathPart.slice(0, slashIdx);
   const locator = pathPart.slice(slashIdx + 1);
   if (!/^[a-z0-9][a-z0-9._-]{0,63}$/i.test(backendId) || FORBIDDEN_IDENTIFIER_KEYS.has(backendId)) {
-    throw new Error(`Invalid vault backendId '${backendId}' in vaultUri`);
+    throw new Error("vaultUri contains an invalid backendId");
   }
-  if (!locator || locator.includes("?") || locator.startsWith("/") || locator.endsWith("/")) {
-    throw new Error("vaultUri locator must be a clean slash-delimited path without query strings");
+  if (!locator || locator.startsWith("/") || locator.endsWith("/")) {
+    throw new Error("vaultUri locator must be a clean slash-delimited path");
   }
   const segments = locator.split("/");
   for (const seg of segments) {
-    if (!seg || seg === "." || seg === ".." || FORBIDDEN_IDENTIFIER_KEYS.has(seg)) {
-      throw new Error(`Invalid vaultUri path segment '${seg}'`);
+    if (!seg || seg === "." || seg === ".." || !VAULT_SEGMENT_RE.test(seg) || FORBIDDEN_IDENTIFIER_KEYS.has(seg)) {
+      throw new Error("vaultUri contains an invalid path segment");
     }
-  }
-  if (fragment !== null && (FORBIDDEN_IDENTIFIER_KEYS.has(fragment) || fragment.includes("*"))) {
-    throw new Error(`Invalid vaultUri fragment '${fragment}'`);
   }
   return { raw: rawUri, backendId, locator, segments, fragment };
 }
 
 function validateVaultEndpointUrl(
   rawUrl: string,
-  opts: { allowLoopbackHttp?: boolean; allowedHosts?: readonly string[] } = {}
+  opts: { allowLoopbackHttp?: boolean; allowedHosts?: readonly string[]; preserveExactPath?: boolean } = {}
 ): string {
   let parsed: URL;
   try {
     parsed = new URL(rawUrl);
   } catch {
-    throw new Error("Vault endpoint URL is invalid");
+    throw new Error("Endpoint URL is invalid");
   }
   const isLoopback = parsed.hostname === "127.0.0.1" || parsed.hostname === "localhost" || parsed.hostname === "::1";
   if (parsed.protocol !== "https:" && !(opts.allowLoopbackHttp && parsed.protocol === "http:" && isLoopback)) {
-    throw new Error("Vault endpoint URL must use https://");
+    throw new Error("Endpoint URL must use https://");
   }
   if (parsed.username || parsed.password || parsed.search || parsed.hash) {
-    throw new Error("Vault endpoint URL must not include credentials, query, or fragment");
+    throw new Error("Endpoint URL must not include credentials, query, or fragment");
   }
   if (opts.allowedHosts && opts.allowedHosts.length > 0 && !opts.allowedHosts.includes(parsed.hostname)) {
-    throw new Error(`Vault endpoint host '${parsed.hostname}' is not allowlisted`);
+    throw new Error("Endpoint URL host is not allowlisted");
   }
-  return parsed.toString().replace(/\/+$/, "");
+  return opts.preserveExactPath ? rawUrl.trim() : parsed.toString().replace(/\/+$/, "");
 }
 
 async function fetchBoundedVaultJson(
@@ -301,7 +299,7 @@ export class InfisicalVaultAdapter implements VaultAdapter {
   public async resolveSecret(vaultUri: string, opts?: { signal?: AbortSignal }): Promise<ResolvedSecret> {
     const parsed = parseVaultUri(vaultUri);
     if (parsed.backendId !== this.backendId) {
-      throw new Error(`Vault URI backend '${parsed.backendId}' does not match adapter '${this.backendId}'`);
+      throw new Error("Vault URI backend does not match adapter");
     }
     const secretName = parsed.segments[parsed.segments.length - 1];
     const secretPath = parsed.segments.length > 1 ? `/${parsed.segments.slice(0, -1).join("/")}` : "/";
@@ -336,7 +334,7 @@ export class InfisicalVaultAdapter implements VaultAdapter {
   public async putSecret(vaultUri: string, value: string, opts?: { signal?: AbortSignal }): Promise<void> {
     const parsed = parseVaultUri(vaultUri);
     if (parsed.backendId !== this.backendId) {
-      throw new Error(`Vault URI backend '${parsed.backendId}' does not match adapter '${this.backendId}'`);
+      throw new Error("Vault URI backend does not match adapter");
     }
     const secretName = parsed.segments[parsed.segments.length - 1];
     const secretPath = parsed.segments.length > 1 ? `/${parsed.segments.slice(0, -1).join("/")}` : "/";
@@ -388,7 +386,7 @@ export class InfisicalVaultAdapter implements VaultAdapter {
 
 /**
  * 2. 1Password Connect Server VaultAdapter
- * URI format: vault://<backendId>/<vaultId>/<itemId>[#<fieldLabel>] (default field: "credential" or "password")
+ * URI format: vault://<backendId>/<vaultId>/<itemId>[#<fieldLabel>]
  */
 export class OnePasswordConnectVaultAdapter implements VaultAdapter {
   public readonly driver: VaultDriver = "onepassword_connect";
@@ -416,7 +414,7 @@ export class OnePasswordConnectVaultAdapter implements VaultAdapter {
   public async resolveSecret(vaultUri: string, opts?: { signal?: AbortSignal }): Promise<ResolvedSecret> {
     const parsed = parseVaultUri(vaultUri);
     if (parsed.backendId !== this.backendId) {
-      throw new Error(`Vault URI backend '${parsed.backendId}' does not match adapter '${this.backendId}'`);
+      throw new Error("Vault URI backend does not match adapter");
     }
     if (parsed.segments.length < 2) {
       throw new Error("1Password vaultUri must be formatted as vault://<backendId>/<vaultId>/<itemId>[#<field>]");
@@ -439,7 +437,7 @@ export class OnePasswordConnectVaultAdapter implements VaultAdapter {
       fields.find((f: any) => f && (f.label === fieldName || f.id === fieldName)) ??
       (!parsed.fragment ? fields.find((f: any) => f && (f.label === "password" || f.purpose === "PASSWORD")) : null);
     if (!match || !isNonEmptyString(match.value)) {
-      throw new Error(`1Password item did not contain non-empty field '${fieldName}'`);
+      throw new Error("1Password item did not contain requested non-empty field");
     }
     return {
       value: match.value,
@@ -466,7 +464,7 @@ export class OnePasswordConnectVaultAdapter implements VaultAdapter {
 }
 
 /**
- * 3. LastPass VaultAdapter (bridge endpoint or pluggable enterprise API)
+ * 3. LastPass Trusted Bridge VaultAdapter
  * URI format: vault://<backendId>/<itemLocator>[#<field>]
  */
 export class LastPassVaultAdapter implements VaultAdapter {
@@ -495,7 +493,7 @@ export class LastPassVaultAdapter implements VaultAdapter {
   public async resolveSecret(vaultUri: string, opts?: { signal?: AbortSignal }): Promise<ResolvedSecret> {
     const parsed = parseVaultUri(vaultUri);
     if (parsed.backendId !== this.backendId) {
-      throw new Error(`Vault URI backend '${parsed.backendId}' does not match adapter '${this.backendId}'`);
+      throw new Error("Vault URI backend does not match adapter");
     }
     const field = parsed.fragment || "password";
     const url = `${this.bridgeUrl}/v1/items/${encodeURIComponent(parsed.locator)}?field=${encodeURIComponent(field)}`;
@@ -532,27 +530,28 @@ export class LastPassVaultAdapter implements VaultAdapter {
 }
 
 /**
- * 4. Bitwarden Secrets Manager VaultAdapter
- * URI format: vault://<backendId>/<secretUuid>
+ * 4. Bitwarden Secrets Manager Trusted Decryption Bridge VaultAdapter
+ * Note: Raw Bitwarden API `/secrets/{id}` returns end-to-end encrypted ciphertexts (`2.<iv>|<ct>|<mac>`)
+ * requiring the official Bitwarden SDK + organization key to decrypt. This adapter talks to a trusted
+ * SDK-backed decryption bridge (`bridgeUrl/v1/secrets/{id}` returning `{ value, decrypted: true }`) and
+ * fails closed if an encrypted Bitwarden CipherString is ever returned.
  */
 export class BitwardenVaultAdapter implements VaultAdapter {
   public readonly driver: VaultDriver = "bitwarden";
   public readonly backendId: string;
-  private readonly apiUrl: string;
+  private readonly bridgeUrl: string;
   private readonly accessToken: string;
   private readonly fetchImpl: FetchLike;
 
   constructor(opts: {
     backendId: string;
-    apiUrl?: string;
+    bridgeUrl: string;
     accessToken: string;
     fetchImpl?: FetchLike;
     allowLoopbackHttp?: boolean;
   }) {
     this.backendId = opts.backendId;
-    this.apiUrl = validateVaultEndpointUrl(opts.apiUrl || "https://api.bitwarden.com", {
-      allowLoopbackHttp: opts.allowLoopbackHttp,
-    });
+    this.bridgeUrl = validateVaultEndpointUrl(opts.bridgeUrl, { allowLoopbackHttp: opts.allowLoopbackHttp });
     if (!isNonEmptyString(opts.accessToken)) {
       throw new Error("BitwardenVaultAdapter requires accessToken");
     }
@@ -563,10 +562,10 @@ export class BitwardenVaultAdapter implements VaultAdapter {
   public async resolveSecret(vaultUri: string, opts?: { signal?: AbortSignal }): Promise<ResolvedSecret> {
     const parsed = parseVaultUri(vaultUri);
     if (parsed.backendId !== this.backendId) {
-      throw new Error(`Vault URI backend '${parsed.backendId}' does not match adapter '${this.backendId}'`);
+      throw new Error("Vault URI backend does not match adapter");
     }
     const secretId = parsed.segments[parsed.segments.length - 1];
-    const url = `${this.apiUrl}/secrets/${encodeURIComponent(secretId)}`;
+    const url = `${this.bridgeUrl}/v1/secrets/${encodeURIComponent(secretId)}`;
     const res = await fetchBoundedVaultJson(
       this.fetchImpl,
       url,
@@ -575,10 +574,13 @@ export class BitwardenVaultAdapter implements VaultAdapter {
       { signal: opts?.signal }
     );
     if (!res.ok) {
-      throw new Error(`Bitwarden lookup failed (HTTP ${res.status})`);
+      throw new Error(`Bitwarden bridge lookup failed (HTTP ${res.status})`);
     }
-    if (!isNonEmptyString(res.json?.value)) {
-      throw new Error("Bitwarden response omitted secret value");
+    if (res.json?.decrypted !== true || !isNonEmptyString(res.json?.value)) {
+      throw new Error("Bitwarden bridge response must provide a decrypted plaintext value");
+    }
+    if (BITWARDEN_CIPHERTEXT_RE.test(res.json.value.trim())) {
+      throw new Error("Bitwarden bridge returned undecrypted CipherString envelope");
     }
     return { value: res.json.value, driver: this.driver, backendId: this.backendId };
   }
@@ -587,7 +589,7 @@ export class BitwardenVaultAdapter implements VaultAdapter {
     try {
       const res = await fetchBoundedVaultJson(
         this.fetchImpl,
-        `${this.apiUrl}/alive`,
+        `${this.bridgeUrl}/v1/health`,
         { method: "GET", headers: { Authorization: `Bearer ${this.accessToken}`, Accept: "application/json" } },
         [this.accessToken],
         { signal: opts?.signal }
@@ -601,7 +603,6 @@ export class BitwardenVaultAdapter implements VaultAdapter {
 
 /**
  * 5. Cloudflare Worker Secret Binding VaultAdapter
- * Resolves secrets from an in-memory JSON map passed via Cloudflare Worker secret binding.
  * URI format: vault://<backendId>/<key>[#<nestedField>]
  */
 export class CloudflareSecretVaultAdapter implements VaultAdapter {
@@ -626,29 +627,29 @@ export class CloudflareSecretVaultAdapter implements VaultAdapter {
   public async resolveSecret(vaultUri: string): Promise<ResolvedSecret> {
     const parsed = parseVaultUri(vaultUri);
     if (parsed.backendId !== this.backendId) {
-      throw new Error(`Vault URI backend '${parsed.backendId}' does not match adapter '${this.backendId}'`);
+      throw new Error("Vault URI backend does not match adapter");
     }
     const entry = Object.prototype.hasOwnProperty.call(this.secretsMap, parsed.locator)
       ? this.secretsMap[parsed.locator]
       : undefined;
     if (entry === undefined || entry === null) {
-      throw new Error(`Secret locator '${parsed.locator}' not found in Cloudflare secret binding`);
+      throw new Error("Secret locator not found in Cloudflare secret binding");
     }
     if (parsed.fragment) {
       if (typeof entry !== "object" || Array.isArray(entry)) {
-        throw new Error(`Secret locator '${parsed.locator}' is not an object for fragment '#${parsed.fragment}'`);
+        throw new Error("Secret locator is not an object for requested fragment");
       }
       const nested = Object.prototype.hasOwnProperty.call(entry, parsed.fragment)
         ? (entry as Record<string, unknown>)[parsed.fragment]
         : undefined;
       if (!isNonEmptyString(nested)) {
-        throw new Error(`Secret fragment '#${parsed.fragment}' is missing or empty`);
+        throw new Error("Secret fragment is missing or empty");
       }
       return { value: nested, driver: this.driver, backendId: this.backendId };
     }
     const value = typeof entry === "string" ? entry : JSON.stringify(entry);
     if (!isNonEmptyString(value)) {
-      throw new Error(`Secret locator '${parsed.locator}' is empty`);
+      throw new Error("Secret locator is empty");
     }
     return { value, driver: this.driver, backendId: this.backendId };
   }
@@ -663,9 +664,6 @@ export class CloudflareSecretVaultAdapter implements VaultAdapter {
   }
 }
 
-/**
- * OAuth2 PKCE helpers for vault-backed OAuth connections (model- & provider-agnostic).
- */
 function base64UrlEncode(bytes: Uint8Array): string {
   let binary = "";
   for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
@@ -689,12 +687,22 @@ export function buildOAuthAuthorizeUrl(params: {
   codeChallenge: string;
   extraParams?: Record<string, string>;
 }): string {
-  const endpoint = validateVaultEndpointUrl(params.authorizeEndpoint);
-  const redirect = validateVaultEndpointUrl(params.redirectUri, { allowLoopbackHttp: true });
+  const endpoint = validateVaultEndpointUrl(params.authorizeEndpoint, { preserveExactPath: true });
+  const redirect = validateVaultEndpointUrl(params.redirectUri, { allowLoopbackHttp: true, preserveExactPath: true });
   if (!isNonEmptyString(params.clientId) || !isNonEmptyString(params.state) || !isNonEmptyString(params.codeChallenge)) {
     throw new Error("OAuth authorize URL requires clientId, state, and codeChallenge");
   }
   const url = new URL(endpoint);
+  if (params.extraParams) {
+    for (const [k, v] of Object.entries(params.extraParams)) {
+      if (RESERVED_OAUTH_PARAMS.has(k.toLowerCase())) {
+        throw new Error(`extraParams must not override reserved OAuth parameter '${k}'`);
+      }
+      if (isNonEmptyString(k) && isNonEmptyString(v)) {
+        url.searchParams.set(k, v);
+      }
+    }
+  }
   url.searchParams.set("response_type", "code");
   url.searchParams.set("client_id", params.clientId.trim());
   url.searchParams.set("redirect_uri", redirect);
@@ -704,26 +712,15 @@ export function buildOAuthAuthorizeUrl(params: {
   url.searchParams.set("state", params.state.trim());
   url.searchParams.set("code_challenge", params.codeChallenge.trim());
   url.searchParams.set("code_challenge_method", "S256");
-  if (params.extraParams) {
-    for (const [k, v] of Object.entries(params.extraParams)) {
-      if (isNonEmptyString(k) && isNonEmptyString(v)) {
-        url.searchParams.set(k, v);
-      }
-    }
-  }
   return url.toString();
 }
 
-/**
- * Registry mapping backendIds to concrete VaultAdapter implementations.
- * Swapping Infisical -> 1Password -> LastPass -> Bitwarden only changes the connection's vaultUri/backendId.
- */
 export class VaultAdapterRegistry {
   private readonly adapters = new Map<string, VaultAdapter>();
 
   public register(adapter: VaultAdapter): this {
     if (!isNonEmptyString(adapter.backendId) || FORBIDDEN_IDENTIFIER_KEYS.has(adapter.backendId)) {
-      throw new Error(`Invalid VaultAdapter backendId '${adapter.backendId}'`);
+      throw new Error("Invalid VaultAdapter backendId");
     }
     this.adapters.set(adapter.backendId, adapter);
     return this;
@@ -761,6 +758,6 @@ export class VaultAdapterRegistry {
         return await fbAdapter.resolveSecret(fb.raw, { signal: opts?.signal });
       }
     }
-    throw new Error(`No vault adapter registered for backend '${primary.backendId}'`);
+    throw new Error("No vault adapter registered for requested backend");
   }
 }

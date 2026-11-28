@@ -90,6 +90,7 @@ CREATE TABLE IF NOT EXISTS acc_connections (
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   PRIMARY KEY (tenant_id, connection_id),
+  UNIQUE (tenant_id, account_id, connection_id),
   FOREIGN KEY (tenant_id, account_id) REFERENCES acc_provider_accounts (tenant_id, account_id),
   FOREIGN KEY (tenant_id, vault_backend_id) REFERENCES acc_vault_backends (tenant_id, backend_id)
 );
@@ -131,7 +132,7 @@ CREATE TABLE IF NOT EXISTS acc_asset_bindings (
   PRIMARY KEY (tenant_id, binding_id),
   FOREIGN KEY (tenant_id, asset_id) REFERENCES acc_assets (tenant_id, asset_id),
   FOREIGN KEY (tenant_id, account_id) REFERENCES acc_provider_accounts (tenant_id, account_id),
-  FOREIGN KEY (tenant_id, connection_id) REFERENCES acc_connections (tenant_id, connection_id)
+  FOREIGN KEY (tenant_id, account_id, connection_id) REFERENCES acc_connections (tenant_id, account_id, connection_id)
 );
 
 -- Enforce at most ONE canonical owner per (tenant, asset, provider) at the database level

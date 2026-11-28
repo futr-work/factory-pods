@@ -47,6 +47,19 @@ const VALID_DRIVERS = new Set<VaultDriver>([
   "oauth_broker",
 ]);
 
+// Strict non-secret configuration key allowlists per VaultDriver
+const ALLOWED_DRIVER_CONFIG_KEYS: Record<VaultDriver, ReadonlySet<string>> = {
+  infisical: new Set(["projectId", "env", "baseUrl", "secretPath"]),
+  onepassword_connect: new Set(["connectUrl", "vault"]),
+  onepassword_cli: new Set(["vault", "account"]),
+  lastpass: new Set(["bridgeUrl", "folder"]),
+  bitwarden: new Set(["bridgeUrl", "organizationId", "projectId"]),
+  aws_sm: new Set(["region", "prefix"]),
+  gcp_sm: new Set(["projectId", "location"]),
+  cf_secret: new Set(["binding"]),
+  oauth_broker: new Set(["backingBackendId", "authorizeEndpoint", "tokenEndpoint"]),
+};
+
 const VALID_PRINCIPAL_KINDS = new Set<PrincipalKind>(["human", "service_account", "oauth_app", "org"]);
 const VALID_AUTH_TYPES = new Set<AuthType>([
   "oauth2_refresh",
@@ -65,17 +78,26 @@ const VALID_BACKEND_STATUSES = new Set(["active", "degraded", "disabled"]);
 const VALID_LIFECYCLE_STATUSES = new Set(["active", "parked", "archived"]);
 const ERROR_CLASS_RE = /^[A-Za-z0-9_.:-]{1,64}$/;
 
+function assertStringNoSecret(val: string, field: string): void {
+  try {
+    assertNoEmbeddedSecretPayload(val, field);
+  } catch (err: any) {
+    throw new ValidationError(err?.message || `Field '${field}' contains forbidden secret material`);
+  }
+}
+
 function requireSafeId(value: unknown, field: string): string {
   if (typeof value !== "string") {
     throw new ValidationError(`${field} must be a non-empty string`);
   }
   const trimmed = value.trim();
   if (!trimmed || trimmed !== value || trimmed.length > 160 || trimmed.includes("*") || /[\r\n\0]/.test(trimmed)) {
-    throw new ValidationError(`${field} must be a canonical non-wildcard identifier without leading/trailing whitespace`);
+    throw new ValidationError(`${field} must be a canonical non-wildcard identifier`);
   }
   if (FORBIDDEN_IDENTIFIER_KEYS.has(trimmed)) {
-    throw new ValidationError(`${field} uses a forbidden identifier '${trimmed}'`);
+    throw new ValidationError(`${field} uses a forbidden identifier`);
   }
+  assertStringNoSecret(trimmed, field);
   return trimmed;
 }
 
@@ -87,10 +109,11 @@ function requireNonEmptyText(value: unknown, field: string, maxLen = 256): strin
   if (trimmed.length > maxLen) {
     throw new ValidationError(`${field} exceeds maximum length of ${maxLen}`);
   }
+  assertStringNoSecret(trimmed, field);
   return trimmed;
 }
 
-function requireSafeObject(value: unknown, field: string): Record<string, unknown> {
+function requireSafeObject(value: unknown, field: string, allowedKeys?: ReadonlySet<string>): Record<string, unknown> {
   if (value === undefined || value === null) return {};
   if (typeof value !== "object" || Array.isArray(value)) {
     throw new ValidationError(`${field} must be a JSON object`);
@@ -99,6 +122,17 @@ function requireSafeObject(value: unknown, field: string): Record<string, unknow
     assertNoEmbeddedSecretPayload(value, field);
   } catch (err: any) {
     throw new ValidationError(err?.message || `Invalid ${field}`);
+  }
+  if (allowedKeys) {
+    for (const k of Object.keys(value as Record<string, unknown>)) {
+      if (!allowedKeys.has(k)) {
+        throw new ValidationError(`${field} contains unsupported configuration key '${k}'`);
+      }
+      const v = (value as Record<string, unknown>)[k];
+      if (typeof v !== "string" || !v.trim()) {
+        throw new ValidationError(`${field}.${k} must be a non-empty string`);
+      }
+    }
   }
   return value as Record<string, unknown>;
 }
@@ -114,6 +148,7 @@ function requireSafeStringArray(value: unknown, field: string): string[] {
     if (typeof v !== "string" || !v.trim() || v.includes("*")) {
       throw new ValidationError(`${field}[${i}] must be a non-empty non-wildcard string`);
     }
+    assertStringNoSecret(v, `${field}[${i}]`);
     out.push(v.trim());
   }
   return out;
@@ -140,7 +175,6 @@ function parseJsonArraySafe(raw: unknown): string[] {
 }
 
 function deterministicBindingId(assetId: string, provider: string, accountId: string, externalResourceId: string): string {
-  // Pure deterministic non-cryptographic FNV-1a 64-bit hex suffix for readable stable IDs
   const input = `${assetId}|${provider}|${accountId}|${externalResourceId}`;
   let h1 = 0x811c9dc5;
   let h2 = 0x9e3779b9;
@@ -264,7 +298,6 @@ function mapEnrichedBinding(row: any): EnrichedBindingView {
 }
 
 export async function ensureAccountsSchemaReady(db: PodStorage): Promise<void> {
-  // Idempotent runtime check; schema.sql initializes all tables on migrations / local startup.
   await db.prepare("SELECT 1 FROM acc_vault_backends LIMIT 1").first().catch(() => null);
 }
 
@@ -304,15 +337,15 @@ export class AccountsService {
   ): Promise<VaultBackendRecord> {
     const tenantId = requireSafeId(input.tenantId, "tenantId");
     const backendId = requireSafeId(input.backendId, "backendId");
-    if (!VALID_DRIVERS.has(input.driver)) {
-      throw new ValidationError(`Unsupported vault driver '${input.driver}'`);
+    if (typeof input.driver !== "string" || !VALID_DRIVERS.has(input.driver)) {
+      throw new ValidationError("Unsupported vault driver");
     }
     const label = requireNonEmptyText(input.label, "label");
-    const config = requireSafeObject(input.config, "config");
+    const config = requireSafeObject(input.config, "config", ALLOWED_DRIVER_CONFIG_KEYS[input.driver]);
     const capabilities = input.capabilities ? requireSafeStringArray(input.capabilities, "capabilities") : ["read"];
     const status = input.status ?? "active";
-    if (!VALID_BACKEND_STATUSES.has(status)) {
-      throw new ValidationError(`Invalid vault backend status '${status}'`);
+    if (typeof status !== "string" || !VALID_BACKEND_STATUSES.has(status)) {
+      throw new ValidationError("Invalid vault backend status");
     }
 
     await this.db
@@ -362,14 +395,14 @@ export class AccountsService {
   ): Promise<PrincipalRecord> {
     const tenantId = requireSafeId(input.tenantId, "tenantId");
     const principalId = requireSafeId(input.principalId, "principalId");
-    if (!VALID_PRINCIPAL_KINDS.has(input.kind)) {
-      throw new ValidationError(`Invalid principal kind '${input.kind}'`);
+    if (typeof input.kind !== "string" || !VALID_PRINCIPAL_KINDS.has(input.kind)) {
+      throw new ValidationError("Invalid principal kind");
     }
     const displayName = requireNonEmptyText(input.displayName, "displayName");
     const email = input.email ? requireNonEmptyText(input.email, "email").toLowerCase() : null;
     const status = input.status ?? "active";
     if (status !== "active" && status !== "disabled") {
-      throw new ValidationError(`Invalid principal status '${status}'`);
+      throw new ValidationError("Invalid principal status");
     }
     const metadata = requireSafeObject(input.metadata, "metadata");
 
@@ -429,17 +462,16 @@ export class AccountsService {
     const environment = input.environment ? requireSafeId(input.environment, "environment") : "prod";
     const status = input.status ?? "active";
     if (status !== "active" && status !== "disabled") {
-      throw new ValidationError(`Invalid provider account status '${status}'`);
+      throw new ValidationError("Invalid provider account status");
     }
     const metadata = requireSafeObject(input.metadata, "metadata");
 
-    // Verify owner principal exists in the EXACT same tenant
     const owner = await this.db
       .prepare("SELECT principal_id FROM acc_principals WHERE tenant_id = ? AND principal_id = ?")
       .bind(tenantId, ownerPrincipalId)
       .first<any>();
     if (!owner) {
-      throw new NotFoundError(`Principal '${ownerPrincipalId}' not found in tenant '${tenantId}'`);
+      throw new NotFoundError("Owner principal not found in tenant");
     }
 
     await this.db
@@ -508,8 +540,8 @@ export class AccountsService {
     const tenantId = requireSafeId(input.tenantId, "tenantId");
     const connectionId = requireSafeId(input.connectionId, "connectionId");
     const accountId = requireSafeId(input.accountId, "accountId");
-    if (!VALID_AUTH_TYPES.has(input.authType)) {
-      throw new ValidationError(`Unsupported authType '${input.authType}'`);
+    if (typeof input.authType !== "string" || !VALID_AUTH_TYPES.has(input.authType)) {
+      throw new ValidationError("Unsupported authType");
     }
     const vaultBackendId = requireSafeId(input.vaultBackendId, "vaultBackendId");
 
@@ -520,25 +552,25 @@ export class AccountsService {
       throw new ValidationError(err?.message || "Invalid vaultUri");
     }
     if (parsedUri.backendId !== vaultBackendId) {
-      throw new ValidationError(`vaultUri backend '${parsedUri.backendId}' must match vaultBackendId '${vaultBackendId}'`);
+      throw new ValidationError("vaultUri backend must match vaultBackendId");
     }
 
     let fallbackUri: string | null = null;
     if (input.fallbackVaultUri !== undefined && input.fallbackVaultUri !== null && input.fallbackVaultUri !== "") {
+      let parsedFb;
       try {
-        const parsedFb = parseVaultUri(input.fallbackVaultUri);
-        const fbBackend = await this.db
-          .prepare("SELECT backend_id FROM acc_vault_backends WHERE tenant_id = ? AND backend_id = ?")
-          .bind(tenantId, parsedFb.backendId)
-          .first<any>();
-        if (!fbBackend) {
-          throw new NotFoundError(`Fallback vault backend '${parsedFb.backendId}' not found in tenant '${tenantId}'`);
-        }
-        fallbackUri = parsedFb.raw;
+        parsedFb = parseVaultUri(input.fallbackVaultUri);
       } catch (err: any) {
-        if (err instanceof NotFoundError) throw err;
         throw new ValidationError(err?.message || "Invalid fallbackVaultUri");
       }
+      const fbBackend = await this.db
+        .prepare("SELECT backend_id FROM acc_vault_backends WHERE tenant_id = ? AND backend_id = ?")
+        .bind(tenantId, parsedFb.backendId)
+        .first<any>();
+      if (!fbBackend) {
+        throw new NotFoundError("Fallback vault backend not found in tenant");
+      }
+      fallbackUri = parsedFb.raw;
     }
 
     const scopes = requireSafeStringArray(input.scopes, "scopes");
@@ -548,8 +580,8 @@ export class AccountsService {
       throw new ValidationError("zeroSpendConfirmed must be a boolean");
     }
     const status = input.status ?? "unconfigured";
-    if (!VALID_CONNECTION_STATUSES.has(status)) {
-      throw new ValidationError(`Invalid connection status '${status}'`);
+    if (typeof status !== "string" || !VALID_CONNECTION_STATUSES.has(status)) {
+      throw new ValidationError("Invalid connection status");
     }
     let lastErrorClass: string | null = null;
     if (input.lastErrorClass !== undefined && input.lastErrorClass !== null && input.lastErrorClass !== "") {
@@ -559,20 +591,34 @@ export class AccountsService {
       lastErrorClass = input.lastErrorClass;
     }
 
-    // Tenant-scoped FK verification
     const acct = await this.db
       .prepare("SELECT account_id FROM acc_provider_accounts WHERE tenant_id = ? AND account_id = ?")
       .bind(tenantId, accountId)
       .first<any>();
     if (!acct) {
-      throw new NotFoundError(`Provider account '${accountId}' not found in tenant '${tenantId}'`);
+      throw new NotFoundError("Provider account not found in tenant");
     }
     const backend = await this.db
       .prepare("SELECT backend_id FROM acc_vault_backends WHERE tenant_id = ? AND backend_id = ?")
       .bind(tenantId, vaultBackendId)
       .first<any>();
     if (!backend) {
-      throw new NotFoundError(`Vault backend '${vaultBackendId}' not found in tenant '${tenantId}'`);
+      throw new NotFoundError("Vault backend not found in tenant");
+    }
+
+    // Reject reparenting an existing connection while any asset binding references it!
+    const existingConn = await this.db
+      .prepare("SELECT account_id FROM acc_connections WHERE tenant_id = ? AND connection_id = ?")
+      .bind(tenantId, connectionId)
+      .first<any>();
+    if (existingConn && String(existingConn.account_id) !== accountId) {
+      const refCountRow = await this.db
+        .prepare("SELECT COUNT(*) AS c FROM acc_asset_bindings WHERE tenant_id = ? AND connection_id = ?")
+        .bind(tenantId, connectionId)
+        .first<any>();
+      if (Number(refCountRow?.c || 0) > 0) {
+        throw new ConflictError("Cannot reparent connection to another account while asset bindings reference it");
+      }
     }
 
     await this.db
@@ -623,10 +669,6 @@ export class AccountsService {
     return mapConnection(row);
   }
 
-  /**
-   * Atomically switch a connection from one secret vault backend to another (e.g., Infisical -> 1Password or LastPass)
-   * without touching any consumer pod or asset binding.
-   */
   public async switchConnectionVault(
     input: {
       tenantId: string;
@@ -647,7 +689,7 @@ export class AccountsService {
       .bind(tenantId, connectionId)
       .first<any>();
     if (!existing) {
-      throw new NotFoundError(`Connection '${connectionId}' not found in tenant '${tenantId}'`);
+      throw new NotFoundError("Connection not found in tenant");
     }
 
     let parsedUri;
@@ -657,7 +699,7 @@ export class AccountsService {
       throw new ValidationError(err?.message || "Invalid vaultUri");
     }
     if (parsedUri.backendId !== vaultBackendId) {
-      throw new ValidationError(`vaultUri backend '${parsedUri.backendId}' must match vaultBackendId '${vaultBackendId}'`);
+      throw new ValidationError("vaultUri backend must match vaultBackendId");
     }
 
     const backend = await this.db
@@ -665,7 +707,7 @@ export class AccountsService {
       .bind(tenantId, vaultBackendId)
       .first<any>();
     if (!backend) {
-      throw new NotFoundError(`Vault backend '${vaultBackendId}' not found in tenant '${tenantId}'`);
+      throw new NotFoundError("Vault backend not found in tenant");
     }
 
     let fallbackUri: string | null = existing.fallback_vault_uri ? String(existing.fallback_vault_uri) : null;
@@ -684,7 +726,7 @@ export class AccountsService {
           .bind(tenantId, parsedFb.backendId)
           .first<any>();
         if (!fbBackend) {
-          throw new NotFoundError(`Fallback vault backend '${parsedFb.backendId}' not found in tenant '${tenantId}'`);
+          throw new NotFoundError("Fallback vault backend not found in tenant");
         }
         fallbackUri = parsedFb.raw;
       }
@@ -748,14 +790,14 @@ export class AccountsService {
   ): Promise<AssetRecord> {
     const tenantId = requireSafeId(input.tenantId, "tenantId");
     const assetId = requireSafeId(input.assetId, "assetId");
-    if (!VALID_ASSET_KINDS.has(input.assetKind)) {
-      throw new ValidationError(`Invalid assetKind '${input.assetKind}'`);
+    if (typeof input.assetKind !== "string" || !VALID_ASSET_KINDS.has(input.assetKind)) {
+      throw new ValidationError("Invalid assetKind");
     }
     const canonicalName = requireNonEmptyText(input.canonicalName, "canonicalName").toLowerCase();
     const brandGroup = input.brandGroup ? requireNonEmptyText(input.brandGroup, "brandGroup") : null;
     const lifecycleStatus = input.lifecycleStatus ?? "active";
-    if (!VALID_LIFECYCLE_STATUSES.has(lifecycleStatus)) {
-      throw new ValidationError(`Invalid lifecycleStatus '${lifecycleStatus}'`);
+    if (typeof lifecycleStatus !== "string" || !VALID_LIFECYCLE_STATUSES.has(lifecycleStatus)) {
+      throw new ValidationError("Invalid lifecycleStatus");
     }
     const metadata = requireSafeObject(input.metadata, "metadata");
 
@@ -785,8 +827,8 @@ export class AccountsService {
   public async listAssets(tenantIdRaw: string, assetKindFilter?: AssetKind): Promise<AssetRecord[]> {
     const tenantId = requireSafeId(tenantIdRaw, "tenantId");
     if (assetKindFilter) {
-      if (!VALID_ASSET_KINDS.has(assetKindFilter)) {
-        throw new ValidationError(`Invalid assetKind '${assetKindFilter}'`);
+      if (typeof assetKindFilter !== "string" || !VALID_ASSET_KINDS.has(assetKindFilter)) {
+        throw new ValidationError("Invalid assetKind");
       }
       const res = await this.db
         .prepare("SELECT * FROM acc_assets WHERE tenant_id = ? AND asset_kind = ? ORDER BY asset_id ASC")
@@ -833,28 +875,27 @@ export class AccountsService {
       throw new ValidationError("isCanonical must be a boolean");
     }
     const discoveryState = input.discoveryState ?? "manual";
-    if (!VALID_DISCOVERY_STATES.has(discoveryState)) {
-      throw new ValidationError(`Invalid discoveryState '${discoveryState}'`);
+    if (typeof discoveryState !== "string" || !VALID_DISCOVERY_STATES.has(discoveryState)) {
+      throw new ValidationError("Invalid discoveryState");
     }
     const metadata = requireSafeObject(input.metadata, "metadata");
 
-    // Verify asset, account, and optional connection all belong to the exact same tenant & matching provider/account
     const asset = await this.db
       .prepare("SELECT asset_id FROM acc_assets WHERE tenant_id = ? AND asset_id = ?")
       .bind(tenantId, assetId)
       .first<any>();
     if (!asset) {
-      throw new NotFoundError(`Asset '${assetId}' not found in tenant '${tenantId}'`);
+      throw new NotFoundError("Asset not found in tenant");
     }
     const account = await this.db
       .prepare("SELECT account_id, provider FROM acc_provider_accounts WHERE tenant_id = ? AND account_id = ?")
       .bind(tenantId, accountId)
       .first<any>();
     if (!account) {
-      throw new NotFoundError(`Provider account '${accountId}' not found in tenant '${tenantId}'`);
+      throw new NotFoundError("Provider account not found in tenant");
     }
     if (String(account.provider) !== provider) {
-      throw new ValidationError(`Account '${accountId}' provider '${account.provider}' does not match binding provider '${provider}'`);
+      throw new ValidationError("Account provider does not match binding provider");
     }
 
     let connectionId: string | null = null;
@@ -865,14 +906,13 @@ export class AccountsService {
         .bind(tenantId, connectionId)
         .first<any>();
       if (!conn) {
-        throw new NotFoundError(`Connection '${connectionId}' not found in tenant '${tenantId}'`);
+        throw new NotFoundError("Connection not found in tenant");
       }
       if (String(conn.account_id) !== accountId) {
-        throw new ValidationError(`Connection '${connectionId}' belongs to account '${conn.account_id}', not '${accountId}'`);
+        throw new ValidationError("Connection does not belong to specified provider account");
       }
     }
 
-    // Look up existing natural binding so repeated upserts preserve binding_id
     const naturalExisting = await this.db
       .prepare(
         `SELECT binding_id FROM acc_asset_bindings
@@ -967,7 +1007,7 @@ export class AccountsService {
       .bind(tenantId, bindingId)
       .first<any>();
     if (!target) {
-      throw new NotFoundError(`Binding '${bindingId}' not found in tenant '${tenantId}'`);
+      throw new NotFoundError("Binding not found in tenant");
     }
 
     await this.db.batch([
@@ -1002,10 +1042,10 @@ export class AccountsService {
   }
 
   /**
-   * Ingest a discovery snapshot from any external account (Bing, GSC, Cloudflare, GitHub, Coolify, etc.):
-   * - Auto-creates missing assets (when autoCreateAssets !== false).
-   * - Auto-marks canonical when no other account owns (asset, provider).
-   * - Preserves existing canonical owner & flags `overlap_conflict` when a second account also reports the same asset!
+   * Concurrency-safe discovery ingestion:
+   * - Evaluates canonical ownership atomically INSIDE the SQLite INSERT statement (never demotes an existing owner!).
+   * - If two accounts discover the same (asset, provider) concurrently, only the first writer obtains is_canonical=1;
+   *   the second atomically lands as is_canonical=0, discovery_state='overlap_conflict'.
    */
   public async ingestDiscovery(
     input: {
@@ -1047,11 +1087,25 @@ export class AccountsService {
       .bind(tenantId, accountId)
       .first<any>();
     if (!account) {
-      throw new NotFoundError(`Provider account '${accountId}' not found in tenant '${tenantId}'`);
+      throw new NotFoundError("Provider account not found in tenant");
     }
     const provider = String(account.provider);
-    const autoCreate = input.autoCreateAssets !== false;
+    let connectionId: string | null = null;
+    if (input.connectionId) {
+      connectionId = requireSafeId(input.connectionId, "connectionId");
+      const conn = await this.db
+        .prepare("SELECT connection_id, account_id FROM acc_connections WHERE tenant_id = ? AND connection_id = ?")
+        .bind(tenantId, connectionId)
+        .first<any>();
+      if (!conn) {
+        throw new NotFoundError("Connection not found in tenant");
+      }
+      if (String(conn.account_id) !== accountId) {
+        throw new ValidationError("Connection does not belong to specified provider account");
+      }
+    }
 
+    const autoCreate = input.autoCreateAssets !== false;
     let createdAssets = 0;
     let canonicalAssigned = 0;
     let overlapsFlagged = 0;
@@ -1060,71 +1114,171 @@ export class AccountsService {
     for (const item of input.items) {
       const assetId = requireSafeId(item.assetId, "item.assetId");
       const canonicalName = requireNonEmptyText(item.canonicalName, "item.canonicalName").toLowerCase();
-      const existingAsset = await this.db
-        .prepare("SELECT asset_id FROM acc_assets WHERE tenant_id = ? AND asset_id = ?")
-        .bind(tenantId, assetId)
-        .first<any>();
-      if (!existingAsset) {
-        if (!autoCreate) {
-          throw new NotFoundError(`Asset '${assetId}' does not exist and autoCreateAssets=false`);
+      const assetKind = item.assetKind ?? "site";
+      if (typeof assetKind !== "string" || !VALID_ASSET_KINDS.has(assetKind)) {
+        throw new ValidationError("Invalid item.assetKind");
+      }
+      const brandGroup = item.brandGroup ? requireNonEmptyText(item.brandGroup, "item.brandGroup") : null;
+      const externalResourceId = requireNonEmptyText(item.externalResourceId, "item.externalResourceId");
+      if (externalResourceId.includes("*")) {
+        throw new ValidationError("item.externalResourceId must not contain wildcards");
+      }
+      const roleOrPermission = item.roleOrPermission ? requireNonEmptyText(item.roleOrPermission, "item.roleOrPermission") : "verified";
+      const metadata = requireSafeObject(item.metadata, "item.metadata");
+
+      if (autoCreate) {
+        const assetInsert = await this.db
+          .prepare(
+            `INSERT OR IGNORE INTO acc_assets (
+               tenant_id, asset_id, asset_kind, canonical_name, brand_group, lifecycle_status, metadata_json, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, 'active', '{}', ?, ?)`
+          )
+          .bind(tenantId, assetId, assetKind, canonicalName, brandGroup, now, now)
+          .run();
+        if (Number(assetInsert.meta?.changes || 0) > 0) {
+          createdAssets += 1;
         }
-        await this.upsertAsset(
-          {
+      } else {
+        const existingAsset = await this.db
+          .prepare("SELECT asset_id FROM acc_assets WHERE tenant_id = ? AND asset_id = ?")
+          .bind(tenantId, assetId)
+          .first<any>();
+        if (!existingAsset) {
+          throw new NotFoundError("Asset does not exist and autoCreateAssets is false");
+        }
+      }
+
+      const prevSelf = await this.db
+        .prepare(
+          `SELECT binding_id, is_canonical FROM acc_asset_bindings
+           WHERE tenant_id = ? AND asset_id = ? AND provider = ? AND account_id = ? AND external_resource_id = ?`
+        )
+        .bind(tenantId, assetId, provider, accountId, externalResourceId)
+        .first<any>();
+      const wasAlreadyCanonical = Boolean(prevSelf && Number(prevSelf.is_canonical) === 1);
+      const bindingId = prevSelf ? String(prevSelf.binding_id) : deterministicBindingId(assetId, provider, accountId, externalResourceId);
+
+      // Atomic conditional INSERT: claims canonical ONLY if no other account or canonical row exists at write time.
+      // Never demotes an existing canonical owner!
+      try {
+        await this.db
+          .prepare(
+            `INSERT INTO acc_asset_bindings (
+               tenant_id, binding_id, asset_id, account_id, connection_id, provider,
+               external_resource_id, role_or_permission, is_canonical, discovery_state,
+               last_discovered_at, metadata_json, created_at, updated_at
+             ) VALUES (
+               ?, ?, ?, ?, ?, ?, ?, ?,
+               CASE WHEN NOT EXISTS (
+                 SELECT 1 FROM acc_asset_bindings
+                 WHERE tenant_id = ? AND asset_id = ? AND provider = ? AND (is_canonical = 1 OR account_id <> ?)
+               ) THEN 1 ELSE 0 END,
+               CASE WHEN EXISTS (
+                 SELECT 1 FROM acc_asset_bindings
+                 WHERE tenant_id = ? AND asset_id = ? AND provider = ? AND account_id <> ?
+               ) THEN 'overlap_conflict' ELSE 'verified' END,
+               ?, ?, ?, ?
+             )
+             ON CONFLICT(tenant_id, asset_id, provider, account_id, external_resource_id) DO UPDATE SET
+               connection_id = excluded.connection_id,
+               role_or_permission = excluded.role_or_permission,
+               discovery_state = CASE
+                 WHEN acc_asset_bindings.is_canonical = 1 THEN 'verified'
+                 WHEN EXISTS (
+                   SELECT 1 FROM acc_asset_bindings AS other
+                   WHERE other.tenant_id = acc_asset_bindings.tenant_id
+                     AND other.asset_id = acc_asset_bindings.asset_id
+                     AND other.provider = acc_asset_bindings.provider
+                     AND other.account_id <> acc_asset_bindings.account_id
+                 ) THEN 'overlap_conflict'
+                 ELSE 'verified'
+               END,
+               last_discovered_at = excluded.last_discovered_at,
+               metadata_json = excluded.metadata_json,
+               updated_at = excluded.updated_at`
+          )
+          .bind(
+            tenantId,
+            bindingId,
+            assetId,
+            accountId,
+            connectionId,
+            provider,
+            externalResourceId,
+            roleOrPermission,
             tenantId,
             assetId,
-            assetKind: item.assetKind ?? "site",
-            canonicalName,
-            brandGroup: item.brandGroup ?? null,
-          },
-          actorId,
-          now
-        );
-        createdAssets += 1;
+            provider,
+            accountId,
+            tenantId,
+            assetId,
+            provider,
+            accountId,
+            now,
+            JSON.stringify(metadata),
+            now,
+            now
+          )
+          .run();
+      } catch (err: any) {
+        // If a concurrent transaction raced and won idx_acc_bindings_canonical, fall back to non-canonical overlap_conflict
+        const msg = String(err?.message || err);
+        if (!/UNIQUE constraint failed/i.test(msg)) throw err;
+        await this.db
+          .prepare(
+            `INSERT INTO acc_asset_bindings (
+               tenant_id, binding_id, asset_id, account_id, connection_id, provider,
+               external_resource_id, role_or_permission, is_canonical, discovery_state,
+               last_discovered_at, metadata_json, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 'overlap_conflict', ?, ?, ?, ?)
+             ON CONFLICT(tenant_id, asset_id, provider, account_id, external_resource_id) DO UPDATE SET
+               connection_id = excluded.connection_id,
+               role_or_permission = excluded.role_or_permission,
+               discovery_state = CASE WHEN acc_asset_bindings.is_canonical = 1 THEN 'verified' ELSE 'overlap_conflict' END,
+               last_discovered_at = excluded.last_discovered_at,
+               metadata_json = excluded.metadata_json,
+               updated_at = excluded.updated_at`
+          )
+          .bind(
+            tenantId,
+            bindingId,
+            assetId,
+            accountId,
+            connectionId,
+            provider,
+            externalResourceId,
+            roleOrPermission,
+            now,
+            JSON.stringify(metadata),
+            now,
+            now
+          )
+          .run();
       }
 
-      // Inspect existing bindings for (tenant, asset, provider) to detect overlaps without clobbering ownership
-      const existingBindingsRes = await this.db
-        .prepare("SELECT * FROM acc_asset_bindings WHERE tenant_id = ? AND asset_id = ? AND provider = ?")
-        .bind(tenantId, assetId, provider)
-        .all<any>();
-      const existingBindings = existingBindingsRes.results || [];
-      const canonicalOther = existingBindings.find((b) => Number(b.is_canonical) === 1 && String(b.account_id) !== accountId);
-      const anyOtherAccount = existingBindings.some((b) => String(b.account_id) !== accountId);
-      const alreadyCanonicalSelf = existingBindings.some(
-        (b) => Number(b.is_canonical) === 1 && String(b.account_id) === accountId && String(b.external_resource_id) === item.externalResourceId.trim()
-      );
-
-      let isCanonical = false;
-      let discoveryState: DiscoveryState = "verified";
-      if (alreadyCanonicalSelf) {
-        isCanonical = true;
-      } else if (!canonicalOther && !anyOtherAccount) {
-        isCanonical = true;
+      const persisted = await this.db
+        .prepare(
+          `SELECT * FROM acc_asset_bindings
+           WHERE tenant_id = ? AND asset_id = ? AND provider = ? AND account_id = ? AND external_resource_id = ?`
+        )
+        .bind(tenantId, assetId, provider, accountId, externalResourceId)
+        .first<any>();
+      const mapped = mapBinding(persisted);
+      if (mapped.isCanonical && !wasAlreadyCanonical) {
         canonicalAssigned += 1;
-      } else {
-        isCanonical = false;
-        discoveryState = "overlap_conflict";
+      } else if (mapped.discoveryState === "overlap_conflict") {
         overlapsFlagged += 1;
       }
-
-      const binding = await this.upsertBinding(
-        {
-          tenantId,
-          assetId,
-          accountId,
-          connectionId: input.connectionId ?? null,
-          provider,
-          externalResourceId: item.externalResourceId,
-          roleOrPermission: item.roleOrPermission ?? "verified",
-          isCanonical,
-          discoveryState,
-          lastDiscoveredAt: now,
-          metadata: item.metadata,
-        },
+      await this.recordAudit(
+        tenantId,
+        "asset_binding",
+        mapped.bindingId,
+        "discover",
         actorId,
+        `Discovered ${assetId} under ${accountId} (${provider}, canonical=${mapped.isCanonical}, state=${mapped.discoveryState})`,
         now
       );
-      bindings.push(binding);
+      bindings.push(mapped);
     }
 
     return {
@@ -1174,7 +1328,7 @@ export class AccountsService {
       LEFT JOIN acc_principals p
         ON p.tenant_id = a.tenant_id AND p.principal_id = a.owner_principal_id
       LEFT JOIN acc_connections c
-        ON c.tenant_id = b.tenant_id AND c.connection_id = b.connection_id
+        ON c.tenant_id = b.tenant_id AND c.connection_id = b.connection_id AND c.account_id = b.account_id
       LEFT JOIN acc_vault_backends vb
         ON vb.tenant_id = c.tenant_id AND vb.backend_id = c.vault_backend_id
       WHERE ${clauses.join(" AND ")}
@@ -1184,9 +1338,6 @@ export class AccountsService {
     return (res.results || []).map(mapEnrichedBinding);
   }
 
-  /**
-   * The #1 anti-blindness query: "Who owns this asset across every provider, and where are its vault pointers?"
-   */
   public async whoOwns(
     tenantIdRaw: string,
     assetIdRaw: string,
@@ -1199,7 +1350,7 @@ export class AccountsService {
       .bind(tenantId, assetId)
       .first<any>();
     if (!assetRow) {
-      throw new NotFoundError(`Asset '${assetId}' not found in tenant '${tenantId}'`);
+      throw new NotFoundError("Asset not found in tenant");
     }
     const asset = mapAsset(assetRow);
     const bindings = await this.fetchEnrichedBindings(tenantId, { assetId });
@@ -1221,12 +1372,7 @@ export class AccountsService {
     const cleanExpected = requireSafeStringArray(expectedProviders, "expectedProviders").map((p) => p.toLowerCase());
     const missingProviders = cleanExpected.filter((p) => !providers[p] || !providers[p].canonical);
 
-    return {
-      tenantId,
-      asset,
-      providers,
-      missingProviders,
-    };
+    return { tenantId, asset, providers, missingProviders };
   }
 
   public async queryMatrix(input: {
