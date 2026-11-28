@@ -139,21 +139,17 @@ function inspectStringForSecrets(value: string): void {
       }
     }
   }
-  // Also catch standalone percent-encoded query strings outside full URLs (e.g. "?access%5Ftoken=val")
+  // Also catch standalone percent-encoded query strings outside full URLs (e.g. "?access%5Ftoken=val" or "&access%5Ftoken=val")
   if (value.includes("?") || value.includes("&")) {
     const qIdx = value.indexOf("?");
     const tail = qIdx >= 0 ? value.slice(qIdx + 1) : value;
-    try {
-      const sp = new URLSearchParams(tail.split(/[\s#]/, 1)[0]);
-      for (const [k, v] of sp.entries()) {
-        if (!v) continue;
-        const lower = k.toLowerCase();
-        if (CREDENTIAL_QUERY_KEY_NAMES.has(lower) || FORBIDDEN_SECRET_FIELD_RE.test(lower)) {
-          throw new Error("Embedded credential query parameter is forbidden");
-        }
+    const sp = new URLSearchParams(tail.split(/[\s#]/, 1)[0]);
+    for (const [k, v] of sp.entries()) {
+      if (!v) continue;
+      const lower = k.toLowerCase();
+      if (CREDENTIAL_QUERY_KEY_NAMES.has(lower) || FORBIDDEN_SECRET_FIELD_RE.test(lower)) {
+        throw new Error("Embedded credential query parameter is forbidden");
       }
-    } catch {
-      // ignore malformed non-query text
     }
   }
 }
