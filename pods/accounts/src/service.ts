@@ -113,6 +113,14 @@ function requireNonEmptyText(value: unknown, field: string, maxLen = 256): strin
   return trimmed;
 }
 
+function requireOptionalTimestamp(value: unknown, field: string): number | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "number" || !Number.isFinite(value) || !Number.isInteger(value) || value < 0) {
+    throw new ValidationError(`${field} must be a non-negative integer timestamp`);
+  }
+  return value;
+}
+
 function requireSafeObject(value: unknown, field: string, allowedKeys?: ReadonlySet<string>): Record<string, unknown> {
   if (value === undefined || value === null) return {};
   if (typeof value !== "object" || Array.isArray(value)) {
@@ -126,11 +134,11 @@ function requireSafeObject(value: unknown, field: string, allowedKeys?: Readonly
   if (allowedKeys) {
     for (const k of Object.keys(value as Record<string, unknown>)) {
       if (!allowedKeys.has(k)) {
-        throw new ValidationError(`${field} contains unsupported configuration key '${k}'`);
+        throw new ValidationError(`${field} contains an unsupported configuration key`);
       }
       const v = (value as Record<string, unknown>)[k];
       if (typeof v !== "string" || !v.trim()) {
-        throw new ValidationError(`${field}.${k} must be a non-empty string`);
+        throw new ValidationError(`${field} values must be non-empty strings`);
       }
     }
   }
@@ -583,6 +591,7 @@ export class AccountsService {
     if (typeof status !== "string" || !VALID_CONNECTION_STATUSES.has(status)) {
       throw new ValidationError("Invalid connection status");
     }
+    const lastVerifiedAt = requireOptionalTimestamp(input.lastVerifiedAt, "lastVerifiedAt");
     let lastErrorClass: string | null = null;
     if (input.lastErrorClass !== undefined && input.lastErrorClass !== null && input.lastErrorClass !== "") {
       if (typeof input.lastErrorClass !== "string" || !ERROR_CLASS_RE.test(input.lastErrorClass)) {
@@ -654,7 +663,7 @@ export class AccountsService {
         JSON.stringify(oauthMeta),
         zeroSpendConfirmed ? 1 : 0,
         status,
-        input.lastVerifiedAt ?? null,
+        lastVerifiedAt,
         lastErrorClass,
         now,
         now
@@ -878,6 +887,7 @@ export class AccountsService {
     if (typeof discoveryState !== "string" || !VALID_DISCOVERY_STATES.has(discoveryState)) {
       throw new ValidationError("Invalid discoveryState");
     }
+    const lastDiscoveredAt = requireOptionalTimestamp(input.lastDiscoveredAt, "lastDiscoveredAt");
     const metadata = requireSafeObject(input.metadata, "metadata");
 
     const asset = await this.db
@@ -966,7 +976,7 @@ export class AccountsService {
           roleOrPermission,
           isCanonical ? 1 : 0,
           discoveryState,
-          input.lastDiscoveredAt ?? null,
+          lastDiscoveredAt,
           JSON.stringify(metadata),
           now,
           now

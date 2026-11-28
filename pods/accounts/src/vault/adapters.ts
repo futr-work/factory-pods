@@ -41,7 +41,11 @@ const FORBIDDEN_SECRET_FIELD_RE =
   /(?:^|_|-)(?:secret|password|passwd|token|private.?key|api.?key|credential|auth.?header|cookie|session.?id|access.?key|refresh.?token|bearer)(?:$|_|-)|(?:secret|password|passwd|token|privatekey|apikey|credential)/i;
 
 const PEM_PRIVATE_KEY_RE = /-----BEGIN\s+[A-Z0-9 ]*PRIVATE KEY-----/;
-const BITWARDEN_CIPHERTEXT_RE = /^\d+\.[A-Za-z0-9+/=]+\|[A-Za-z0-9+/=]+(?:\|[A-Za-z0-9+/=]+)?$/;
+const BITWARDEN_CIPHERTEXT_RE =
+  /^(?:[0-2]\.[A-Za-z0-9+/=]{4,}\|[A-Za-z0-9+/=]{4,}(?:\|[A-Za-z0-9+/=]{4,})?|[3-6]\.[A-Za-z0-9+/=]{4,}(?:\|[A-Za-z0-9+/=]{4,})?)$/;
+const CREDENTIAL_QUERY_RE =
+  /[?&](?:apikey|api_key|access_token|refresh_token|client_secret|token|password|passwd|secret)=[^&\s#]+/i;
+const CREDENTIAL_USERINFO_RE = /[a-z][a-z0-9+.-]*:\/\/[^/\s@]+:[^/\s@]+@/i;
 const VAULT_SEGMENT_RE = /^[A-Za-z0-9._:@-]{1,128}$/;
 const VAULT_FRAGMENT_RE = /^[A-Za-z0-9._-]{1,64}$/;
 
@@ -85,31 +89,37 @@ export function redactSecrets(text: string, knownSecrets: readonly string[] = []
  * Recursively reject embedded credentials, secret-named keys, prototype keys, or PEM private keys
  * across ANY string, array, or object persisted into D1.
  */
-export function assertNoEmbeddedSecretPayload(value: unknown, path = "$"): void {
+export function assertNoEmbeddedSecretPayload(value: unknown, _path = "$"): void {
   if (typeof value === "string") {
     if (PEM_PRIVATE_KEY_RE.test(value)) {
-      throw new Error(`Embedded PEM private key material is forbidden at '${path}'`);
+      throw new Error("Embedded PEM private key material is forbidden");
     }
-    if (/Bearer\s+[A-Za-z0-9\-._~+/]{12,}/i.test(value)) {
-      throw new Error(`Embedded Bearer credential is forbidden at '${path}'`);
+    if (/\bBearer\s+\S+/i.test(value)) {
+      throw new Error("Embedded Bearer credential is forbidden");
+    }
+    if (CREDENTIAL_QUERY_RE.test(value)) {
+      throw new Error("Embedded credential query parameter is forbidden");
+    }
+    if (CREDENTIAL_USERINFO_RE.test(value)) {
+      throw new Error("Embedded URL credential userinfo is forbidden");
     }
     return;
   }
   if (!value || typeof value !== "object") return;
   if (Array.isArray(value)) {
     for (let i = 0; i < value.length; i++) {
-      assertNoEmbeddedSecretPayload(value[i], `${path}[${i}]`);
+      assertNoEmbeddedSecretPayload(value[i]);
     }
     return;
   }
   for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
     if (FORBIDDEN_IDENTIFIER_KEYS.has(key)) {
-      throw new Error(`Forbidden object key at '${path}'`);
+      throw new Error("Forbidden object key detected");
     }
     if (FORBIDDEN_SECRET_FIELD_RE.test(key)) {
-      throw new Error(`Embedded secret field is forbidden at '${path}'`);
+      throw new Error("Embedded secret field is forbidden");
     }
-    assertNoEmbeddedSecretPayload(val, `${path}.${key}`);
+    assertNoEmbeddedSecretPayload(val);
   }
 }
 

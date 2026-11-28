@@ -1,5 +1,5 @@
 import type { HandlerContext, TaskHandler, TaskRecord } from "./types.js";
-import { AccountsService } from "./service.js";
+import { AccountsService, ValidationError } from "./service.js";
 import { sha256Hex } from "@futr-work/pod-kernel/auth";
 
 export class AccountsPodHandler implements TaskHandler {
@@ -14,14 +14,19 @@ export class AccountsPodHandler implements TaskHandler {
     const service = new AccountsService(storage);
     const spec = task.spec && typeof task.spec === "object" ? task.spec : {};
     const payload = spec.payload && typeof spec.payload === "object" ? spec.payload : spec;
-    const action = spec.action || (task.topic.includes(".") ? task.topic.split(".")[1] : "matrix");
+    const rawAction =
+      typeof spec.action === "string"
+        ? spec.action.trim()
+        : task.topic.includes(".")
+          ? task.topic.split(".")[1].trim()
+          : "";
 
     if (!payload.tenantId || typeof payload.tenantId !== "string" || !payload.tenantId.trim()) {
-      throw new Error("Scoped accounts task requires an explicit tenantId");
+      throw new ValidationError("Scoped accounts task requires an explicit tenantId");
     }
 
     let domainOutput: any;
-    switch (action) {
+    switch (rawAction) {
       case "who_owns":
         domainOutput = await service.whoOwns(payload.tenantId, payload.assetId, payload.expectedProviders || []);
         break;
@@ -34,7 +39,6 @@ export class AccountsPodHandler implements TaskHandler {
         domainOutput = await service.ingestDiscovery(payload as any, task.ownerId || "hub", now);
         break;
       case "matrix":
-      default:
         domainOutput = await service.queryMatrix({
           tenantId: payload.tenantId,
           assetKind: payload.assetKind,
@@ -42,7 +46,10 @@ export class AccountsPodHandler implements TaskHandler {
           brandGroup: payload.brandGroup,
         });
         break;
+      default:
+        throw new ValidationError("Unsupported accounts task action");
     }
+    const action = rawAction;
 
     const receiptHash = await sha256Hex(`${task.taskId}:${podConfig.id}:${JSON.stringify(domainOutput)}`);
     const result = {
