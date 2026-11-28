@@ -19,7 +19,9 @@ import {
   ValidationError,
 } from "./service.js";
 import { renderPodUiHtml } from "./ui.js";
-import type { TaskRecord } from "./types.js";
+import { MeasurementCollectorScheduler } from "./collectors/scheduler.js";
+import type { FetchLike } from "./collectors/gsc.js";
+import type { CollectorConnector, TaskRecord } from "./types.js";
 
 export interface Env {
   DB: D1Database | D1DatabaseLike | PodStorage;
@@ -32,6 +34,8 @@ export interface Env {
   FACTORY_HUB_URL?: string;
   FACTORY_HUB_TOKEN?: string;
   SCOPED_CALLER_GRANTS?: string;
+  COLLECTOR_CREDENTIALS?: string;
+  COLLECTOR_FETCH?: FetchLike;
 }
 
 const CORS_HEADERS = {
@@ -166,7 +170,7 @@ export default {
             },
           });
         }
-        // Fail closed BEFORE touching/migrating DB on /evidence/:id/authorize when caller lacks any tenant evidence:read grant!
+        // Fail closed BEFORE touching/migrating DB on /evidence/:id/authorize or /collectors/status when caller lacks required tenant grant!
         const preEvAuthMatch = method === "GET" ? url.pathname.match(/^\/api\/measurement\/evidence\/([^/]+)\/authorize$/) : null;
         if (preEvAuthMatch) {
           const preTenantId = (url.searchParams.get("tenantId") || "").trim();
@@ -175,6 +179,56 @@ export default {
           }
           if (!hasAnyTenantActionGrant(preAuthCaller, preTenantId, "evidence:read")) {
             return jsonResponse({ error: "forbidden" }, 403);
+          }
+        }
+        if (method === "GET" && url.pathname === "/api/measurement/collectors/status") {
+          const preTenantId = (url.searchParams.get("tenantId") || "").trim();
+          if (!preTenantId) {
+            return jsonResponse({ error: "Query parameter 'tenantId' is required" }, 400);
+          }
+          const preResourceId = (url.searchParams.get("resourceId") || "").trim() || undefined;
+          if (preResourceId) {
+            const preDenied = authorizeScopedCaller(preAuthCaller, { tenantId: preTenantId, resourceId: preResourceId, action: "read" }, "measurement-pod");
+            if (preDenied) return preDenied;
+          } else if (!hasAnyTenantActionGrant(preAuthCaller, preTenantId, "read")) {
+            return jsonResponse({ error: "forbidden" }, 403);
+          }
+        }
+        let preParsedCollectorBody: Record<string, any> | null = null;
+        if (method === "POST" && url.pathname === "/api/measurement/collectors/schedules") {
+          preParsedCollectorBody = await parseJsonBody(request);
+          const preTenantId = typeof preParsedCollectorBody.tenantId === "string" ? preParsedCollectorBody.tenantId.trim() : "";
+          const preResourceId = typeof preParsedCollectorBody.resourceId === "string" ? preParsedCollectorBody.resourceId.trim() : "";
+          const preDenied = authorizeScopedCaller(preAuthCaller, { tenantId: preTenantId, resourceId: preResourceId, action: "write" }, "measurement-pod");
+          if (preDenied) return preDenied;
+        }
+        if (method === "POST" && url.pathname === "/api/measurement/collectors/run") {
+          preParsedCollectorBody = await parseJsonBody(request);
+          const preTenantId = typeof preParsedCollectorBody.tenantId === "string" ? preParsedCollectorBody.tenantId.trim() : "";
+          const preResourceId =
+            typeof preParsedCollectorBody.resourceId === "string" && preParsedCollectorBody.resourceId.trim()
+              ? preParsedCollectorBody.resourceId.trim()
+              : undefined;
+          const preScheduleId =
+            typeof preParsedCollectorBody.scheduleId === "string" && preParsedCollectorBody.scheduleId.trim()
+              ? preParsedCollectorBody.scheduleId.trim()
+              : undefined;
+          const preConnector =
+            typeof preParsedCollectorBody.connector === "string" && preParsedCollectorBody.connector.trim()
+              ? preParsedCollectorBody.connector.trim()
+              : undefined;
+          if (!preTenantId) {
+            return jsonResponse({ error: "Field 'tenantId' must be a non-empty string" }, 400);
+          }
+          if (preConnector && preConnector !== "gsc" && preConnector !== "bing_webmaster") {
+            return jsonResponse({ error: "Field 'connector' must be 'gsc' or 'bing_webmaster'" }, 400);
+          }
+          if (!hasAnyTenantWriteGrant(preAuthCaller, preTenantId)) {
+            return jsonResponse({ error: "forbidden" }, 403);
+          }
+          if (!preScheduleId && preResourceId) {
+            const preDenied = authorizeScopedCaller(preAuthCaller, { tenantId: preTenantId, resourceId: preResourceId, action: "write" }, "measurement-pod");
+            if (preDenied) return preDenied;
           }
         }
         await ensureDbReady(env.DB, db);
@@ -417,6 +471,110 @@ export default {
           if (denied) return denied;
           const result = await service.annotateWork(body as any);
           return jsonResponse(result, 201);
+        }
+
+        // POST /api/measurement/collectors/schedules (register/update read-only GSC or Bing collector schedule)
+        if (method === "POST" && url.pathname === "/api/measurement/collectors/schedules") {
+          const body = preParsedCollectorBody ?? (await parseJsonBody(request));
+          const tenantId = typeof body.tenantId === "string" ? body.tenantId.trim() : "";
+          const resourceId = typeof body.resourceId === "string" ? body.resourceId.trim() : "";
+          const { denied } = await resolveAndAuthorize(request, env, { tenantId, resourceId, action: "write" });
+          if (denied) return denied;
+          const scheduler = new MeasurementCollectorScheduler(db, service, {
+            collectorCredentialsRaw: env.COLLECTOR_CREDENTIALS,
+            fetchImpl: env.COLLECTOR_FETCH,
+          });
+          const result = await scheduler.upsertSchedule(body as any);
+          return jsonResponse(result, 201);
+        }
+
+        // GET /api/measurement/collectors/status (freshness, last success/attempt, failures, cooldown, quota, backlog)
+        if (method === "GET" && url.pathname === "/api/measurement/collectors/status") {
+          const tenantId = (url.searchParams.get("tenantId") || "").trim();
+          const resourceId = (url.searchParams.get("resourceId") || "").trim() || undefined;
+          const connectorRaw = (url.searchParams.get("connector") || "").trim() || undefined;
+          if (!tenantId) {
+            return jsonResponse({ error: "Query parameter 'tenantId' is required" }, 400);
+          }
+          if (connectorRaw && connectorRaw !== "gsc" && connectorRaw !== "bing_webmaster") {
+            return jsonResponse({ error: "Query parameter 'connector' must be 'gsc' or 'bing_webmaster'" }, 400);
+          }
+          const configured = parseScopedCallerGrants(env.SCOPED_CALLER_GRANTS);
+          const caller = await resolveScopedCaller(request, configured);
+          if (!caller) return jsonResponse({ error: "unauthorized" }, 401);
+          if (resourceId) {
+            const denied = authorizeScopedCaller(caller, { tenantId, resourceId, action: "read" }, "measurement-pod");
+            if (denied) return denied;
+          } else if (!hasAnyTenantActionGrant(caller, tenantId, "read")) {
+            return jsonResponse({ error: "forbidden" }, 403);
+          }
+          const scheduler = new MeasurementCollectorScheduler(db, service, {
+            collectorCredentialsRaw: env.COLLECTOR_CREDENTIALS,
+            fetchImpl: env.COLLECTOR_FETCH,
+          });
+          const items = await scheduler.getCollectorStatus({
+            tenantId,
+            resourceId,
+            connector: connectorRaw as CollectorConnector | undefined,
+            allowedResourceFilter: (rid: string) =>
+              authorizeScopedCaller(caller, { tenantId, resourceId: rid, action: "read" }, "measurement-pod") === null,
+          });
+          return jsonResponse({ items }, 200);
+        }
+
+        // POST /api/measurement/collectors/run (run due schedules or explicit idempotent backfill windows)
+        if (method === "POST" && url.pathname === "/api/measurement/collectors/run") {
+          const body = preParsedCollectorBody ?? (await parseJsonBody(request));
+          const tenantId = typeof body.tenantId === "string" ? body.tenantId.trim() : "";
+          const resourceId = typeof body.resourceId === "string" && body.resourceId.trim() ? body.resourceId.trim() : undefined;
+          const scheduleId = typeof body.scheduleId === "string" && body.scheduleId.trim() ? body.scheduleId.trim() : undefined;
+          const connectorRaw = typeof body.connector === "string" && body.connector.trim() ? body.connector.trim() : undefined;
+          if (!tenantId) {
+            return jsonResponse({ error: "Field 'tenantId' must be a non-empty string" }, 400);
+          }
+          if (connectorRaw && connectorRaw !== "gsc" && connectorRaw !== "bing_webmaster") {
+            return jsonResponse({ error: "Field 'connector' must be 'gsc' or 'bing_webmaster'" }, 400);
+          }
+          const configured = parseScopedCallerGrants(env.SCOPED_CALLER_GRANTS);
+          const caller = await resolveScopedCaller(request, configured);
+          if (!caller) return jsonResponse({ error: "unauthorized" }, 401);
+          if (!hasAnyTenantWriteGrant(caller, tenantId)) {
+            return jsonResponse({ error: "forbidden" }, 403);
+          }
+          const scheduler = new MeasurementCollectorScheduler(db, service, {
+            collectorCredentialsRaw: env.COLLECTOR_CREDENTIALS,
+            fetchImpl: env.COLLECTOR_FETCH,
+          });
+          if (scheduleId) {
+            const sched = await scheduler.getScheduleById(tenantId, scheduleId);
+            if (!sched) {
+              const wildcardDenied = authorizeScopedCaller(caller, { tenantId, resourceId: "*", action: "write" }, "measurement-pod");
+              if (wildcardDenied) return jsonResponse({ error: "forbidden" }, 403);
+              return jsonResponse({ error: `Schedule '${scheduleId}' not found` }, 404);
+            }
+            const denied = authorizeScopedCaller(caller, { tenantId, resourceId: sched.resourceId, action: "write" }, "measurement-pod");
+            if (denied) return jsonResponse({ error: "forbidden" }, 403);
+          } else if (resourceId) {
+            const denied = authorizeScopedCaller(caller, { tenantId, resourceId, action: "write" }, "measurement-pod");
+            if (denied) return jsonResponse({ error: "forbidden" }, 403);
+          }
+          const outcomes = await scheduler.runSchedules(
+            {
+              tenantId,
+              scheduleId,
+              resourceId,
+              connector: connectorRaw as CollectorConnector | undefined,
+              windowStart: typeof body.windowStart === "string" ? body.windowStart : undefined,
+              windowEnd: typeof body.windowEnd === "string" ? body.windowEnd : undefined,
+              maxWindows: typeof body.maxWindows === "number" ? body.maxWindows : undefined,
+              force: Boolean(body.force),
+            },
+            {
+              allowedResourceFilter: (rid: string) =>
+                authorizeScopedCaller(caller, { tenantId, resourceId: rid, action: "write" }, "measurement-pod") === null,
+            }
+          );
+          return jsonResponse({ outcomes }, 200);
         }
 
         // GET /api/measurement/series
@@ -715,6 +873,7 @@ export default {
     const config = loadPodConfig(env as any);
     const tincan = new TincanClient(config, env.FACTORY_HUB);
     const db: PodStorage = toPodStorage(env.DB);
+    await ensureDbReady(env.DB, db);
 
     const hbOk = await tincan.sendHeartbeat();
     await recordPodHeartbeat(db, config.id, {
@@ -725,6 +884,18 @@ export default {
       role: config.role,
       capabilities: config.capabilities,
     });
+
+    // Run due read-only scheduled collectors (bounded; never interrupts heartbeat or task sweep)
+    try {
+      const collectorService = new MeasurementService(db);
+      const scheduler = new MeasurementCollectorScheduler(db, collectorService, {
+        collectorCredentialsRaw: env.COLLECTOR_CREDENTIALS,
+        fetchImpl: env.COLLECTOR_FETCH,
+      });
+      await scheduler.runDueSchedules({ maxSchedules: 5 });
+    } catch {
+      // Errors are durably recorded per-schedule in ms_collector_schedules & ms_coverage
+    }
 
     // Sweep expired task leases
     const now = Date.now();
