@@ -56,6 +56,51 @@ export class ForbiddenError extends Error {
   }
 }
 
+export class LeaseFenceError extends Error {
+  public readonly status = 409;
+  constructor(message = "Schedule execution lease expired or was preempted") {
+    super(message);
+    this.name = "LeaseFenceError";
+  }
+}
+
+export interface CollectorLeaseFence {
+  scheduleId: string;
+  leaseOwner: string;
+  getNow: () => number;
+  getClockOffsetMs?: () => number;
+  buildPostCommitStatements?: (now: number, clockOffsetMs: number) => any[];
+}
+
+export const SQL_TX_NOW_MS_EXPR = "MAX(?, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) + ?)";
+
+/**
+ * Pure-SQL atomic transaction fence for SQLite/D1 db.batch():
+ * evaluates lease ownership AND expiry at SQLite transaction execution time (never against a stale pre-bound timestamp alone).
+ * Succeeds with 0 mutations when the schedule lease is still owned and unexpired,
+ * or raises NOT NULL constraint failed on ms_schema_migrations.applied_at to roll back the entire batch!
+ */
+export function buildCollectorLeaseFenceStatement(
+  db: PodStorage,
+  scheduleId: string,
+  leaseOwner: string,
+  nowTs: number,
+  clockOffsetMs = 0
+): any {
+  return db
+    .prepare(
+      `INSERT INTO ms_schema_migrations (migration_id, applied_at)
+       SELECT '__collector_lease_fence__', NULL
+       WHERE NOT EXISTS (
+         SELECT 1 FROM ms_collector_schedules
+         WHERE schedule_id = ?
+           AND lease_owner = ?
+           AND lease_expires_at > ${SQL_TX_NOW_MS_EXPR}
+       )`
+    )
+    .bind(scheduleId, leaseOwner, nowTs, clockOffsetMs);
+}
+
 const RESOURCE_TYPES = new Set<ResourceType>(["site", "analytics_property", "ad_account", "server_service"]);
 const METRIC_FAMILIES = new Set<MetricFamily>(["seo", "analytics", "spend", "telemetry"]);
 const VALUE_TYPES = new Set<ValueType>(["integer", "decimal_string", "gauge", "counter"]);
@@ -188,6 +233,43 @@ export async function ensureMeasurementSchemaUpgraded(
       groups_json TEXT NOT NULL,
       PRIMARY KEY (tenant_id, import_id, part_index)
     )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS ms_collector_schedules (
+      schedule_id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL,
+      resource_id TEXT NOT NULL,
+      connector TEXT NOT NULL CHECK (connector IN ('gsc', 'bing_webmaster')),
+      source_resource_id TEXT NOT NULL,
+      credential_ref TEXT NOT NULL,
+      cadence_sec INTEGER NOT NULL DEFAULT 86400 CHECK (cadence_sec >= 300),
+      expected_lag_sec INTEGER NOT NULL DEFAULT 259200 CHECK (expected_lag_sec >= 0),
+      daily_request_budget INTEGER NOT NULL DEFAULT 100 CHECK (daily_request_budget >= 1 AND daily_request_budget <= 10000),
+      max_rows_per_window INTEGER NOT NULL DEFAULT 25000 CHECK (max_rows_per_window >= 1 AND max_rows_per_window <= 25000),
+      dimensions_json TEXT NOT NULL DEFAULT '["date","page","query","country","device"]',
+      search_type TEXT NOT NULL DEFAULT 'web',
+      zero_spend_confirmed INTEGER NOT NULL DEFAULT 0 CHECK (zero_spend_confirmed IN (0, 1)),
+      enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+      cursor_date TEXT,
+      pending_window_date TEXT,
+      next_run_at INTEGER NOT NULL DEFAULT 0,
+      last_attempt_at INTEGER,
+      last_success_at INTEGER,
+      consecutive_failures INTEGER NOT NULL DEFAULT 0,
+      max_retries INTEGER NOT NULL DEFAULT 3 CHECK (max_retries >= 1 AND max_retries <= 10),
+      cooldown_until INTEGER,
+      lease_owner TEXT,
+      lease_expires_at INTEGER,
+      last_status TEXT NOT NULL DEFAULT 'planned' CHECK (last_status IN ('planned', 'running', 'partial', 'succeeded', 'failed', 'blocked')),
+      last_error_class TEXT,
+      last_error_message TEXT,
+      requests_used_date TEXT,
+      requests_used_today INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      UNIQUE (tenant_id, resource_id, connector),
+      FOREIGN KEY (tenant_id, resource_id) REFERENCES ms_resources(tenant_id, resource_id) ON DELETE CASCADE
+    )`),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_ms_collector_due ON ms_collector_schedules(enabled, next_run_at ASC)"),
+    db.prepare("CREATE INDEX IF NOT EXISTS idx_ms_collector_tenant_res ON ms_collector_schedules(tenant_id, resource_id, connector)"),
   ]);
 
   let migratedObservations = false;
@@ -316,6 +398,30 @@ export async function ensureMeasurementSchemaUpgraded(
        GROUP BY s.tenant_id, s.import_id`
     )
     .run();
+
+  const schedColsRes = await db.prepare("PRAGMA table_info(ms_collector_schedules)").all<any>();
+  const schedColNames = new Set((schedColsRes.results || []).map((col: any) => String(col.name)));
+  if (schedColNames.size > 0) {
+    const missingSchedCols: string[] = [];
+    if (!schedColNames.has("pending_window_date")) {
+      missingSchedCols.push("ALTER TABLE ms_collector_schedules ADD COLUMN pending_window_date TEXT");
+    }
+    if (!schedColNames.has("lease_owner")) {
+      missingSchedCols.push("ALTER TABLE ms_collector_schedules ADD COLUMN lease_owner TEXT");
+    }
+    if (!schedColNames.has("lease_expires_at")) {
+      missingSchedCols.push("ALTER TABLE ms_collector_schedules ADD COLUMN lease_expires_at INTEGER");
+    }
+    for (const ddl of missingSchedCols) {
+      try {
+        await db.prepare(ddl).run();
+      } catch (err) {
+        if (!errorText(err).includes("duplicate column name")) {
+          throw err;
+        }
+      }
+    }
+  }
 
   return { migratedObservations, migratedStagedImports };
 }
@@ -1146,6 +1252,7 @@ export class MeasurementService {
           coverageStatus: string | null;
         }>;
       }) => any[];
+      collectorLeaseFence?: CollectorLeaseFence;
     },
     now: number
   ): Promise<{
@@ -1200,12 +1307,66 @@ export class MeasurementService {
       };
       const preStatements = opts.buildPreStatements ? opts.buildPreStatements(summary) : [];
       const postStatements = opts.buildPostStatements ? opts.buildPostStatements(summary) : [];
-      const allStatements = [...preStatements, ...shared.statements, ...postStatements];
+      const fenceNow = opts.collectorLeaseFence ? opts.collectorLeaseFence.getNow() : now;
+      const fenceClockOffsetMs = opts.collectorLeaseFence?.getClockOffsetMs
+        ? opts.collectorLeaseFence.getClockOffsetMs()
+        : 0;
+      const leasePreStatements = opts.collectorLeaseFence
+        ? [
+            buildCollectorLeaseFenceStatement(
+              this.db,
+              opts.collectorLeaseFence.scheduleId,
+              opts.collectorLeaseFence.leaseOwner,
+              fenceNow,
+              fenceClockOffsetMs
+            ),
+          ]
+        : [];
+      const leasePostStatements = opts.collectorLeaseFence
+        ? [
+            ...(opts.collectorLeaseFence.buildPostCommitStatements
+              ? opts.collectorLeaseFence.buildPostCommitStatements(fenceNow, fenceClockOffsetMs)
+              : []),
+            // Closing fence guarantees no intra-transaction expiry or row deletion can split domain writes from schedule state!
+            buildCollectorLeaseFenceStatement(
+              this.db,
+              opts.collectorLeaseFence.scheduleId,
+              opts.collectorLeaseFence.leaseOwner,
+              fenceNow,
+              fenceClockOffsetMs
+            ),
+          ]
+        : [];
+      const allStatements = [
+        ...leasePreStatements,
+        ...preStatements,
+        ...shared.statements,
+        ...postStatements,
+        ...leasePostStatements,
+      ];
 
       if (allStatements.length > 0) {
         try {
           await this.db.batch(allStatements);
         } catch (err) {
+          if (opts.collectorLeaseFence && isNotNullConstraintError(err)) {
+            const msg = errorText(err);
+            if (msg.includes("ms_schema_migrations.applied_at") || msg.includes("ms_collector_schedules.updated_at")) {
+              throw new LeaseFenceError();
+            }
+            const effectiveCheckNow = Math.max(fenceNow, Date.now() + fenceClockOffsetMs);
+            const leaseRow = await this.db
+              .prepare("SELECT lease_owner, lease_expires_at FROM ms_collector_schedules WHERE schedule_id = ?")
+              .bind(opts.collectorLeaseFence.scheduleId)
+              .first<any>();
+            if (
+              !leaseRow ||
+              String(leaseRow.lease_owner || "") !== opts.collectorLeaseFence.leaseOwner ||
+              Number(leaseRow.lease_expires_at || 0) <= effectiveCheckNow
+            ) {
+              throw new LeaseFenceError();
+            }
+          }
           if (isUniqueConstraintError(err) && !isReceiptUniqueError(err)) {
             if (attempt + 1 < MAX_DOMAIN_CONTENTION_ATTEMPTS) {
               continue;
@@ -1248,7 +1409,11 @@ export class MeasurementService {
     return out.groups[0];
   }
 
-  public async ingestAtomicBatch(raw: IngestAtomicBatchInput, now = Date.now()): Promise<{
+  public async ingestAtomicBatch(
+    raw: IngestAtomicBatchInput,
+    now = Date.now(),
+    txOpts?: { collectorLeaseFence?: CollectorLeaseFence }
+  ): Promise<{
     inserted: number;
     replayedNoop: number;
     groups: Array<{
@@ -1286,7 +1451,11 @@ export class MeasurementService {
     return this.commitGroupsAtomically(
       tenantId,
       raw.groups as any,
-      { maxObservationsPerGroup: MAX_ATOMIC_OBSERVATIONS, allowInlineRunCreate: true },
+      {
+        maxObservationsPerGroup: MAX_ATOMIC_OBSERVATIONS,
+        allowInlineRunCreate: true,
+        collectorLeaseFence: txOpts?.collectorLeaseFence,
+      },
       now
     );
   }
@@ -1759,7 +1928,10 @@ export class MeasurementService {
   public async commitStagedImport(
     raw: CommitStagedImportInput,
     now = Date.now(),
-    auth?: { authorizeResourceWrite?: (resourceId: string) => void }
+    auth?: {
+      authorizeResourceWrite?: (resourceId: string) => void;
+      collectorLeaseFence?: CollectorLeaseFence;
+    }
   ): Promise<{
     importId: string;
     inserted: number;
@@ -2040,6 +2212,7 @@ export class MeasurementService {
           allowInlineRunCreate: true,
           buildPreStatements,
           buildPostStatements,
+          collectorLeaseFence: auth?.collectorLeaseFence,
         },
         now
       );
@@ -2049,6 +2222,9 @@ export class MeasurementService {
         ...out,
       };
     } catch (err) {
+      if (err instanceof LeaseFenceError) {
+        throw err;
+      }
       if (isUniqueConstraintError(err) || isNotNullConstraintError(err) || err instanceof ConflictError) {
         const concurrentReceipt = await this.db
           .prepare(
@@ -2809,71 +2985,76 @@ export class MeasurementService {
 
     let inserted = 0;
     let replayedNoop = 0;
+    const toInsert: any[] = [];
     for (const item of preparedObs) {
       if (item.replayedNoop) {
         replayedNoop += 1;
         continue;
       }
       inserted += 1;
-      const o = item.obs;
-      statements.push(
-        this.db
-          .prepare(
-            `INSERT INTO ms_observations (
-               obs_id, tenant_id, resource_id, source, run_id, evidence_id,
-               metric_id, definition_version, comparability_key,
-               window_start, window_end, window_tz, grain,
-               dimensions_json, dimensions_hash,
-               value_type, value_num, value_text,
-               currency, billing_date, gross_or_net, refund_text, credit_text, tax_text, collection_request_budget,
-               numerator, denominator, exclusions_json,
-               sample_time, gauge_reducer, counter_start, counter_end, counter_reset,
-               interpretation_version, source_revision, source_as_of,
-               idempotency_key, payload_digest, created_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-          )
-          .bind(
-            item.obsId,
-            tenantId,
-            resourceId,
-            source,
-            runId,
-            evidenceId,
-            item.def.metricId,
-            item.def.version,
-            item.def.comparabilityKey,
-            o.windowStart,
-            o.windowEnd,
-            o.windowTz,
-            o.grain,
-            item.dimensionsJson,
-            item.dimensionsHash,
-            item.def.valueType,
-            item.valueNum,
-            item.valueText,
-            o.currency ?? null,
-            o.billingDate ?? null,
-            o.grossOrNet ?? null,
-            o.refundText ?? null,
-            o.creditText ?? null,
-            o.taxText ?? null,
-            o.collectionRequestBudget ?? null,
-            o.numerator ?? null,
-            o.denominator ?? null,
-            o.exclusions ? canonicalJson(o.exclusions) : null,
-            o.sampleTime ?? null,
-            o.gaugeReducer ?? null,
-            o.counterStart ?? null,
-            o.counterEnd ?? null,
-            o.counterReset ? 1 : 0,
-            o.interpretationVersion,
-            o.sourceRevision ?? 1,
-            o.sourceAsOf,
-            o.idempotencyKey,
-            item.payloadDigest,
-            now
-          )
-      );
+      toInsert.push(item);
+    }
+
+    // Pack 2 observations per INSERT (78 params <= D1's 100-param statement cap) with compact SQL
+    // to cut D1 db.batch() RPC payload by ~55% while preserving exact record_seq insertion order.
+    const OBS_COLS =
+      "obs_id,tenant_id,resource_id,source,run_id,evidence_id,metric_id,definition_version,comparability_key," +
+      "window_start,window_end,window_tz,grain,dimensions_json,dimensions_hash,value_type,value_num,value_text," +
+      "currency,billing_date,gross_or_net,refund_text,credit_text,tax_text,collection_request_budget," +
+      "numerator,denominator,exclusions_json,sample_time,gauge_reducer,counter_start,counter_end,counter_reset," +
+      "interpretation_version,source_revision,source_as_of,idempotency_key,payload_digest,created_at";
+    const ONE_ROW_PH = "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+    const MAX_ROWS_PER_INSERT = 2;
+
+    for (let i = 0; i < toInsert.length; i += MAX_ROWS_PER_INSERT) {
+      const slice = toInsert.slice(i, i + MAX_ROWS_PER_INSERT);
+      const valuesClause = slice.map(() => ONE_ROW_PH).join(",");
+      const binds: any[] = [];
+      for (const item of slice) {
+        const o = item.obs;
+        binds.push(
+          item.obsId,
+          tenantId,
+          resourceId,
+          source,
+          runId,
+          evidenceId,
+          item.def.metricId,
+          item.def.version,
+          item.def.comparabilityKey,
+          o.windowStart,
+          o.windowEnd,
+          o.windowTz,
+          o.grain,
+          item.dimensionsJson,
+          item.dimensionsHash,
+          item.def.valueType,
+          item.valueNum,
+          item.valueText,
+          o.currency ?? null,
+          o.billingDate ?? null,
+          o.grossOrNet ?? null,
+          o.refundText ?? null,
+          o.creditText ?? null,
+          o.taxText ?? null,
+          o.collectionRequestBudget ?? null,
+          o.numerator ?? null,
+          o.denominator ?? null,
+          o.exclusions ? canonicalJson(o.exclusions) : null,
+          o.sampleTime ?? null,
+          o.gaugeReducer ?? null,
+          o.counterStart ?? null,
+          o.counterEnd ?? null,
+          o.counterReset ? 1 : 0,
+          o.interpretationVersion,
+          o.sourceRevision ?? 1,
+          o.sourceAsOf,
+          o.idempotencyKey,
+          item.payloadDigest,
+          now
+        );
+      }
+      statements.push(this.db.prepare(`INSERT INTO ms_observations (${OBS_COLS}) VALUES ${valuesClause}`).bind(...binds));
     }
 
     if (coverage) {

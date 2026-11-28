@@ -313,6 +313,46 @@ CREATE TABLE IF NOT EXISTS ms_staged_import_receipt_chunks (
   PRIMARY KEY (tenant_id, import_id, part_index)
 );
 
+-- 10. Scheduled Collector Registry (M2 GSC & Bing read-only connectors; credentials NEVER stored in D1)
+CREATE TABLE IF NOT EXISTS ms_collector_schedules (
+  schedule_id TEXT PRIMARY KEY,
+  tenant_id TEXT NOT NULL,
+  resource_id TEXT NOT NULL,
+  connector TEXT NOT NULL CHECK (connector IN ('gsc', 'bing_webmaster')),
+  source_resource_id TEXT NOT NULL,
+  credential_ref TEXT NOT NULL,
+  cadence_sec INTEGER NOT NULL DEFAULT 86400 CHECK (cadence_sec >= 300),
+  expected_lag_sec INTEGER NOT NULL DEFAULT 259200 CHECK (expected_lag_sec >= 0),
+  daily_request_budget INTEGER NOT NULL DEFAULT 100 CHECK (daily_request_budget >= 1 AND daily_request_budget <= 10000),
+  max_rows_per_window INTEGER NOT NULL DEFAULT 25000 CHECK (max_rows_per_window >= 1 AND max_rows_per_window <= 25000),
+  dimensions_json TEXT NOT NULL DEFAULT '["date","page","query","country","device"]',
+  search_type TEXT NOT NULL DEFAULT 'web',
+  zero_spend_confirmed INTEGER NOT NULL DEFAULT 0 CHECK (zero_spend_confirmed IN (0, 1)),
+  enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+  cursor_date TEXT,
+  pending_window_date TEXT,
+  next_run_at INTEGER NOT NULL DEFAULT 0,
+  last_attempt_at INTEGER,
+  last_success_at INTEGER,
+  consecutive_failures INTEGER NOT NULL DEFAULT 0,
+  max_retries INTEGER NOT NULL DEFAULT 3 CHECK (max_retries >= 1 AND max_retries <= 10),
+  cooldown_until INTEGER,
+  lease_owner TEXT,
+  lease_expires_at INTEGER,
+  last_status TEXT NOT NULL DEFAULT 'planned' CHECK (last_status IN ('planned', 'running', 'partial', 'succeeded', 'failed', 'blocked')),
+  last_error_class TEXT,
+  last_error_message TEXT,
+  requests_used_date TEXT,
+  requests_used_today INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE (tenant_id, resource_id, connector),
+  FOREIGN KEY (tenant_id, resource_id) REFERENCES ms_resources(tenant_id, resource_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_ms_collector_due ON ms_collector_schedules(enabled, next_run_at ASC);
+CREATE INDEX IF NOT EXISTS idx_ms_collector_tenant_res ON ms_collector_schedules(tenant_id, resource_id, connector);
+
 -- Indexes for bounded paginated queries & capacity floor
 CREATE INDEX IF NOT EXISTS idx_tasks_task_id ON tasks(task_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);

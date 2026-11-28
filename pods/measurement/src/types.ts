@@ -282,3 +282,108 @@ export interface EventsQueryInput {
   sinceCursor?: number;
   limit?: number;
 }
+
+export type CollectorConnector = "gsc" | "bing_webmaster";
+export type CollectorFreshnessState = "fresh" | "stale" | "never_collected" | "blocked" | "failing" | "disabled";
+
+export interface CollectorScheduleInput {
+  scheduleId?: string;
+  tenantId: string;
+  resourceId: string;
+  connector: CollectorConnector;
+  sourceResourceId: string;
+  credentialRef: string;
+  cadenceSec?: number;
+  expectedLagSec?: number;
+  dailyRequestBudget?: number;
+  maxRowsPerWindow?: number;
+  dimensions?: string[];
+  searchType?: string;
+  zeroSpendConfirmed?: boolean;
+  enabled?: boolean;
+  cursorDate?: string | null;
+  maxRetries?: number;
+}
+
+export interface CollectorScheduleRecord {
+  scheduleId: string;
+  tenantId: string;
+  resourceId: string;
+  connector: CollectorConnector;
+  sourceResourceId: string;
+  credentialRef: string;
+  cadenceSec: number;
+  expectedLagSec: number;
+  dailyRequestBudget: number;
+  maxRowsPerWindow: number;
+  dimensions: string[];
+  searchType: string;
+  zeroSpendConfirmed: boolean;
+  enabled: boolean;
+  cursorDate: string | null;
+  pendingWindowDate: string | null;
+  nextRunAt: number;
+  lastAttemptAt: number | null;
+  lastSuccessAt: number | null;
+  consecutiveFailures: number;
+  maxRetries: number;
+  cooldownUntil: number | null;
+  lastStatus: RunStatus;
+  lastErrorClass: string | null;
+  lastErrorMessage: string | null;
+  requestsUsedDate: string | null;
+  requestsUsedToday: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface CollectorStatusItem extends CollectorScheduleRecord {
+  credentialConfigured: boolean;
+  credentialScopeAuthorized: boolean;
+  freshnessState: CollectorFreshnessState;
+  ageSec: number | null;
+  latestEligibleDate: string;
+  backlogDays: number;
+}
+
+export interface CollectorRunRequest {
+  tenantId: string;
+  scheduleId?: string;
+  resourceId?: string;
+  connector?: CollectorConnector;
+  windowStart?: string;
+  windowEnd?: string;
+  maxWindows?: number;
+  force?: boolean;
+}
+
+export interface CollectorWindowOutcome {
+  windowStart: string;
+  windowEnd: string;
+  status: RunStatus;
+  inserted: number;
+  replayedNoop: number;
+  requestsUsed: number;
+  coverageStatus: CoverageStatus;
+  reconciliationStatus: ReconciliationStatus;
+  truncated: boolean;
+  errorClass?: string | null;
+  errorMessage?: string | null;
+}
+
+export interface CollectorRunOutcome {
+  scheduleId: string;
+  tenantId: string;
+  resourceId: string;
+  connector: CollectorConnector;
+  status: RunStatus;
+  windowsProcessed: number;
+  inserted: number;
+  replayedNoop: number;
+  requestsUsed: number;
+  cursorDate: string | null;
+  cooldownUntil: number | null;
+  errorClass: string | null;
+  errorMessage: string | null;
+  windows: CollectorWindowOutcome[];
+}
