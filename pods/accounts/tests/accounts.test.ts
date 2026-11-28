@@ -504,13 +504,21 @@ test("HTTP Worker enforces scoped auth on /api/tasks, rejects raw credentials in
     assert.equal(badMetaRes.status, 400);
     assert.ok(!(await badMetaRes.text()).includes(keyCanary), "400 validation error must not echo caller-controlled object keys");
 
-    // Short Bearer credential in displayName rejected
-    const shortBearerRes = await call("/api/accounts/principals", {
-      method: "POST",
-      token: alphaAdminToken,
-      body: { tenantId: "tenant-alpha", principalId: "person:short-bearer", kind: "human", displayName: "Bearer ab12" },
-    });
-    assert.equal(shortBearerRes.status, 400);
+    // Short Bearer credential, single-side URL userinfo, percent-encoded credential query, and Bearer object keys MUST all return 400!
+    for (const [id, payload] of [
+      ["person:short-bearer", { displayName: "Bearer ab12" }],
+      ["person:user-only-url", { displayName: "https://synthetic-userinfo-73@host.test/repo" }],
+      ["person:pass-only-url", { displayName: "https://:synthetic-password-73@host.test/repo" }],
+      ["person:pct-query", { displayName: "https://host.test/?access%5Ftoken=synthetic-query-73" }],
+      ["person:bearer-key", { displayName: "Normal", metadata: { "Bearer ab12": true } }],
+    ] as const) {
+      const res = await call("/api/accounts/principals", {
+        method: "POST",
+        token: alphaAdminToken,
+        body: { tenantId: "tenant-alpha", principalId: id, kind: "human", ...payload },
+      });
+      assert.equal(res.status, 400, `Expected 400 for ${id}`);
+    }
 
     // 4. Undeclared password & credential-bearing URL rejected on HTTP /api/tasks and MCP submit_task; conformant submit_task succeeds!
     const pwCanary = makeSynthetic("raw-task-pw");

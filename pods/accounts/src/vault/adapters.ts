@@ -45,7 +45,22 @@ const BITWARDEN_CIPHERTEXT_RE =
   /^(?:[0-2]\.[A-Za-z0-9+/=]{4,}\|[A-Za-z0-9+/=]{4,}(?:\|[A-Za-z0-9+/=]{4,})?|[3-6]\.[A-Za-z0-9+/=]{4,}(?:\|[A-Za-z0-9+/=]{4,})?)$/;
 const CREDENTIAL_QUERY_RE =
   /[?&](?:apikey|api_key|access_token|refresh_token|client_secret|token|password|passwd|secret)=[^&\s#]+/i;
-const CREDENTIAL_USERINFO_RE = /[a-z][a-z0-9+.-]*:\/\/[^/\s@]+:[^/\s@]+@/i;
+const CREDENTIAL_USERINFO_RE = /[a-z][a-z0-9+.-]*:\/\/[^/\s@]*@/i;
+const URL_CANDIDATE_RE = /[a-z][a-z0-9+.-]*:\/\/[^\s"'<>]+/gi;
+const CREDENTIAL_QUERY_KEY_NAMES = new Set([
+  "apikey",
+  "api_key",
+  "access_token",
+  "refresh_token",
+  "client_secret",
+  "token",
+  "password",
+  "passwd",
+  "secret",
+  "bearer",
+  "auth_token",
+  "service_token",
+]);
 const VAULT_SEGMENT_RE = /^[A-Za-z0-9._:@-]{1,128}$/;
 const VAULT_FRAGMENT_RE = /^[A-Za-z0-9._-]{1,64}$/;
 
@@ -89,20 +104,63 @@ export function redactSecrets(text: string, knownSecrets: readonly string[] = []
  * Recursively reject embedded credentials, secret-named keys, prototype keys, or PEM private keys
  * across ANY string, array, or object persisted into D1.
  */
+function inspectStringForSecrets(value: string): void {
+  if (PEM_PRIVATE_KEY_RE.test(value)) {
+    throw new Error("Embedded PEM private key material is forbidden");
+  }
+  if (/\bBearer\s+\S+/i.test(value)) {
+    throw new Error("Embedded Bearer credential is forbidden");
+  }
+  if (CREDENTIAL_QUERY_RE.test(value)) {
+    throw new Error("Embedded credential query parameter is forbidden");
+  }
+  if (CREDENTIAL_USERINFO_RE.test(value)) {
+    throw new Error("Embedded URL credential userinfo is forbidden");
+  }
+  // Parse any embedded URL candidates to catch decoded query keys (e.g. ?access%5Ftoken=...) and any userinfo
+  const matches = value.match(URL_CANDIDATE_RE);
+  if (matches) {
+    for (const candidate of matches) {
+      let parsed: URL;
+      try {
+        parsed = new URL(candidate);
+      } catch {
+        continue;
+      }
+      if (parsed.username || parsed.password) {
+        throw new Error("Embedded URL credential userinfo is forbidden");
+      }
+      for (const [k, v] of parsed.searchParams.entries()) {
+        if (!v) continue;
+        const lower = k.toLowerCase();
+        if (CREDENTIAL_QUERY_KEY_NAMES.has(lower) || FORBIDDEN_SECRET_FIELD_RE.test(lower)) {
+          throw new Error("Embedded credential query parameter is forbidden");
+        }
+      }
+    }
+  }
+  // Also catch standalone percent-encoded query strings outside full URLs (e.g. "?access%5Ftoken=val")
+  if (value.includes("?") || value.includes("&")) {
+    const qIdx = value.indexOf("?");
+    const tail = qIdx >= 0 ? value.slice(qIdx + 1) : value;
+    try {
+      const sp = new URLSearchParams(tail.split(/[\s#]/, 1)[0]);
+      for (const [k, v] of sp.entries()) {
+        if (!v) continue;
+        const lower = k.toLowerCase();
+        if (CREDENTIAL_QUERY_KEY_NAMES.has(lower) || FORBIDDEN_SECRET_FIELD_RE.test(lower)) {
+          throw new Error("Embedded credential query parameter is forbidden");
+        }
+      }
+    } catch {
+      // ignore malformed non-query text
+    }
+  }
+}
+
 export function assertNoEmbeddedSecretPayload(value: unknown, _path = "$"): void {
   if (typeof value === "string") {
-    if (PEM_PRIVATE_KEY_RE.test(value)) {
-      throw new Error("Embedded PEM private key material is forbidden");
-    }
-    if (/\bBearer\s+\S+/i.test(value)) {
-      throw new Error("Embedded Bearer credential is forbidden");
-    }
-    if (CREDENTIAL_QUERY_RE.test(value)) {
-      throw new Error("Embedded credential query parameter is forbidden");
-    }
-    if (CREDENTIAL_USERINFO_RE.test(value)) {
-      throw new Error("Embedded URL credential userinfo is forbidden");
-    }
+    inspectStringForSecrets(value);
     return;
   }
   if (!value || typeof value !== "object") return;
@@ -119,6 +177,7 @@ export function assertNoEmbeddedSecretPayload(value: unknown, _path = "$"): void
     if (FORBIDDEN_SECRET_FIELD_RE.test(key)) {
       throw new Error("Embedded secret field is forbidden");
     }
+    inspectStringForSecrets(key);
     assertNoEmbeddedSecretPayload(val);
   }
 }
