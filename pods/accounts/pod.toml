@@ -1,0 +1,11 @@
+[pod]
+name = "accounts-pod"
+role = "accounts"
+version = "1.0.0"
+
+[harness]
+runtime = "cloudflare-worker"
+engine = "edge-v8"
+
+[tools]
+mcp = ["submit_task", "task_status", "approve", "cancel", "get_receipt", "acc_who_owns", "acc_query_matrix", "acc_overlaps_and_gaps", "acc_upsert_binding", "acc_switch_vault", "acc_ingest_discovery", "search", "execute"]

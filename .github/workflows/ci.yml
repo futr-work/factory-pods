@@ -56,7 +56,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        template: [starter, model-governor, sentinel-radar, authority-seo, measurement]
+        template: [starter, model-governor, sentinel-radar, authority-seo, measurement, accounts]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

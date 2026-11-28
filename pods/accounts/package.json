@@ -1,0 +1,27 @@
+{
+  "name": "accounts-pod",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Vault-agnostic, provider-agnostic, model-agnostic Account, Connection, and Asset-Ownership registry pod with pluggable secret backends (Infisical, 1Password, LastPass, Bitwarden, OAuth2 PKCE) and MCP v2 + Code Mode",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "wrangler dev --port 8787",
+    "serve": "tsx src/main.ts serve",
+    "test": "tsx --import ../../tests/support/no-network.mjs --test tests/**/*.test.ts",
+    "check": "tsc --noEmit",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261104.1",
+    "@types/node": "^24.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "wrangler": "^4.158.0"
+  },
+  "dependencies": {
+    "@futr-work/pod-kernel": "^0.2.0"
+  }
+}

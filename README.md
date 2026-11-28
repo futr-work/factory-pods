@@ -60,6 +60,7 @@ Every pod lives in `pods/<name>` and ships a `pod.toml` manifest that tests keep
 | [`sentinel-radar`](pods/sentinel-radar) | Sentinel | Proactive anomaly, AI-crawler and security probes. HTTP API; no MCP endpoint. |
 | [`authority-seo`](pods/authority-seo) | SEO governance | Site audits, AI-crawler robots.txt, Schema.org JSON-LD, metadata, IndexNow. |
 | [`measurement`](pods/measurement) | Measurement | Low-frequency typed evidence & time-series plane (SEO, analytics, decimal spend, telemetry rollups), MCP v2 + Code Mode, and Worldview-ready projection cursor. |
+| [`accounts`](pods/accounts) | Accounts & Access | Vault-agnostic, zero-secret account/connection/asset ownership registry with pluggable secret backends (Infisical, 1Password, LastPass, Bitwarden, CF Secret, OAuth2 PKCE) and MCP v2 + Code Mode. |
 
 ---
 
