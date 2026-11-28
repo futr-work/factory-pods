@@ -1,0 +1,6 @@
+# Local development secrets for accounts-pod (never commit .dev.vars)
+FACTORY_HUB_TOKEN=replace-with-random-operator-token
+# JSON array of ScopedCallerConfig entries (SHA-256 token hashes + explicit tenant/resource/action grants)
+SCOPED_CALLER_GRANTS=[]
+# Optional JSON map of backendId -> runtime vault auth credentials (kept in Worker secrets, never D1)
+VAULT_BACKEND_SECRETS={}
