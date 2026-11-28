@@ -1,4 +1,6 @@
-# Factory Pods: Autonomous Edge Workers on Cloudflare
+[![Factory Pods by Futr Work — the open-source toolkit for modular AI pods](./factory-pods-banner.png)](https://futr.work/)
+
+# Factory Pods
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![MCP Spec](https://img.shields.io/badge/MCP-2026--07--28-orange.svg)](docs/pod-contract.md)
@@ -8,7 +10,9 @@
 
 > **Autonomous edge workers with durable state, a shared auth gate, and an MCP interface, deployed to Cloudflare with no servers to run.**
 
-Factory Pods is the open-source micro-worker chassis from [futr.work](https://futr.work). Instead of running heavy, fragile 500MB browser bots in multi-gigabyte Docker containers, Factory Pods execute as lightweight micro-agents directly inside V8 isolates on the Cloudflare Workers global edge, paired with isolated SQLite persistence (Cloudflare D1).
+Factory Pods is Futr Work’s open-source TypeScript toolkit for building workers on Cloudflare. Start with a reference pod, run it locally, and deploy it to your own account. Each pod keeps its own state in D1.
+
+[Explore the managed business pods](https://futr.work/pods) · [View self-hosting instructions](docs/self-hosting.md)
 
 ---
 
@@ -169,3 +173,4 @@ Factory Pods are MIT-licensed and free to self-host. [futr.work](https://futr.wo
 ## 📄 License
 
 MIT © [futr.work](https://futr.work)
+
